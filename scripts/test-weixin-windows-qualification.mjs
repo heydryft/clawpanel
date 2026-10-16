@@ -240,7 +240,12 @@ export class W3C{
  constructor(base){const u=new URL(base);assert.ok(u.protocol==='http:'&&u.hostname==='127.0.0.1'&&!u.username&&!u.password);this.base=u.origin;this.session=null;this.events=[]}
  async request(method,route,body,timeout=120000){assert.ok(timeout>0&&timeout<=720000);if(typeof body?.script==='string')compileInjected(body.script,route);const start=Date.now();const r=await fetch(this.base+route,{method,...(body===undefined?{}:{headers:{'content-type':'application/json'},body:JSON.stringify(body)}),signal:AbortSignal.timeout(timeout)});const j=await r.json();this.events.push({method,route,status:r.status,elapsedMs:Date.now()-start});assert.ok(r.ok&&!j.value?.error,`W3C ${route}: ${redact(j.value?.message||j.value?.error||r.status)}`);return j.value}
  command(method,route,body,timeout){assert.ok(this.session);return this.request(method,`/session/${this.session}${route}`,body,timeout)}
- async create(application){const v=await this.request('POST','/session',{capabilities:{alwaysMatch:{'tauri:options':{application}}}});assert.ok(v.sessionId);this.session=v.sessionId;this.sessionInfo={sessionId:v.sessionId,capabilities:v.capabilities,application};await this.command('POST','/timeouts',{script:120000,pageLoad:60000,implicit:0})}
+ async create(application,userDataFolder){
+  assert.ok(typeof userDataFolder==='string'&&(path.win32.isAbsolute(userDataFolder)||path.isAbsolute(userDataFolder)),'userDataFolder 必须为私有绝对profile路径');const paths=path.win32.isAbsolute(userDataFolder)?path.win32:path;assert.ok(paths!==path.win32||/^[a-z]:\\/i.test(userDataFolder),'profile拒绝网络路径');assert.equal(paths.resolve(userDataFolder),userDataFolder,'profile路径须正规化')
+  // 固定tauri-driver 2.1.0会覆盖顶层ms:edgeOptions；必须经TauriOptions.webviewOptions转发。
+  this.requestedCapabilities={capabilities:{alwaysMatch:{'tauri:options':{application,webviewOptions:{userDataFolder}}}}}
+  const v=await this.request('POST','/session',this.requestedCapabilities);assert.ok(v.sessionId);this.session=v.sessionId;this.sessionInfo={sessionId:v.sessionId,capabilities:v.capabilities,application,requestedCapabilities:this.requestedCapabilities};await this.command('POST','/timeouts',{script:120000,pageLoad:60000,implicit:0})
+ }
  script(script,args=[]){return this.command('POST','/execute/sync',{script,args})}
  async ipc(cmd,args={}){const x=await this.command('POST','/execute/async',{script:'const [cmd,args,done]=arguments;window.__TAURI__.core.invoke(cmd,args).then(value=>done({ok:true,value}),error=>done({ok:false,error:String(error)}))',args:[cmd,args]});return x}
  async click(selector){const x=await this.command('POST','/element',{using:'css selector',value:selector}),id=x['element-6066-11e4-a52e-4f735466cecf'];assert.ok(id);await this.command('POST',`/element/${id}/click`,{})}
@@ -249,6 +254,15 @@ export class W3C{
 }
 async function until(fn,timeout=120000){const end=Date.now()+timeout;do{const v=await fn();if(v)return v;await wait(300)}while(Date.now()<end);throw Error('bounded wait timeout')}
 function physical(p){p=path.resolve(p);for(let q=p;;q=path.dirname(q)){if(fs.existsSync(q)){assert.ok(!fs.lstatSync(q).isSymbolicLink(),'路径链接');const real=fs.realpathSync.native(q);assert.equal(real.toLowerCase(),q.toLowerCase(),'非physical路径');}if(path.dirname(q)===q)break}return p}
+export function webviewProfileMetadata({home,userDataFolder}){
+ const root=physical(home),folder=physical(userDataFolder);assert.ok(inside(root,folder),'profile越出私有HOME');const result={scope:'read-only explicit UDD metadata; not native launch proof',capturedAt:new Date().toISOString(),userDataFolder:folder,folder:{exists:false},files:{}}
+ try{assert.ok(fs.lstatSync(folder).isDirectory(),'profile不是目录');result.folder={exists:true}}catch(e){if(e.code!=='ENOENT')throw e}
+ for(const name of ['DevToolsActivePort','EBWebView/DevToolsActivePort']){const file=physical(path.join(folder,name));try{const stat=fs.lstatSync(file),row={exists:true,size:stat.size,mtimeMs:stat.mtimeMs,contentRead:false};assert.ok(stat.isFile()&&!stat.isSymbolicLink(),'DevTools文件类型');result.files[name]=row
+   if(stat.size<=4096){const fd=fs.openSync(file,'r'),buffer=Buffer.alloc(4097);let n;try{n=fs.readSync(fd,buffer,0,buffer.length,0)}finally{fs.closeSync(fd)}if(n<=4096){const bytes=buffer.subarray(0,n),first=bytes.toString('utf8').split(/\r?\n/)[0],port=/^\d+$/.test(first)?Number(first):0;Object.assign(row,{contentRead:true,sha256:sha(bytes),port:port>0&&port<=65535?port:null})}}
+  }catch(e){if(e.code!=='ENOENT')throw e;result.files[name]={exists:false}}
+ }
+ return result
+}
 function git(root,args,input){const r=spawnSync('git',['--no-optional-locks','-C',root,...args],{input,windowsHide:true,timeout:60000,maxBuffer:512*1024*1024});assert.equal(r.status,0,'Git读取失败');return r.stdout}
 function gitSnapshot(root,commit,exportTo){
  assert.equal(git(root,['rev-parse','HEAD']).toString().trim(),commit,'候选SHA不符')
@@ -386,7 +400,8 @@ async function execute(o){
   driver=spawn(tauri,['--port',String(driverPort),'--native-port',String(nativePort),'--native-driver',edge],{cwd:root,env,windowsHide:true,stdio:['ignore','pipe','pipe']});assert.ok(driver.pid);pending.add(driver.pid)
   for(const [stream,key] of [[driver.stdout,'stdout'],[driver.stderr,'stderr']])stream.on('data',b=>{driverLogBytes[key]+=b.length;if(driverLogBytes[key]>16*1024*1024){driverOverflow=true;driver.kill()}else driverLogs[key].push(b)})
   await until(async()=>{try{return (await fetch(`http://127.0.0.1:${driverPort}/status`,{signal:AbortSignal.timeout(1000)})).ok}catch{return false}},30000)
-  client=new W3C(`http://127.0.0.1:${driverPort}`);await client.create(application)
+  client=new W3C(`http://127.0.0.1:${driverPort}`);const launch={application,envUserDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,before:webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER})};report.sessionLaunch=launch;save()
+  try{await client.create(application,env.WEBVIEW2_USER_DATA_FOLDER)}finally{launch.requestedCapabilities=client.requestedCapabilities||null;launch.sessionCreated=!!client.session;try{launch.after=webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER})}catch(e){launch.metadataError=String(e)}receipt('session-launch',launch);save()}
   const nativeProcesses=processSnapshot(output,[...ports]);assert.ok(nativeProcesses.processes.some(p=>p.exe?.toLowerCase()===application.toLowerCase()),'没有同SHA exe的真实PID');assert.ok(nativeProcesses.processes.some(p=>p.exe?.toLowerCase()===runtime.path.toLowerCase()),'实际WebView2进程不是精确配套runtime');for(const p of nativeProcesses.processes)identities.set(`${p.pid}:${p.creationDate}`,p);receipt('native-process-identities',nativeProcesses)
   const intermediary=nativeProcesses.processes.find(p=>p.pid===driver.pid),nativeDriver=nativeProcesses.processes.filter(p=>p.exe?.toLowerCase()===edge.toLowerCase());assert.equal(nativeDriver.length,1,'实际Microsoft driver进程不明确');tauriEvidence.sha256AfterSession=hash(tauri);tauriEvidence.session={...client.sessionInfo,ports:{intermediary:driverPort,native:nativePort},processes:{intermediary,native:nativeDriver[0]},listeners:nativeProcesses.listeners};assertTauriDriverEvidence(tauriEvidence,report.drivers.edge,application);receipt('tauri-driver-native-session-identity',tauriEvidence);save()
   await until(()=>client.script('return !!window.__TAURI__?.core?.invoke'))

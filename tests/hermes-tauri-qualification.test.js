@@ -8,6 +8,20 @@ import { spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 
 const load = () => import('../scripts/test-hermes-tauri-qualification.mjs')
+test('R6 Hermes session真实HTTP first-red：私有UDD经tauri webviewOptions且原错误仍抛出',async()=>{
+ const {NativeWebDriver}=await load(),folder='C:\\qualification\\h\\.webview2-native-qualification',seen=[];let fail=false
+ const server=http.createServer(async(req,res)=>{let raw='';for await(const b of req)raw+=b;const body=raw?JSON.parse(raw):null;seen.push({url:req.url,body});res.setHeader('content-type','application/json');if(req.url==='/session'){if(fail||body?.capabilities?.alwaysMatch?.['tauri:options']?.webviewOptions?.userDataFolder!==folder){res.writeHead(500);res.end(JSON.stringify({value:{error:'session not created',message:"DevToolsActivePort file doesn't exist"}}));return}res.end(JSON.stringify({value:{sessionId:'isolated-http-not-native',capabilities:{browserName:'webview2'}}}))}else res.end(JSON.stringify({value:null}))})
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));try{const c=new NativeWebDriver('http://127.0.0.1:'+server.address().port);await c.create('C:\\candidate\\clawpanel.exe',folder);assert.deepEqual(seen[0].body,{capabilities:{alwaysMatch:{'tauri:options':{application:'C:\\candidate\\clawpanel.exe',webviewOptions:{userDataFolder:folder}}}}});assert.equal(Object.hasOwn(seen[0].body.capabilities.alwaysMatch,'ms:edgeOptions'),false);assert.deepEqual(c.requestedCapabilities,seen[0].body);assert.deepEqual(seen[1].body,{script:120000,pageLoad:60000,implicit:0});await c.close();fail=true;await assert.rejects(new NativeWebDriver(c.base).create('C:\\candidate\\clawpanel.exe',folder),/DevToolsActivePort/);const count=seen.length;for(const bad of [undefined,'','relative','http://host/profile','C:\\qualification\\h\\..\\outside']){await assert.rejects(new NativeWebDriver(c.base).create('C:\\candidate\\clawpanel.exe',bad),/profile|userDataFolder/);assert.equal(seen.length,count)}
+ }finally{server.closeAllConnections();await new Promise(r=>server.close(r))}
+})
+test('R6 Hermes profile只读诊断：不创建/不遍历/不泄露DevTools endpoint并拒绝越界',async()=>{
+ const {webviewProfileMetadata}=await load();assert.equal(typeof webviewProfileMetadata,'function');const root=fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(),'hm-profile-meta-'))),home=path.join(root,'h'),folder=path.join(home,'udd');fs.mkdirSync(home)
+ try{assert.equal(webviewProfileMetadata({home,userDataFolder:folder}).folder.exists,false);assert.equal(fs.existsSync(folder),false);fs.mkdirSync(path.join(folder,'EBWebView'),{recursive:true});const value='49345\n/devtools/browser/private-endpoint\n';fs.writeFileSync(path.join(folder,'DevToolsActivePort'),value);const r=webviewProfileMetadata({home,userDataFolder:folder});assert.equal(r.files.DevToolsActivePort.port,49345);assert.equal(r.files.DevToolsActivePort.sha256,crypto.createHash('sha256').update(value).digest('hex'));assert.equal(JSON.stringify(r).includes('private-endpoint'),false);assert.throws(()=>webviewProfileMetadata({home,userDataFolder:root}));const foreign=path.join(root,'foreign');fs.mkdirSync(foreign);fs.symlinkSync(foreign,path.join(home,'link'),'junction');assert.throws(()=>webviewProfileMetadata({home,userDataFolder:path.join(home,'link')}))
+ }finally{fs.rmSync(root,{recursive:true,force:true})}
+})
+test('R6 Hermes实际启动caps绑定env同一私有UDD，未改120/60s或增加权限flag',()=>{
+ const s=fs.readFileSync(new URL('../scripts/test-hermes-tauri-qualification.mjs',import.meta.url),'utf8');assert.match(s,/client\.create\(app, env\.WEBVIEW2_USER_DATA_FOLDER\)/);assert.match(s,/report\.sessionLaunch/);assert.match(s,/timeout = 120000/);assert.match(s,/pageLoad: 60000/);assert.doesNotMatch(s,/--no-sandbox|ignoreCertificateErrors|disable-web-security/)
+})
 const home = 'C:\\qualification\\h'
 const listener = (port = 18791) => ({ port, pid: 401, creationDate: '2026-10-16T01:00:00.000Z', executablePath: home + '\\.hermes\\venv\\Scripts\\python.exe', commandLine: 'python -m hermes_cli gateway run' })
 const stopped = () => ({ productionStop: true, identities: [listener()], present: [], listeners: [], ports: [18791], reachablePorts: [], pidsExited: true, portsClosed: true })
@@ -115,7 +129,7 @@ test('W3C 真实协议错误不伪造成功、不回退到 HTTP API', async () =
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   try {
     const client = new NativeWebDriver(`http://127.0.0.1:${server.address().port}`)
-    await assert.rejects(client.create('C:\\candidate\\clawpanel.exe'), /driver mismatch/)
+    await assert.rejects(client.create('C:\\candidate\\clawpanel.exe', 'C:\\qualification\\h\\.webview2-native-qualification'), /driver mismatch/)
     assert.deepEqual(calls, ['/session'])
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) }
 })

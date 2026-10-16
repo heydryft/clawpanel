@@ -402,8 +402,13 @@ export class NativeWebDriver {
     if (!response.ok || data.value?.error) throw new Error(`WebDriver ${route}: ${data.value?.message || data.value?.error || response.status}`)
     return data.value
   }
-  async create(application) {
-    const data = await this.request('POST', '/session', { capabilities: { alwaysMatch: { 'tauri:options': { application } } } })
+  async create(application, userDataFolder) {
+    assert.ok(typeof userDataFolder === 'string' && (path.win32.isAbsolute(userDataFolder) || path.isAbsolute(userDataFolder)), 'userDataFolder 必须为私有绝对profile路径')
+    const paths = path.win32.isAbsolute(userDataFolder) ? path.win32 : path
+    assert.ok(paths !== path.win32 || /^[a-z]:\\/i.test(userDataFolder), 'profile拒绝网络路径'); assert.equal(paths.resolve(userDataFolder), userDataFolder, 'profile路径须正规化')
+    // 固定tauri-driver 2.1.0从TauriOptions转发webviewOptions；顶层ms:edgeOptions会被覆盖。
+    this.requestedCapabilities = { capabilities: { alwaysMatch: { 'tauri:options': { application, webviewOptions: { userDataFolder } } } } }
+    const data = await this.request('POST', '/session', this.requestedCapabilities)
     assert.ok(data?.sessionId, '缺少真实 WebDriver session')
     this.session = data.sessionId
     await this.command('POST', '/timeouts', { script: 120000, pageLoad: 60000, implicit: 0 })
@@ -438,6 +443,29 @@ export class NativeWebDriver {
     fs.writeFileSync(file, data)
   }
   async close() { if (this.session) { await this.command('DELETE', ''); this.session = null } }
+}
+
+export function webviewProfileMetadata({ home, userDataFolder }) {
+  const root = physical(home), folder = physical(userDataFolder)
+  assert.ok(folder !== root && inside(root, folder), 'profile越出私有HOME')
+  const result = { scope: 'read-only explicit UDD metadata; not native launch proof', capturedAt: new Date().toISOString(), userDataFolder: folder, folder: { exists: false }, files: {} }
+  try { assert.ok(fs.lstatSync(folder).isDirectory(), 'profile不是目录'); result.folder = { exists: true } } catch (e) { if (e.code !== 'ENOENT') throw e }
+  for (const name of ['DevToolsActivePort', 'EBWebView/DevToolsActivePort']) {
+    const file = physical(path.join(folder, name))
+    try {
+      const stat = fs.lstatSync(file), row = { exists: true, size: stat.size, mtimeMs: stat.mtimeMs, contentRead: false }
+      assert.ok(stat.isFile() && !stat.isSymbolicLink(), 'DevTools文件类型'); result.files[name] = row
+      if (stat.size <= 4096) {
+        const fd = fs.openSync(file, 'r'), buffer = Buffer.alloc(4097); let n
+        try { n = fs.readSync(fd, buffer, 0, buffer.length, 0) } finally { fs.closeSync(fd) }
+        if (n <= 4096) {
+          const bytes = buffer.subarray(0, n), first = bytes.toString('utf8').split(/\r?\n/)[0], port = /^\d+$/.test(first) ? Number(first) : 0
+          Object.assign(row, { contentRead: true, sha256: sha256(bytes), port: port > 0 && port <= 65535 ? port : null })
+        }
+      }
+    } catch (e) { if (e.code !== 'ENOENT') throw e; result.files[name] = { exists: false } }
+  }
+  return result
 }
 
 async function until(predicate, timeout = 60000) {
@@ -658,7 +686,13 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
     fs.closeSync(log)
     let spawnError; driver.once('error', e => { spawnError = e })
     await until(async () => { if (spawnError) throw spawnError; return await reachable(driverPort) }, 30000)
-    client = new NativeWebDriver(`http://127.0.0.1:${driverPort}`, { compatibility }); report.webdriver = await client.create(app)
+    client = new NativeWebDriver(`http://127.0.0.1:${driverPort}`, { compatibility })
+    const launch = { application: app, envUserDataFolder: env.WEBVIEW2_USER_DATA_FOLDER, before: webviewProfileMetadata({ home, userDataFolder: env.WEBVIEW2_USER_DATA_FOLDER }) }; report.sessionLaunch = launch; save()
+    try { report.webdriver = await client.create(app, env.WEBVIEW2_USER_DATA_FOLDER) } finally {
+      launch.requestedCapabilities = client.requestedCapabilities || null; launch.sessionCreated = !!client.session
+      try { launch.after = webviewProfileMetadata({ home, userDataFolder: env.WEBVIEW2_USER_DATA_FOLDER }) } catch (e) { launch.metadataError = String(e) }
+      fs.writeFileSync(path.join(output, 'session-launch.json'), JSON.stringify(launch, null, 2)); save()
+    }
     if (compatibility) report.compatibility.blockedInstallerCommands = client.blockedInstallerCommands
     const startedApps = applicationPids(); assert.ok(startedApps.some(p => p.ExecutablePath.toLowerCase() === app.toLowerCase()), '没有实际 ClawPanel.exe 进程')
     report.application.processes = startedApps
