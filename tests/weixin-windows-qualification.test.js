@@ -116,6 +116,18 @@ test('crates官方固定API真实HTTP契约：具名UA才200，固定version/has
 })
 
 const driverHelp='USAGE: tauri-driver [FLAGS] [OPTIONS]\n\nFLAGS:\n  -h, --help              Prints help information\n\nOPTIONS:\n  --port NUMBER           Sets the tauri-driver intermediary port\n  --native-port NUMBER    Sets the port of the underlying WebDriver\n  --native-host HOST      Sets the host of the underlying WebDriver (Linux only)\n  --native-driver PATH    Sets the path to the native WebDriver binary'
+test('真实38962119578微软154输出新名称仍严格提取四段版本，不伪造工具stdout',async()=>{
+ const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.parseMicrosoftEdgeDriverVersion,'function','原run两host真实exit0新名称被旧MSEdgeDriver正则解析为undefined')
+ const actual='Microsoft Edge WebDriver 154.0.4258.62 (49f7c5590dad654f33b924537ccc8be227c5a43a)\r\n'
+ assert.equal(m.parseMicrosoftEdgeDriverVersion(actual),'154.0.4258.62')
+ assert.equal(m.parseMicrosoftEdgeDriverVersion('MSEdgeDriver 154.0.4258.62 (49f7c5590dad654f33b924537ccc8be227c5a43a)'),'154.0.4258.62')
+ assert.equal(m.parseMicrosoftEdgeDriverVersion('MSEdgeDriver 154.0.4258.62'),'154.0.4258.62')
+ for(const bad of ['',null,'154.0.4258.62','Other Driver 154.0.4258.62','Microsoft Edge WebDriver 154.0.4258','Microsoft Edge WebDriver 154.0.4258.62-beta','MSEdgeDriver 154.0.4258.62forged','error\n'+actual,actual+'second line','Microsoft Edge WebDriver 154.0.4258.62 (hash\nforged)'])assert.throws(()=>m.parseMicrosoftEdgeDriverVersion(bad))
+ const source=fs.readFileSync(new URL('../scripts/test-weixin-windows-qualification.mjs',import.meta.url),'utf8')
+ assert.match(source,/parseMicrosoftEdgeDriverVersion\(await run\(edge,\['--version'\]\)\)/)
+ assert.match(source,/assert.equal\(edgeVersion,runtime.version\)/,'仍要求实际driver和runtime精确四段相等')
+ assert.match(source,/Get-AuthenticodeSignature/,'官方签名门禁保持')
+})
 function driverReceipt(){return {installs:{'tauri-driver 2.1.0 (registry+https://github.com/rust-lang/crates.io-index)':{version_req:'=2.1.0',bins:['tauri-driver.exe'],features:[],all_features:false,no_default_features:false,profile:'release',target:'x86_64-pc-windows-msvc',rustc:'rustc 1.95.0 fixture'}}}}
 test('真实2.1.0 unused --version红灯不再作为ABI；实际help才是CLI探针',async()=>{
  const source=fs.readFileSync(new URL('../scripts/test-weixin-windows-qualification.mjs',import.meta.url),'utf8')

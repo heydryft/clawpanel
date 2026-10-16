@@ -466,3 +466,142 @@ test('hostSnapshot 六个有限阶段只写 stderr，不给 before/after canary 
   assert.match(source, /\[Console\]::Error\.WriteLine/); assert.match(source, /executionPolicy=\$executionPolicy/)
   assert.doesNotMatch(source.slice(source.indexOf('@{registry=$registry')), /phaseTimings|hostClock|elapsedMs/)
 })
+
+// R18：以下 factory 为4ca/669共同的真实 Git 源片段；只读解析，不执行候选代码。
+const releaseFactory = [
+  "export function hermesInstallerPlan(home = hermesHome()) {",
+  "  const installDir = hermesSourceDir(home)",
+  "  const cacheDir = path.join(home, '.clawpanel-cache')",
+  "  if (isWindows) {",
+  "    // 旧版回归保留原11阶段隔离入口；新PM不能进入旧vendor wrapper。",
+  "    if (HERMES_STABLE_VERSION === '0.21.5') {",
+  "      if (HERMES_STABLE_COMMIT !== 'f97608f178d1ffeca59860195ab7da295f7c8e5f') throw new Error('Hermes legacy installer pin 未审查')",
+  "      return {",
+  "        url: HERMES_INSTALLER_BASE_URL + '/install.ps1', sha256: HERMES_INSTALLER_SHA256.windows,",
+  "        sourcePath: 'scripts/install.ps1', scriptPath: path.join(cacheDir, 'install-' + HERMES_STABLE_TAG + '.ps1'), program: 'powershell.exe',",
+  "        stages: ['uv', 'git', 'node', 'repository', 'python', 'venv', 'dependencies', 'node-deps', 'config-templates', 'platform-sdks', 'bootstrap-marker'],",
+  "        argsForStage: (scriptPath, stage, wrapperPath) => [",
+  "          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', wrapperPath, '-InstallerPath', scriptPath,",
+  "          '-HermesHome', home, '-InstallDir', installDir, '-Branch', HERMES_STABLE_BRANCH, '-Commit', HERMES_STABLE_COMMIT,",
+  "          '-ForceCommit', '-SkipSetup', '-SkipComputerUse', '-NonInteractive', '-Json', '-Stage', stage,",
+  "        ],",
+  "      }",
+  "    }",
+  "    if (HERMES_STABLE_VERSION !== '0.22.2' || HERMES_STABLE_COMMIT !== 'd923a5eb487a17c0a68801bba9ef0f56c81040a8') throw new Error('Hermes PM installer pin 未审查')",
+  "    return {",
+  "      url: `${HERMES_INSTALLER_BASE_URL}/install.ps1`,",
+  "      sha256: HERMES_INSTALLER_SHA256.windows,",
+  "      sourcePath: 'scripts/install.ps1',",
+  "      scriptPath: path.join(cacheDir, `install-${HERMES_STABLE_TAG}.ps1`),",
+  "      program: 'powershell.exe',",
+  "      // 0.22.2 由固定 commit 内的 PM 管理依赖；跳过修改用户 PATH 的 products 和系统 prerequisites。",
+  "      stages: ['repository', 'venv', 'python-deps', 'config', 'complete'],",
+  "      argsForStage: (scriptPath, stage) => [",
+  "        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,",
+  "        '-HermesHome', home, '-InstallDir', installDir,",
+  "        '-Branch', HERMES_STABLE_BRANCH,",
+  "        '-Commit', HERMES_STABLE_COMMIT,",
+  "        '-SkipSetup', '-SkipComputerUse', '-NonInteractive', '-Json', '-Stage', stage,",
+  "      ],",
+  "    }",
+  "  }",
+  "  return {",
+  "    url: `${HERMES_INSTALLER_BASE_URL}/install.sh`,",
+  "    sha256: HERMES_INSTALLER_SHA256.posix,",
+  "    sourcePath: 'scripts/install.sh',",
+  "    scriptPath: path.join(cacheDir, `install-${HERMES_STABLE_TAG}.sh`),",
+  "    program: 'bash',",
+  "    stages: ['repository', 'venv', 'python-deps', 'config', 'complete'],",
+  "    argsForStage: (scriptPath, stage) => [",
+  "      scriptPath,",
+  "      '--hermes-home', home, '--dir', installDir,",
+  "      '--branch', HERMES_STABLE_BRANCH,",
+  "      '--commit', HERMES_STABLE_COMMIT,",
+  "      '--skip-setup', '--skip-computer-use', '--non-interactive', '--json', '--stage', stage,",
+  "    ],",
+  "  }",
+  "}"
+].join('\n')
+
+function releaseInputs(version = '0.22.2') {
+  const old = version === '0.21.5', commit = old ? 'f97608f178d1ffeca59860195ab7da295f7c8e5f' : 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
+  const tag = old ? 'v2026.9.24' : 'v0.22.2', branch = old ? tag : 'release/0.22.2'
+  return { version, web: [
+    "const HERMES_STABLE_VERSION = '" + version + "'",
+    "const HERMES_STABLE_TAG = '" + tag + "'",
+    "const HERMES_STABLE_BRANCH = '" + branch + "'",
+    "const HERMES_STABLE_COMMIT = '" + commit + "'",
+    "const HERMES_INSTALLER_SHA256 = { windows: '" + 'a'.repeat(64) + "', posix: '" + 'b'.repeat(64) + "' }",
+    releaseFactory,
+  ].join('\n'), rust: 'const HERMES_STABLE_VERSION: &str = "' + version + '";\nconst HERMES_STABLE_COMMIT: &str = "' + commit + '";' }
+}
+const oldReleaseStages = ['uv', 'git', 'node', 'repository', 'python', 'venv', 'dependencies', 'node-deps', 'config-templates', 'platform-sdks', 'bootstrap-marker']
+const newReleaseStages = ['repository', 'venv', 'python-deps', 'config', 'complete']
+
+test('R18：真实双分支factory按版本/pin读取声明，22.2不误取旧11，21.5仍原11', async () => {
+  const { readHermesRelease } = await load(); assert.equal(typeof readHermesRelease, 'function')
+  for (const version of ['0.22.2', '0.21.5']) {
+    const f = releaseInputs(version), r = readHermesRelease(f.web, f.rust, version)
+    assert.equal(r.version, version); assert.deepEqual(r.stages, version === '0.21.5' ? oldReleaseStages : newReleaseStages)
+    assert.equal(r.installerSha256, 'a'.repeat(64))
+  }
+  const source = fs.readFileSync(script, 'utf8')
+  assert.match(source, /release = readHermesRelease\(webSource, rust, o\['--version'\]\)/)
+  assert.doesNotMatch(source, /webSource\.match\(\/stages:/)
+})
+
+test('R18：无关全文/注释/非Windows stages不能抢占；候选源码始终只作数据不执行', async () => {
+  const { readHermesRelease } = await load(), f = releaseInputs()
+  const poison = "throw new Error('candidate source executed')\nconst decoy = { stages: ['not-the-installer'] }\n"
+  const web = poison + f.web.replace("if (isWindows) {", "if (isWindows) { /* stages: ['comment-only'] */")
+  assert.deepEqual(readHermesRelease(web, f.rust, f.version).stages, newReleaseStages)
+})
+
+test('R18：未知版本/错pin/期望版本或Rust不符、重复常量、缺branch均failclosed', async () => {
+  const { readHermesRelease } = await load(), f = releaseInputs()
+  assert.equal(typeof readHermesRelease, 'function')
+  for (const web of [
+    f.web.replace("VERSION = '0.22.2'", "VERSION = '0.22.3'"),
+    f.web.replace("COMMIT = 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'", "COMMIT = '" + '0'.repeat(40) + "'"),
+    f.web + "\nconst HERMES_STABLE_VERSION = '0.22.2'",
+    f.web.replace("const HERMES_STABLE_BRANCH = 'release/0.22.2'\n", ''),
+    f.web.replace("const HERMES_STABLE_BRANCH = 'release/0.22.2'", "const HERMES_STABLE_BRANCH = 'unknown'"),
+  ]) assert.throws(() => readHermesRelease(web, f.rust, f.version))
+  assert.throws(() => readHermesRelease(f.web, f.rust, '0.21.5'))
+  assert.throws(() => readHermesRelease(f.web, f.rust.replace('0.22.2', '0.21.5'), f.version))
+  assert.throws(() => readHermesRelease(f.web, f.rust.replace('d923a5eb487a17c0a68801bba9ef0f56c81040a8', '0'.repeat(40)), f.version))
+})
+
+test('R18：两固定guard及Windows分支必须完整，错guard/缺/重复/改形态不可fallback', async () => {
+  const { readHermesRelease } = await load(), f = releaseInputs()
+  assert.equal(typeof readHermesRelease, 'function')
+  const oldBranch = releaseFactory.match(/    if \(HERMES_STABLE_VERSION === '0\.21\.5'\) \{[^]*?\n    \}/)[0]
+  for (const web of [
+    f.web.replace("HERMES_STABLE_COMMIT !== 'f97608f178d1ffeca59860195ab7da295f7c8e5f'", "HERMES_STABLE_COMMIT !== '" + '1'.repeat(40) + "'"),
+    f.web.replace("HERMES_STABLE_COMMIT !== 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'", "HERMES_STABLE_COMMIT !== '" + '2'.repeat(40) + "'"),
+    f.web.replace("HERMES_STABLE_VERSION === '0.21.5'", "HERMES_STABLE_VERSION === '0.21.4'"),
+    f.web.replace("if (isWindows)", "if (!isWindows)"),
+    f.web.replace(/^    if \(HERMES_STABLE_VERSION !== '0.22.2'[^\n]+\n/m, ''),
+    f.web.replace(oldBranch, ''),
+    f.web.replace(oldBranch, oldBranch + '\n' + oldBranch),
+    f.web + '\n' + releaseFactory,
+  ]) assert.throws(() => readHermesRelease(web, f.rust, f.version))
+})
+
+test('R18：stages必须来自单一真实literal，重复/缺失/未知/表达式不硬造expected', async () => {
+  const { readHermesRelease } = await load(), f = releaseInputs()
+  assert.equal(typeof readHermesRelease, 'function')
+  const declaration = "stages: ['repository', 'venv', 'python-deps', 'config', 'complete']"
+  for (const replacement of [
+    "stages: ['repository', 'venv', 'python-deps', 'config', 'complete', 'node-deps']",
+    "stages: ['repository', 'venv', 'python-deps', 'config']",
+    "stages: ['repository', 'venv', 'python-deps', 'config', 'config']",
+    "stages: ['invented', 'venv', 'python-deps', 'config', 'complete']",
+    'stages: buildStages()',
+    declaration + ', ' + declaration,
+    "otherStages: ['repository', 'venv', 'python-deps', 'config', 'complete']",
+  ]) assert.throws(() => readHermesRelease(f.web.replace(declaration, replacement), f.rust, f.version))
+  const old = releaseInputs('0.21.5')
+  assert.throws(() => readHermesRelease(old.web.replace("stages: ['uv', 'git'", "stages: ['unsafe', 'git'"), old.rust, old.version))
+  assert.throws(() => readHermesRelease(f.web.replace('windows:', 'otherPlatform:'), f.rust, f.version))
+})

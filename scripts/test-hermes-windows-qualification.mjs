@@ -15,6 +15,83 @@ import { classifyHermesMetadataRequest } from './hermes-qualification-provider.m
 import { createHermesExecFileObserver } from './hermes-exec-observation.mjs'
 
 export const STAGES = ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve']
+
+// 只读识别已审双版本 factory 的确定语法；不 import/eval 候选，也不搜索全文第一个 stages。
+export function readHermesRelease(webSource, rust, expectedVersion) {
+  const one = pattern => {
+    const matches = [...webSource.matchAll(pattern)]
+    assert.equal(matches.length, 1, 'Hermes release 声明缺失或重复')
+    return matches[0][1]
+  }
+  const constant = name => one(new RegExp(`^const HERMES_STABLE_${name} = '([^']+)'`, 'gm'))
+  const version = constant('VERSION'), tag = constant('TAG'), commit = constant('COMMIT'), branch = constant('BRANCH')
+  const pins = { '0.21.5': 'f97608f178d1ffeca59860195ab7da295f7c8e5f', '0.22.2': 'd923a5eb487a17c0a68801bba9ef0f56c81040a8' }
+  assert.equal(version, expectedVersion)
+  assert.ok(Object.hasOwn(pins, version) && exactSha(commit) && pins[version] === commit, 'Hermes release version/pin 未审查')
+  assert.equal(branch, version === '0.21.5' ? 'v2026.9.24' : 'release/0.22.2', 'Hermes release branch 未审查')
+  assert.ok(rust.includes(`HERMES_STABLE_VERSION: &str = "${version}"`) && rust.includes(commit), 'Hermes release Rust version/pin 不符')
+  const installerSha256 = one(/HERMES_INSTALLER_SHA256\s*=\s*\{\s*windows:\s*'([a-f0-9]{64})'/g)
+  const factory = one(/^export function hermesInstallerPlan\(([^]*?)^\}/gm)
+  // 注释及字符串各为独立 token，避免其中的 stages/括号冒充分支；模板仅作不可执行数据。
+  const lex = source => [...source.matchAll(/\s+|\/\/[^\n]*|\/\*[^]*?\*\/|'(?:\\.|[^'\\\r\n])*'|"(?:\\.|[^"\\\r\n])*"|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*|===|!==|=>|\|\||\S/g)]
+    .map(m => m[0]).filter(t => !/^\s|^\/\/|^\/\*/.test(t))
+  const tokens = lex('(' + factory + '}'); let cursor = 0
+  const take = source => {
+    const expected = lex(source)
+    assert.deepEqual(tokens.slice(cursor, cursor + expected.length), expected, 'Hermes installer factory 形态/分支/固定 guard 不符')
+    cursor += expected.length
+  }
+  const semi = () => { if (tokens[cursor] === ';') cursor++ }
+  const guardedThrow = () => {
+    take('throw new Error(')
+    assert.match(tokens[cursor++] || '', /^(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*")$/, 'Hermes installer guard 缺固定错误声明')
+    take(')'); semi()
+  }
+  const returnStages = () => {
+    take('return {')
+    const properties = {}, closing = { '(': ')', '[': ']', '{': '}' }
+    while (tokens[cursor] !== '}') {
+      const key = tokens[cursor++]
+      assert.ok(/^[A-Za-z]\w*$/.test(key || '') && !Object.hasOwn(properties, key), 'Hermes installer 属性缺失/重复/未知形态')
+      take(':')
+      const value = [], stack = []
+      while (cursor < tokens.length && (stack.length || ![',', '}'].includes(tokens[cursor]))) {
+        const token = tokens[cursor++]
+        if (Object.hasOwn(closing, token)) stack.push(closing[token])
+        else if ([')', ']', '}'].includes(token)) assert.equal(stack.pop(), token, 'Hermes installer 属性边界不符')
+        value.push(token)
+      }
+      assert.ok(value.length && !stack.length, 'Hermes installer 属性不完整')
+      properties[key] = value
+      if (tokens[cursor] === ',') cursor++
+    }
+    take('}'); semi()
+    assert.deepEqual(Object.keys(properties).sort(), ['argsForStage', 'program', 'scriptPath', 'sha256', 'sourcePath', 'stages', 'url'])
+    const array = properties.stages
+    assert.equal(array[0], '['); assert.equal(array.at(-1), ']')
+    const stages = []
+    for (let i = 1; i < array.length - 1; i++) {
+      assert.match(array[i], /^'[a-z][a-z0-9-]*'$/, 'Hermes installer stages 必须是实际字符串 literal')
+      stages.push(array[i].slice(1, -1))
+      if (i + 1 < array.length - 1) assert.equal(array[++i], ',')
+    }
+    assert.ok(stages.length >= 5 && new Set(stages).size === stages.length, '缺真实 Windows 安装协议/hash')
+    return stages
+  }
+  take('(home = hermesHome()) { const installDir = hermesSourceDir(home)'); semi()
+  take("const cacheDir = path.join(home, '.clawpanel-cache')"); semi()
+  take("if (isWindows) { if (HERMES_STABLE_VERSION === '0.21.5') {")
+  take(`if (HERMES_STABLE_COMMIT !== '${pins['0.21.5']}')`); guardedThrow()
+  const legacyStages = returnStages(); take('}')
+  take(`if (HERMES_STABLE_VERSION !== '0.22.2' || HERMES_STABLE_COMMIT !== '${pins['0.22.2']}')`); guardedThrow()
+  const modernStages = returnStages(); take('}')
+  returnStages(); take('}'); assert.equal(cursor, tokens.length, 'Hermes installer factory 有额外分支')
+  const stages = version === '0.21.5' ? legacyStages : modernStages
+  if (version === '0.22.2') assert.deepEqual(stages, ['repository', 'venv', 'python-deps', 'config', 'complete'], '22.2 upstream stage 协议不符，不虚构 node-deps')
+  else assert.deepEqual(stages, ['uv', 'git', 'node', 'repository', 'python', 'venv', 'dependencies', 'node-deps', 'config-templates', 'platform-sdks', 'bootstrap-marker'], '21.5 原11 stage 协议不符')
+  return { version, tag, commit, stages, installerSha256 }
+}
+
 const tooling = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const hash = file => digest(fs.readFileSync(file))
@@ -648,13 +725,7 @@ async function execute(o) {
       write('source-sha256.json', { sha: o['--sha'], method: 'literal git show raw bytes + ls-tree blob SHA1 + readback SHA256', files: source }); r.sourceHashes = source
       assertSameSource(project, source)
       const webSource = fs.readFileSync(path.join(project, 'scripts/dev-api.js'), 'utf8'), rust = fs.readFileSync(path.join(project, 'src-tauri/src/commands/hermes.rs'), 'utf8')
-      const version = webSource.match(/HERMES_STABLE_VERSION = '([^']+)'/)?.[1], tag = webSource.match(/HERMES_STABLE_TAG = '([^']+)'/)?.[1], commit = webSource.match(/HERMES_STABLE_COMMIT = '([^']+)'/)?.[1]
-      assert.equal(version, o['--version']); assert.ok(exactSha(commit)); assert.ok(rust.includes(`HERMES_STABLE_VERSION: &str = "${version}"`) && rust.includes(commit))
-      const stages = webSource.match(/stages:\s*\[([^\]]+)\]/)?.[1].match(/'([^']+)'/g)?.map(x => x.slice(1, -1))
-      const installerSha256 = webSource.match(/HERMES_INSTALLER_SHA256\s*=\s*\{\s*windows:\s*'([a-f0-9]{64})'/)?.[1]
-      assert.ok(stages?.length >= 5 && installerSha256, '缺真实 Windows 安装协议/hash')
-      if (version === '0.22.2') assert.deepEqual(stages, ['repository', 'venv', 'python-deps', 'config', 'complete'], '22.2 upstream stage 协议不符，不虚构 node-deps')
-      release = { version, tag, commit, stages, installerSha256 }; write('release.json', release)
+      release = readHermesRelease(webSource, rust, o['--version']); write('release.json', release)
       await run(process.execPath, [npmCli, 'ci'], { timeout: 600000 }); await run(process.execPath, [path.join(project, 'node_modules/vite/bin/vite.js'), 'build'])
       const dist = {}; function walk(dir) { for (const e of fs.readdirSync(dir, { withFileTypes: true })) { const f = path.join(dir, e.name); if (e.isDirectory()) walk(f); else { assert.ok(e.isFile()); dist[path.relative(project, f)] = hash(f) } } } walk(path.join(project, 'dist')); write('dist-sha256.json', dist); r.distHashes = dist
       r.nativeTauri.entryEvidence = { scope: 'source-only, not native execution', file: 'src-tauri/src/commands/hermes.rs', sha256: source['src-tauri/src/commands/hermes.rs'], commands: ['install_hermes', 'update_hermes', 'uninstall_hermes'] }

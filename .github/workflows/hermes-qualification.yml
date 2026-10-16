@@ -232,7 +232,7 @@ jobs:
             const edge=process.env.NATIVE_EDGE_DRIVER,zip=path.join(path.dirname(edge),'edgedriver_win64.zip');fs.mkdirSync(path.dirname(edge),{recursive:true});fs.writeFileSync(zip,Buffer.concat(chunks),{flag:'wx'});
             const z=Buffer.from(zip).toString('base64'),e=Buffer.from(edge).toString('base64');
             await ps(`$ErrorActionPreference='Stop';Add-Type -AssemblyName System.IO.Compression.FileSystem;$z=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${z}'));$e=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${e}'));$a=[IO.Compression.ZipFile]::OpenRead($z);try{$entry=$a.GetEntry('msedgedriver.exe');if(!$entry){throw 'Missing msedgedriver.exe ZIP member'};[IO.Compression.ZipFileExtensions]::ExtractToFile($entry,$e,$false)}finally{$a.Dispose()}`);
-            const edgeVersion=await run(edge,['--version']);assert.equal(edgeVersion.match(/^MSEdgeDriver (\d+\.\d+\.\d+\.\d+)(?:\s|$)/)?.[1],runtime.version);
+            const edgeVersion=await run(edge,['--version']);assert.equal(driverHelper.parseMicrosoftEdgeDriverVersion(edgeVersion),runtime.version);
             const drivers={tauri:tauriEvidence,microsoft:{url,finalUrl:download.url,version:edgeVersion,sha256:hash(edge),zipSha256:hash(zip),webview2:runtime}};write('driver-receipt.json',drivers);
             const npmArguments=['ci'];await run(process.execPath,[path.join(path.dirname(process.execPath),'node_modules/npm/bin/npm-cli.js'),...npmArguments],600000);
             await run(process.execPath,[path.join(root,'node_modules/@tauri-apps/cli/tauri.js'),'build', '--no-bundle', '--ci', '--', '--locked'],1800000);

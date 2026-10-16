@@ -12,6 +12,20 @@ const workflow = fs.readFileSync(new URL('../.github/workflows/hermes-qualificat
 const helperSource = fs.readFileSync(new URL('../scripts/test-weixin-windows-qualification.mjs', import.meta.url), 'utf8')
 const helperPath = 'scripts/test-weixin-windows-qualification.mjs'
 const hash = b => crypto.createHash('sha256').update(b).digest('hex')
+
+test('真实微软driver品牌名变更仍绑定原四段版本，未知来源或版本不匹配保持失败', async () => {
+  const code = inline().match(/const edgeVersion=await run\(edge,\['--version'\]\);assert\.equal\(driverHelper\.parseMicrosoftEdgeDriverVersion\(edgeVersion\),runtime\.version\);/)?.[0]
+  assert.ok(code, '实际native builder必须调用已审查的共享版本解析器')
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+  const check = new AsyncFunction('run', 'edge', 'driverHelper', 'runtime', 'assert', code)
+  for (const output of ['MSEdgeDriver 154.0.4258.62 (build)', 'Microsoft Edge WebDriver 154.0.4258.62 (49f7c5590dad654f33b924537ccc8be227c5a43a)']) {
+    const run = async (file, args) => { assert.equal(file, 'owned-driver'); assert.deepEqual(args, ['--version']); return output }
+    await check(run, 'owned-driver', driverHelper, { version: '154.0.4258.62' }, assert)
+    await assert.rejects(() => check(run, 'owned-driver', driverHelper, { version: '154.0.4258.63' }, assert))
+  }
+  await assert.rejects(() => check(async () => 'UnknownDriver 154.0.4258.62', 'owned-driver', driverHelper, { version: '154.0.4258.62' }, assert))
+})
+
 function inline() {
   const step = workflow.split('        id: native_build\n')[1]
   assert.ok(step, '缺少 native_build')
