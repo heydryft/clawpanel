@@ -357,6 +357,9 @@ export function actualRunnerProof() {
 // 只读 reparse point 自身，不跟随/执行 AppExecLink；原始数据读取或普通文件 hash 失败均抛错。
 export function windowsPathFingerprintSource() {
   // 逐文件诊断仅记录序号/阶段/本PS进程CPU；512是日志额度，不是扫描额度。诊断失败不改变原指纹或异常。
+  // 仅launcher普通文件延后hash；同进程最多两个pipeline/等待句柄，前后metadata复核，任一错误整次失败。
+  // worker复用原literal hash函数，EndInvoke只解包真实ErrorRecord；shell/default不使用pool。
+  // 固定文本仅去行首缩进以保留原EncodedCommand/32767门禁，不换传输、不压缩或删减原检查。
   return String.raw`
 if(-not ('ClawPanelReparseReader' -as [type])){Add-Type -TypeDefinition @'
 using System;
@@ -418,35 +421,49 @@ public static class ClawPanelReparseReader {
 function Write-ClawPanelFingerprintStage($trace,$stage,$event,$bytes){
   if($null -eq $trace){return}
   try{
-    if($trace.records -ge 512){return};$trace.records++
+    $b=if($trace.budget){$trace.budget}else{$trace};[Threading.Monitor]::Enter($b)
+    try{
+    if($b.records -ge 512){return};$b.records++
     $cpu=[int64]$trace.process.TotalProcessorTime.TotalMilliseconds
     [Console]::Error.WriteLine('CLAWPANEL_LAUNCHER_FILE {"directoryIndex":'+$trace.directoryIndex+',"fileIndex":'+$trace.fileIndex+',"stage":"'+$stage+'","event":"'+$event+'","bytes":'+$bytes+',"elapsedMs":'+$trace.clock.ElapsedMilliseconds+',"cpuMs":'+$cpu+'}')
+    }finally{[Threading.Monitor]::Exit($b)}
   }catch{}
 }
-function Get-ClawPanelPathFingerprint($p,$trace=$null){
-  $stage='attributes';$traceBytes=0L
+function Get-ClawPanelPathFingerprint($p,$trace=$null,$defer=$false){
+  $k='attributes';$z=0L
   try{
-    Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
-    try{$attributes=[IO.File]::GetAttributes($p)}catch [IO.FileNotFoundException]{Write-ClawPanelFingerprintStage $trace $stage 'absent' $traceBytes;return [ordered]@{kind='absent';sha256=$null}}catch [IO.DirectoryNotFoundException]{Write-ClawPanelFingerprintStage $trace $stage 'absent' $traceBytes;return [ordered]@{kind='absent';sha256=$null}}
-    Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes
-    $stage='item';Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
+    Write-ClawPanelFingerprintStage $trace $k 'begin' $z
+    try{$a=[IO.File]::GetAttributes($p)}catch [IO.FileNotFoundException]{Write-ClawPanelFingerprintStage $trace $k 'absent' $z;return [ordered]@{kind='absent';sha256=$null}}catch [IO.DirectoryNotFoundException]{Write-ClawPanelFingerprintStage $trace $k 'absent' $z;return [ordered]@{kind='absent';sha256=$null}}
+    Write-ClawPanelFingerprintStage $trace $k 'end' $z
+    $k='item';Write-ClawPanelFingerprintStage $trace $k 'begin' $z
     $item=Get-Item -LiteralPath $p -Force -ErrorAction Stop
-    Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes
-    if(($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){
-      $stage='reparse';Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
+    Write-ClawPanelFingerprintStage $trace $k 'end' $z
+    if(($a -band [IO.FileAttributes]::ReparsePoint) -ne 0){
+      $k='reparse';Write-ClawPanelFingerprintStage $trace $k 'begin' $z
       $r=[ClawPanelReparseReader]::Decode([ClawPanelReparseReader]::Read($p))
-      $metadata=[ordered]@{attributes=[int64]$attributes;bytes=$(if($item.PSIsContainer){$null}else{[int64]$item.Length});createdUtc=$item.CreationTimeUtc.Ticks;modifiedUtc=$item.LastWriteTimeUtc.Ticks;reparseTag=$r.ReparseTag;linkType=$r.LinkType;target=$r.Target;printName=$r.PrintName;flags=$r.Flags;version=$r.Version;strings=@($r.Strings);dataSha256=$r.DataSha256}
+      $metadata=[ordered]@{attributes=[int64]$a;bytes=$(if($item.PSIsContainer){$null}else{[int64]$item.Length});createdUtc=$item.CreationTimeUtc.Ticks;modifiedUtc=$item.LastWriteTimeUtc.Ticks;reparseTag=$r.ReparseTag;linkType=$r.LinkType;target=$r.Target;printName=$r.PrintName;flags=$r.Flags;version=$r.Version;strings=@($r.Strings);dataSha256=$r.DataSha256}
       $fingerprint=[ordered]@{kind='reparse';sha256=$null;reparseTag=$r.ReparseTag;linkType=$r.LinkType;target=$r.Target;metadata=$metadata;metadataSha256=(Get-ClawPanelUtf8Sha256 (ConvertTo-Json -InputObject $metadata -Depth 4 -Compress))}
-      Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes;return $fingerprint
+      Write-ClawPanelFingerprintStage $trace $k 'end' $z;return $fingerprint
     }
-    if($item.PSIsContainer){return [ordered]@{kind='directory';sha256=$null;attributes=[int64]$attributes}}
-    $stage='filehash';$traceBytes=[int64]$item.Length;Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
+    if($item.PSIsContainer){return [ordered]@{kind='directory';sha256=$null;attributes=[int64]$a}}
+    $sha256=$null;if(!$defer){
+    $k='filehash';$z=[int64]$item.Length;Write-ClawPanelFingerprintStage $trace $k 'begin' $z
     $sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash
-    Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes
-    return [ordered]@{kind='file';sha256=$sha256;bytes=[int64]$item.Length;attributes=[int64]$attributes}
-  }catch{Write-ClawPanelFingerprintStage $trace $stage 'failed' $traceBytes;throw}
+    Write-ClawPanelFingerprintStage $trace $k 'end' $z}
+    return [ordered]@{kind='file';sha256=$sha256;bytes=[int64]$item.Length;attributes=[int64]$a}
+  }catch{Write-ClawPanelFingerprintStage $trace $k 'failed' $z;throw}
 }
-`
+function New-ClawHashPool{@{p=[runspacefactory]::CreateRunspacePool(1,2);j=@();c=('param($p,$e,$t);function Write-ClawPanelFingerprintStage{'+${'$'}{function:Write-ClawPanelFingerprintStage}+'};function fp{'+${'$'}{function:Get-ClawPanelPathFingerprint}+'};function stamp($i=$(Get-Item -LiteralPath $p -Force -ea Stop)){if($i.PSIsContainer -or ([int]$i.Attributes -band 1024)){throw "Changed"};@([int]$i.Attributes,$i.Length,$i.CreationTimeUtc.Ticks,$i.LastWriteTimeUtc.Ticks)-join ","};$ErrorActionPreference="Stop";$e=stamp $e;if((stamp)-ne $e){throw "Changed"};$r=fp $p $t;if((stamp)-ne $e){throw "Changed"};$r.sha256')}}
+function Close-ClawDir($d){if(--$d.n -eq 0){Write-ClawPanelLauncherDirectory $d.i 'fingerprinted' $d.c $d.b}}
+function Step-ClawPanelHash($s,$r,$f,$t){
+  if($s.j.Count -eq 2 -or (!$r -and $s.j.Count)){
+    $n=[Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($s.j|%{$_.a.AsyncWaitHandle}));$j=$s.j[$n]
+    try{try{$h=@($j.p.EndInvoke($j.a))}catch{$e=$_.Exception.InnerException;if($e.ErrorRecord){throw $e.ErrorRecord};throw};if($j.p.HadErrors -or $h.Count -ne 1 -or $h[0] -isnot [string] -or $h[0] -notmatch '^[a-f0-9]{64}$'){throw 'Invalid hash'};$j.r.sha256=$j.r.fingerprint.sha256=$h[0];Close-ClawDir $j.d}
+    finally{$j.a.AsyncWaitHandle.Close();$j.p.Dispose();$s.j=@($s.j|?{$_ -ne $j})}
+  }
+  if($r){$p=[powershell]::Create();try{$p.RunspacePool=$s.p;$c=$t.Clone();$c.budget=$t;[void]$p.AddScript($s.c).AddArgument($f.FullName).AddArgument($f).AddArgument($c);$s.j+=@{p=$p;a=$p.BeginInvoke();r=$r;d=$t.dir};$t.dir.n++;$p=$null}finally{if($p){$p.Dispose()}}}
+}
+`.replace(/^ +/gm, '')
 }
 
 export function hostSnapshot(proof) {
@@ -468,15 +485,19 @@ Write-ClawPanelHostPhase 'launchers'
 $launchers=@();$dirs=@(($env:PATH -split ';')+@("$real\\AppData\\Roaming\\npm","$real\\.local\\bin","$real\\.hermes\\bin"))|Sort-Object -Unique
 $launcherPrefixes=@('hermes','uv','node','npm','python','git');$launcherDirectoryIndex=0
 $launcherFingerprintTrace=@{directoryIndex=0;fileIndex=0;records=0;clock=$hostClock;process=[Diagnostics.Process]::GetCurrentProcess()}
+$hw=New-ClawHashPool
 function Write-ClawPanelLauncherDirectory($index,$event,$count,$bytes){if($index -le 64){[Console]::Error.WriteLine('CLAWPANEL_LAUNCHER_DIRECTORY {"index":'+$index+',"event":"'+$event+'","count":'+$count+',"bytes":'+$bytes+',"elapsedMs":'+$hostClock.ElapsedMilliseconds+'}')}}
+try{$hw.p.Open()
 foreach($d in $dirs){if($d -and (Test-Path -LiteralPath $d)){
   $launcherDirectoryIndex++;Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'begin' 0 0
   $launcherFiles=@(@(foreach($prefix in $launcherPrefixes){Get-ChildItem -LiteralPath $d -Filter ($prefix+'*') -File -ErrorAction Stop})|Where-Object {$_.Name -match '^(hermes|uv|node|npm|python|git)([.-].*|[0-9.]*\\.exe|\\.cmd|\\.ps1)?$'}|Sort-Object FullName)
   $launcherBytes=0L;foreach($f in $launcherFiles){$launcherBytes+=$f.Length};Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'enumerated' $launcherFiles.Count $launcherBytes
-  $launcherFingerprintTrace.directoryIndex=$launcherDirectoryIndex;$launcherFingerprintTrace.fileIndex=0
-  foreach($f in $launcherFiles){$launcherFingerprintTrace.fileIndex++;$fingerprint=Get-ClawPanelPathFingerprint $f.FullName $launcherFingerprintTrace;$launchers+=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint}}
-  Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'fingerprinted' $launcherFiles.Count $launcherBytes
+  $t=$launcherFingerprintTrace;$t.directoryIndex=$launcherDirectoryIndex;$t.fileIndex=0;$t.dir=@{n=1;i=$launcherDirectoryIndex;c=$launcherFiles.Count;b=$launcherBytes}
+  foreach($f in $launcherFiles){$t.fileIndex++;$fingerprint=Get-ClawPanelPathFingerprint $f.FullName $launcherFingerprintTrace $true;$row=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint};$launchers+=$row;if($fingerprint.kind -eq 'file'){Step-ClawPanelHash $hw $row $f $t}}
+  Close-ClawDir $t.dir
 }}
+while($hw.j.Count){Step-ClawPanelHash $hw}
+}finally{foreach($j in $hw.j){$j.p.Stop();$j.a.AsyncWaitHandle.Close();$j.p.Dispose()};$hw.p.Dispose()}
 Write-ClawPanelHostPhase 'execution-policy'
 $executionPolicy=@(Get-ExecutionPolicy -List|ForEach-Object {@{scope=$_.Scope.ToString();value=$_.ExecutionPolicy.ToString()}})
 Write-ClawPanelHostPhase 'complete'
@@ -827,7 +848,16 @@ async function execute(o) {
       stopped = false; await api('hermes_gateway_action', { action: 'start' }); await api('hermes_health_check'); await api('hermes_capabilities'); await api('hermes_gateway_action', { action: 'status' })
       if (diagnostic) { r.diagnostic.gatewayReadyWithinBudget = true; await capturePids(); return { scope: r.diagnostic.scope, gatewayReadyWithinBudget: true } }
       const dash = await api('hermes_dashboard_start'); assert.equal(dash.started, true); assert.equal((await api('hermes_dashboard_probe')).running, true); await capturePids()
-      await run(process.execPath, [npmCli, 'install', '--prefix', path.join(home, 'browser-tools'), '--no-save', '--ignore-scripts', '--package-lock=false', 'playwright@1.58.2'], { timeout: 600000 })
+      // 官方40747修复Node24.16与旧zip stream的死锁；固定测试工具版本，不降Node或扩安装预算。
+      await run(process.execPath, [npmCli, 'install', '--prefix', path.join(home, 'browser-tools'), '--no-save', '--ignore-scripts', '--package-lock=false', 'playwright@1.60.0'], { timeout: 600000 })
+      const browserModules = path.join(home, 'browser-tools/node_modules')
+      r.browserTooling = {
+        playwrightVersion: JSON.parse(fs.readFileSync(path.join(browserModules, 'playwright/package.json'), 'utf8')).version,
+        coreVersion: JSON.parse(fs.readFileSync(path.join(browserModules, 'playwright-core/package.json'), 'utf8')).version,
+        browserManifestSha256: digest(fs.readFileSync(path.join(browserModules, 'playwright-core/browsers.json'))),
+      }
+      assert.equal(r.browserTooling.playwrightVersion, '1.60.0'); assert.equal(r.browserTooling.coreVersion, '1.60.0')
+      write('browser-tooling.json', r.browserTooling); save()
       // 本验收只用默认headless shell；不再下载未使用的headed Chrome，原600秒和真实启动/长UI门禁不变。
       await run(process.execPath, [path.join(home, 'browser-tools/node_modules/playwright/cli.js'), 'install', '--only-shell', 'chromium'], { timeout: 600000, browserDiagnostics: true })
       const { chromium } = await import(pathToFileURL(path.join(home, 'browser-tools/node_modules/playwright/index.mjs')))

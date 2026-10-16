@@ -332,12 +332,12 @@ test('真实 runner ImageOS 精确 allowlist win25 / win25-vs2026，不接受任
   const p = { ...proof(), imageOS: 'win25-vs2026', sid: '' }; assert.throws(() => validateRunnerProof(p), /sid-format/, '新 ImageOS 不绕过真实 SID 门禁')
 })
 
-test('Linux Python Chromium 固定实际发布的 playwright1.58.0，不混用 npm1.58.2', () => {
+test('Linux Python Chromium 保留1.58.0；Windows npm单独固定含Node24.16修复的1.60.0', () => {
   const w = YAML.parse(fs.readFileSync(path.join(root, '.github/workflows/hermes-qualification.yml'), 'utf8'))
   const body = w.jobs['linux-long-ui'].steps.map(s => s.run || '').join('\n')
   assert.match(body, /pip" install 'playwright==1\.58\.0'/)
   assert.doesNotMatch(body, /playwright==1\.58\.2/)
-  assert.match(fs.readFileSync(script, 'utf8'), /playwright@1\.58\.2/, '保留已发布的 Windows npm 版本，不误改')
+  assert.equal(fs.readFileSync(script, 'utf8').match(/'playwright@(\d+\.\d+\.\d+)'/)?.[1], '1.60.0', 'Windows使用已复现修复的npm版本，不误改Python发布线')
 })
 
 test('hostSnapshot UTF8 哈希命令使用唯一名称，不删 h alias，保留全部 canary', async () => {
