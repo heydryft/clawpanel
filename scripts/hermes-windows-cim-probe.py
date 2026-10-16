@@ -1,6 +1,6 @@
 """仅修复固定 CIM 查询的自有 Job/继承管道收尾；不替换进程列表或身份判定。"""
 def install_windows_cim_probe(gateway, compat, spawn_server, platform=None):
-    import os, subprocess, time
+    import json, os, subprocess, sys, time
     if (platform or os.name) != 'nt':
         return lambda: None
     original = compat.bounded_probe_run
@@ -16,11 +16,24 @@ def install_windows_cim_probe(gateway, compat, spawn_server, platform=None):
         if not isinstance(timeout, (int, float)) or not 0 < timeout <= 15:
             raise SystemExit('Hermes CIM probe deadline contract changed')
         proc = job = None
-        end = time.monotonic() + timeout
+        start = time.monotonic()
+        end = start + timeout
+        def observe(event, **fields):
+            if os.environ.get('CLAWPANEL_HERMES_PHASE_TIMING') != '1':
+                return
+            try:
+                print('CLAWPANEL_HERMES_CIM_PROBE ' + json.dumps(dict(event=event, pid=getattr(proc,'pid',None),
+                    elapsedMs=round((time.monotonic()-start)*1000,3), **fields)), file=sys.stderr, flush=True)
+            except Exception:
+                pass
         try:
-            proc, job = spawn_server(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # 上游只消费这两个字段。CIM仍遍历全部进程，不过滤PID/解释器/其他HOME。
+            projected = [*argv[:3], query.replace('Get-CimInstance Win32_Process |',
+                'Get-CimInstance Win32_Process -Property ProcessId,CommandLine |', 1)]
+            proc, job = spawn_server(projected, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors=errors,
                 env=None, cwd=None, creationflags=compat.windows_hide_flags())
+            observe('start', deadlineMs=timeout*1000)
             if job is None:
                 raise RuntimeError('owned probe Job missing')
             while True:
@@ -34,12 +47,15 @@ def install_windows_cim_probe(gateway, compat, spawn_server, platform=None):
                     # 仅在真正的 PowerShell 已退出后关自有 Job；释放 conhost 等继承写端。
                     # 不用于 MSYS 父 stub 先退出的普通命令，不杀其他 HOME 或任务。
                     if job is not None and proc.poll() is not None:
+                        observe('direct-exit-before-pipe-eof', directExitCode=proc.returncode)
                         job.close()
                         job = None
             if len(out) + len(err) > 1048576:
                 raise RuntimeError('CIM output budget exceeded')
+            observe('finish', directExitCode=proc.returncode)
             return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
-        except Exception:
+        except Exception as error:
+            observe('failure', exceptionType=type(error).__name__, directExitCode=proc.poll() if proc else None)
             compat._close_job(job)
             job = None
             if proc is not None:

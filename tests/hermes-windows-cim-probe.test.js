@@ -14,13 +14,15 @@ function probe(t, mode) {
   const driver = String.raw`
 import sys,os,time,pathlib,subprocess,json,types
 root=pathlib.Path(sys.argv[1]);mode=sys.argv[2];source=pathlib.Path(sys.argv[3]);marker=root/'closed';state={'closes':0,'polls':0};children=[]
+if mode=='observe-timeout':os.environ['CLAWPANEL_HERMES_PHASE_TIMING']='1'
 class Job:
  def close(self):
   state['closes']+=1;marker.write_text('closed')
 def spawn_server(argv,**kw):
+ state['query']=argv[3] if len(argv)==4 else None
  if mode=='spawn-error':raise OSError('fixture spawn failed')
  code="import time,pathlib,sys; sys.stdout.reconfigure(encoding='utf-8'); m=pathlib.Path(sys.argv[1]); print('CommandLine=中文',flush=True); print('ProcessId=42',flush=True); end=time.monotonic()+4;\nwhile not m.exists() and time.monotonic()<end:time.sleep(.01)"
- if mode not in ('timeout','legacy-timeout'):
+ if mode not in ('timeout','legacy-timeout','observe-timeout'):
   keeper=code.replace("print('CommandLine=中文',flush=True); print('ProcessId=42',flush=True); ","")
   code="import subprocess,sys; sys.stdout.reconfigure(encoding='utf-8'); subprocess.Popen([sys.executable,'-I','-B','-c',"+repr(keeper)+",sys.argv[1]],stdout=sys.stdout,stderr=sys.stderr); print('CommandLine=中文',flush=True); print('ProcessId=42',flush=True); print('parent-complete',flush=True)"
  p=subprocess.Popen([sys.executable,'-I','-B','-c',code,str(marker)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL,text=True,encoding='utf8',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
@@ -61,12 +63,21 @@ print(json.dumps({'result':result,'error':error,'elapsed':elapsed,'state':state,
 `
   const r = spawnSync(process.env.PYTHON || 'python', ['-I', '-B', '-c', driver, dir, mode, module], { encoding: 'utf8', windowsHide: true, timeout: 7000, maxBuffer: 1048576 })
   assert.equal(r.status, 0, r.stderr)
-  return JSON.parse(r.stdout)
+  const result = JSON.parse(r.stdout)
+  result.observation = r.stderr.split(/\r?\n/).filter(s => s.startsWith('CLAWPANEL_HERMES_CIM_PROBE ')).map(s => JSON.parse(s.slice('CLAWPANEL_HERMES_CIM_PROBE '.length)))
+  return result
 }
 test('父进程已退出、后代仍持管道时先关闭自有 Job，不白等原预算；完整 UTF8 与返回值保留', { timeout: 10000 }, t => {
   const r = probe(t, 'inherited-pipe')
   assert.equal(r.error, null); assert.match(r.result || '', /CommandLine=中文/); assert.match(r.result, /parent-complete/)
   assert.ok(r.elapsed < .65, JSON.stringify(r)); assert.equal(r.state.closes, 1); assert.equal(r.restored, true)
+})
+
+test('固定CIM调用只投影原来实际使用的两个字段，仍遍历全进程，不减少冲突检查', { timeout: 10000 }, t => {
+  const r = probe(t, 'inherited-pipe')
+  assert.match(r.state.query, /^Get-CimInstance Win32_Process -Property ProcessId,CommandLine \|/)
+  assert.doesNotMatch(r.state.query, /-Filter|-Query|Where-Object|Select-Object|ErrorAction/)
+  assert.match(r.state.query, /'CommandLine='/); assert.match(r.state.query, /'ProcessId='/)
 })
 test('实际子进程未退出仍守原 deadline，未知列表明确失败，不把空集合当无冲突', { timeout: 10000 }, t => {
   const r = probe(t, 'timeout')
@@ -87,4 +98,14 @@ test('旧兼容层没有 kill_and_drain 时仍执行原有有界树清理，不�
   const r = probe(t, 'legacy-timeout')
   assert.equal(r.error?.type, 'SystemExit'); assert.equal(r.state.legacyCleanup, 1); assert.ok(r.elapsed < 2)
   assert.equal(r.restored, true)
+})
+
+test('实际deadline失败只记录数值/类型/直接子进程状态，不打印argv输出或异常消息', { timeout: 10000 }, t => {
+  const r = probe(t, 'observe-timeout')
+  const failed = r.observation.find(v => v.event === 'failure')
+  assert.ok(failed, '原R12库存失败未保留直接子进程状态，机制仍未定位')
+  assert.equal(failed.exceptionType, 'TimeoutExpired'); assert.equal(failed.directExitCode, null)
+  assert.ok(failed.elapsedMs >= 650 && failed.elapsedMs < 1700)
+  assert.ok(failed.pid > 0); assert.equal(r.error?.type, 'SystemExit')
+  for (const row of r.observation) for (const key of Object.keys(row)) assert.ok(['event','pid','elapsedMs','exceptionType','directExitCode','deadlineMs'].includes(key), key)
 })
