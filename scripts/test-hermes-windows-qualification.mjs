@@ -793,7 +793,8 @@ async function execute(o) {
       if (diagnostic) { r.diagnostic.gatewayReadyWithinBudget = true; await capturePids(); return { scope: r.diagnostic.scope, gatewayReadyWithinBudget: true } }
       const dash = await api('hermes_dashboard_start'); assert.equal(dash.started, true); assert.equal((await api('hermes_dashboard_probe')).running, true); await capturePids()
       await run(process.execPath, [npmCli, 'install', '--prefix', path.join(home, 'browser-tools'), '--no-save', '--ignore-scripts', '--package-lock=false', 'playwright@1.58.2'], { timeout: 600000 })
-      await run(process.execPath, [path.join(home, 'browser-tools/node_modules/playwright/cli.js'), 'install', 'chromium'], { timeout: 600000 })
+      // 本验收只用默认headless shell；不再下载未使用的headed Chrome，原600秒和真实启动/长UI门禁不变。
+      await run(process.execPath, [path.join(home, 'browser-tools/node_modules/playwright/cli.js'), 'install', '--only-shell', 'chromium'], { timeout: 600000 })
       const { chromium } = await import(pathToFileURL(path.join(home, 'browser-tools/node_modules/playwright/index.mjs')))
       browser = await chromium.launch({ headless: true }); context = await browser.newContext({ locale: 'zh-CN' }); await context.tracing.start({ screenshots: true, snapshots: true, sources: true })
       const pageErrors = [], screenshots = [], prompts = []; context.on('page', p => p.on('pageerror', e => pageErrors.push(String(e))))
