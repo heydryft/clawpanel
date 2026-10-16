@@ -5,6 +5,46 @@ import { createInterface } from 'node:readline'
 
 const imageKey = value => path.win32.normalize(String(value || '')).toLowerCase()
 
+// 只在原断言失败时调用；不新增进程查询，不用另时刻native样本自动归因或替代raw门禁。
+export function formatFixtureBoundsFailure(report) {
+  const number = value => Number.isFinite(value) ? value : null
+  const hex = value => /^[0-9a-f]{16}$/i.test(value || '') ? value : null
+  const native = row => row ? {
+    sampledAtMs: number(row.sampledAtMs), status: ['running', 'exited', 'missing', 'error'].includes(row.status) ? row.status : 'unknown',
+    creationTimeFileTimeHex: hex(row.creationTimeFileTimeHex), createdAtMs: number(row.createdAtMs), exitAtMs: number(row.exitAtMs),
+    belongsToFixture: typeof row.belongsToFixture === 'boolean' ? row.belongsToFixture : null,
+    waitResult: number(row.waitResult), nativeError: number(row.nativeError), imageQueryError: number(row.imageQueryError),
+  } : null
+  const event = row => row ? {
+    event: ['start', 'exit', 'write', 'failure'].includes(row.event) ? row.event : 'unknown', pid: number(row.pid),
+    name: /^(?:burst-\d{1,3}|fail|recovery)$/.test(row.name || '') ? row.name : '[other]', at: number(row.at), monotonicMs: number(row.monotonicMs),
+  } : null
+  const rows = (report.observations || []).flatMap(observation => observation.processes || [])
+  const peaks = report.rawPeakSamples || []
+  const selected = peaks.filter(sample => sample.count === report.peak).slice(0, 3)
+  const samples = selected.map(sample => ({
+    count: number(sample.count), startedAtMs: number(sample.startedAtMs), completedAtMs: number(sample.completedAtMs), probeCount: number(sample.probeCount),
+    pids: (sample.probes || []).slice(0, 8).map(probe => {
+      const candidates = rows.filter(row => row.pid === probe.pid && Number.isFinite(row.sampledAtMs)).sort((a, b) => a.sampledAtMs - b.sampledAtMs)
+      const events = (report.events || sample.starts || []).filter(row => row.pid === probe.pid)
+      return {
+        pid: number(probe.pid), alive: probe.alive === true, startedAtMs: number(probe.startedAtMs), completedAtMs: number(probe.completedAtMs),
+        startedAtNs: /^\d{1,24}$/.test(probe.startedAtNs || '') ? probe.startedAtNs : null,
+        completedAtNs: /^\d{1,24}$/.test(probe.completedAtNs || '') ? probe.completedAtNs : null,
+        start: event(events.find(row => row.event === 'start')), lastEvent: event(events.at(-1)),
+        nativeFirst: native(candidates[0]), nativeBefore: native(candidates.filter(row => row.sampledAtMs <= probe.startedAtMs).at(-1)),
+        nativeAfter: native(candidates.find(row => row.sampledAtMs >= probe.completedAtMs)),
+      }
+    }),
+  }))
+  const result = { cause: 'unresolved', samplingNotSimultaneous: true, rawPeak: number(report.peak), nativePeak: number(report.nativePeak),
+    rawSamplesCaptured: peaks.length, samples, observerErrorCount: report.observerErrors?.length || 0,
+    requestCount: report.requests?.length || 0, failureRecoveryPhase: report.failed ? 'failure-requested' : 'not-reached' }
+  // 只输出白名单数字/枚举/fixture名，绝不输出env、argv、文件路径或原错误正文。
+  while (Buffer.byteLength(JSON.stringify(result)) > 24576 && result.samples.length) result.samples.pop()
+  return JSON.stringify(result)
+}
+
 export function classifyFixtureIdentitySample({ starts, processes, expectedExecutable }) {
   const receipts = new Map(starts.filter(row => row.event === 'start').map(row => [row.pid, row]))
   const identities = new Map(processes.map(row => [row.pid, row]))

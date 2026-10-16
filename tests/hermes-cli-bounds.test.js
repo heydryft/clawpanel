@@ -7,11 +7,20 @@ import path from 'node:path'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { formatFixtureBoundsFailure } from '../scripts/hermes-cli-bounds-observation.mjs'
 
 const root = path.resolve(process.env.HERMES_ASYNC_TEST_ROOT || fileURLToPath(new URL('..', import.meta.url)))
 const evidence = process.env.HERMES_BOUNDS_TEST_EVIDENCE
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
-const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+let rawProbeSink = null
+const alive = pid => {
+  const sink = rawProbeSink, startedAtMs = sink ? Date.now() : null, startedAtNs = sink ? process.hrtime.bigint().toString() : null
+  let value = false
+  try { process.kill(pid, 0); value = true; return true } catch { return false }
+  finally {
+    if (sink) { sink.count++; if (sink.probes.length < 8) sink.probes.push({ pid, alive: value, startedAtMs, completedAtMs: Date.now(), startedAtNs, completedAtNs: process.hrtime.bigint().toString() }) }
+  }
+}
 
 test('PID 观察传输：原2秒超时终止本观察器，迟到响应不得污染下一次或恢复成绿灯', { timeout: 7000 }, async t => {
   const { startFixtureObserverTransport } = await import('../scripts/hermes-cli-bounds-observation.mjs')
@@ -175,7 +184,7 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   const home = path.join(dir, 'h'), bin = path.join(home, '.hermes/bin'), log = path.join(dir, 'cli.jsonl')
   const readEvents = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(s => JSON.parse(s)) : []
   let child, gateway, sampler, nativeSampler, observer, sampleInFlight, pressureChild, pressureTask, stopPressure = false, peak = 0
-  const report = { scope: 'production middleware / isolated CLI concurrency and real HTTP', root, requests: [], health: [], peak: 0, legacyPeak: 0, nativePeak: 0, observations: [], observerErrors: [], pressure: [], environment: { platform: process.platform, node: process.version, executable: process.execPath }, pressureEnabled: process.env.HERMES_BOUNDS_OBSERVATION_PRESSURE === '1' }
+  const report = { scope: 'production middleware / isolated CLI concurrency and real HTTP', root, requests: [], health: [], peak: 0, legacyPeak: 0, nativePeak: 0, rawPeakSamples: [], observations: [], observerErrors: [], pressure: [], environment: { platform: process.platform, node: process.version, executable: process.execPath }, pressureEnabled: process.env.HERMES_BOUNDS_OBSERVATION_PRESSURE === '1' }
   const expectedExecutable = path.join(bin, 'hermes.exe')
   const sample = async () => {
     const starts = readEvents().filter(e => e.event === 'start'), pids = [...new Set(starts.map(e => e.pid))]
@@ -230,7 +239,18 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
     report.observerPid = observer.pid
   }
   // 保留原25ms裸PID门禁；不被原生侧车的异步busy/采样速度合并或跳过。
-  sampler = setInterval(() => { const pids = [...new Set(readEvents().filter(e => e.event === 'start').map(e => e.pid))]; peak = Math.max(peak, pids.filter(alive).length); report.legacyPeak = peak }, 25)
+  sampler = setInterval(() => {
+    const starts = readEvents().filter(e => e.event === 'start'), pids = [...new Set(starts.map(e => e.pid))]
+    const startedAtMs = Date.now(), sink = { count: 0, probes: [] }
+    rawProbeSink = sink
+    let count
+    try { count = pids.filter(alive).length } finally { rawProbeSink = null }
+    if (count > peak || (count > 2 && report.rawPeakSamples.length < 8)) {
+      if (report.rawPeakSamples.length >= 8) report.rawPeakSamples.pop()
+      report.rawPeakSamples.push({ count, startedAtMs, completedAtMs: Date.now(), probeCount: sink.count, probes: sink.probes, starts: starts.slice(-8) })
+    }
+    peak = Math.max(peak, count); report.legacyPeak = peak
+  }, 25)
   // 原生侧车独立采样；逐PID并非atomic snapshot，不能替代原门禁。
   if (observer) nativeSampler = setInterval(() => {
     if (sampleInFlight) return
@@ -258,7 +278,7 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   // 先保存完整红灯事实，再断言；不让第一个并发失败掩盖其他观测。
   report.events = readEvents(); report.peak = peak
   assert.equal(health.status, 200, JSON.stringify(health)); assert.deepEqual(health.value, healthPayload); assert.ok(health.ms < 2000, 'CLI过载期间真实health: ' + JSON.stringify(health))
-  assert.ok(peak <= 2, `实际子进程峰值 ${peak}，不应无界启动`)
+  assert.ok(peak <= 2, `实际子进程峰值 ${peak}，不应无界启动${peak > 2 ? '；诊断（不同时间采样，未归因）=' + formatFixtureBoundsFailure(report) : ''}`)
   assert.ok(report.nativePeak <= 2, `另时刻逐PID原生观察峰值 ${report.nativePeak}；仅附加门禁，不替代原kill0门禁`)
   const busy = results.filter(r => r.status === 500 && /queue.*full/i.test(r.value.error))
   assert.equal(busy.length, 2, JSON.stringify(results)); assert.ok(busy.every(r => r.ms < 2000), '队满立即失败')

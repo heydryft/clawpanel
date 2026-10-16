@@ -91,19 +91,33 @@ test('Windows真实文件symlink仍读link metadata而非target内容；target�
   const f = fixture()
   try {
     const link = path.join(f.one, 'hermes-link.exe'), target = path.join(f.two, 'not-hermes.exe')
-    try { fs.symlinkSync(target, link, 'file'); f.links.push(link) } catch (error) {
-      if (error.code !== 'EPERM') throw error
-      t.skip('当前非提权宿主缺文件symlink创建权；目录junction负向及typed reparse既有测试另验，VM文件symlink仍需验证')
-      return
-    }
-    const { value } = run(f, `${original}\n$old=@($launchers)\n${block}\n@{old=$old;new=@($launchers)}|ConvertTo-Json -Depth 12 -Compress`)
+    fs.symlinkSync(target, link, 'file'); f.links.push(link)
+    assert.ok(fs.lstatSync(link).isSymbolicLink()); assert.ok(fs.statSync(target).isFile())
+    // 属性只改本fixture链接自身；不对生产枚举加Force，也不把NoForce合理排除当成正例通过。
+    const visible = `$link=Join-Path $fixture.one 'hermes-link.exe';$before=[int64][IO.File]::GetAttributes($link);[IO.File]::SetAttributes($link,($before -band (-bnot ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System))));$literal=Get-Item -LiteralPath $link -Force -ErrorAction Stop;$linkProof=@{path=$literal.FullName;before=$before;attributes=[int64][IO.File]::GetAttributes($link);fingerprint=(Get-ClawPanelPathFingerprint $link)}`
+    const pair = `function Read-FixtureLauncherPair {\n${original}\n$old=@($launchers)\n${block}\nreturn @{old=$old;new=@($launchers)}\n}`
+    const { value } = run(f, `${pair}\n$link=Join-Path $fixture.one 'hermes-link.exe';$initialAttributes=[int64][IO.File]::GetAttributes($link);$initial=Read-FixtureLauncherPair;[IO.File]::SetAttributes($link,($initialAttributes -bor [IO.FileAttributes]::Hidden));$hiddenAttributes=[int64][IO.File]::GetAttributes($link);$hidden=Read-FixtureLauncherPair\n${visible}\n$shown=Read-FixtureLauncherPair;@{old=$shown.old;new=$shown.new;initial=$initial;initialAttributes=$initialAttributes;hidden=$hidden;hiddenAttributes=$hiddenAttributes;link=$linkProof}|ConvertTo-Json -Depth 12 -Compress`)
     assert.deepEqual(value.new, value.old)
-    const observed = value.new.find(x => x.path.toLowerCase() === link.toLowerCase())
+    const selected = (rows, expected = value.link.path) => rows.filter(x => x.path.toLowerCase() === expected.toLowerCase())
+    const diagnostic = { initialAttributes: value.initialAttributes, hiddenAttributes: value.hiddenAttributes, visibleAttributes: value.link.attributes, initiallySelectedOld: selected(value.initial.old).length, initiallySelectedNew: selected(value.initial.new).length }
+    t.diagnostic(JSON.stringify(diagnostic))
+    assert.deepEqual(value.initial.new, value.initial.old)
+    assert.deepEqual(value.hidden.new, value.hidden.old)
+    assert.ok(value.hiddenAttributes & 2); assert.equal(selected(value.hidden.old).length, 0); assert.equal(selected(value.hidden.new).length, 0)
+    assert.equal(value.link.attributes & 6, 0); assert.ok(value.link.attributes & 1024)
+    assert.equal(selected(value.old).length, 1, JSON.stringify({ ...diagnostic, literal: value.link, original: value.old }))
+    assert.equal(selected(value.new).length, 1, JSON.stringify({ ...diagnostic, literal: value.link, filtered: value.new }))
+    const observed = selected(value.new)[0]
+    assert.deepEqual(observed.fingerprint, value.link.fingerprint, '必须是LiteralPath读到的真实同一reparse，不能按basename宽松补认')
     assert.equal(observed.fingerprint.kind, 'reparse'); assert.equal(observed.sha256, null)
     assert.equal(observed.fingerprint.linkType, 'SymbolicLink'); assert.ok(observed.fingerprint.metadataSha256)
     fs.unlinkSync(link); fs.symlinkSync(path.join(f.one, 'not-hermes.exe'), link, 'file')
-    const changed = run(f, `${block}\nConvertTo-Json -InputObject @($launchers) -Depth 12 -Compress`).value
-    const actual = changed.find(x => x.path.toLowerCase() === link.toLowerCase())
+    const after = run(f, `${visible}\n${pair}\n$shown=Read-FixtureLauncherPair;@{old=$shown.old;new=$shown.new;link=$linkProof}|ConvertTo-Json -Depth 12 -Compress`).value
+    assert.deepEqual(after.new, after.old)
+    const changed = after.new
+    assert.equal(selected(changed, after.link.path).length, 1, JSON.stringify({ literal: after.link, filtered: changed }))
+    const actual = selected(changed, after.link.path)[0]
+    assert.deepEqual(actual.fingerprint, after.link.fingerprint)
     assert.notEqual(actual.fingerprint.metadataSha256, observed.fingerprint.metadataSha256)
     assert.throws(() => assertHostUnchanged({ launchers: value.new }, { launchers: changed }), /宿主/)
   } finally { f.dispose() }
