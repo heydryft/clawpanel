@@ -394,8 +394,17 @@ def run():
         p=self.root/'hermes_cli/gateway.py';self.write('hermes_cli/gateway.py',p.read_text().replace("return 'ProcessId=123\\nCommandLine=fixture\\n'",'return None'))
         ns={};helper=entry.with_name('hermes-windows-cim-probe.py')
         exec(compile(helper.read_bytes(),str(helper),'exec'),ns)
-        def install(g,c,s):return ns['install_windows_cim_probe'](g,c,s,platform='nt')
-        with self.assertRaisesRegex(SystemExit,'inventory unavailable'):self.run_console(install=install)
+        calls=[]
+        def unknown_spawn(argv,**kwargs):
+            calls.append(argv)
+            raise OSError('owned COM inventory unavailable')
+        def install(g,c,s):return ns['install_windows_cim_probe'](g,c,unknown_spawn,platform='nt')
+        from unittest.mock import patch
+        # getter已窄接WMIC/COM；不依赖测试宿主有没有WMIC，实际COM未知仍须中止原console。
+        with patch('shutil.which',return_value=None),self.assertRaisesRegex(SystemExit,'inventory unavailable'):
+            self.run_console(install=install)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0][1:4],['-I','-B','-c'])
         self.assertIsNone(sys.modules['hermes_cli.gateway']._windows_process_listing())
 
     def test_do_not_clobber_subsequent_loader_or_finder(self):

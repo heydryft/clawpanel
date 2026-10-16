@@ -150,6 +150,73 @@ fn decode(value: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn complete_old_new_com_body_matches_actual_node_envelope_byte_for_byte() {
+        // 两端读取同一静态 helper，禁止压缩层局部绿但实际旧/新入口遗漏 worker。
+        let file = PathBuf::from(file!());
+        let file = if file.is_absolute() {
+            file
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(file)
+        };
+        let root = file.ancestors().nth(4).unwrap();
+        let node = std::process::Command::new("node")
+            .current_dir(root)
+            .args(["--input-type=module", "-e", r#"
+import fs from 'node:fs';
+import {HERMES_PRIVATE_LAUNCH_SCRIPT as pm} from './scripts/hermes-pm-runtime.js';
+import {hermesWindowsScript as render,decodeHermesWindowsScript as decode} from './scripts/hermes-windows-script-envelope.js';
+const old=fs.readFileSync('scripts/hermes-legacy-gateway-identity.py','utf8').replaceAll('\r\n','\n')+'\n'+fs.readFileSync('scripts/hermes-legacy-windows-launch.py','utf8').replaceAll('\r\n','\n');
+for(const [v,p,b] of [['0.22.2','d923a5eb487a17c0a68801bba9ef0f56c81040a8',pm],['0.21.5','f97608f178d1ffeca59860195ab7da295f7c8e5f',old]])
+  console.log(Buffer.from(decode(render(b,{platform:'win32',version:v,pin:p})).script).toString('base64'));
+"#])
+            .output()
+            .unwrap();
+        assert!(
+            node.status.success(),
+            "{}",
+            String::from_utf8_lossy(&node.stderr)
+        );
+        let output = String::from_utf8(node.stdout).unwrap();
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let pm = include_str!("../../../scripts/hermes-pm-runtime.js");
+        let new = pm
+            .split_once("export const HERMES_PRIVATE_LAUNCH_SCRIPT = String.raw`")
+            .unwrap()
+            .1
+            .split_once('`')
+            .unwrap()
+            .0
+            .to_string();
+        let old = include_str!("../../../scripts/hermes-legacy-gateway-identity.py")
+            .replace("\r\n", "\n")
+            + "\n"
+            + &include_str!("../../../scripts/hermes-legacy-windows-launch.py")
+                .replace("\r\n", "\n");
+        for ((base, version, pin), line) in [(new, "0.22.2", NEW_PIN), (old, "0.21.5", OLD_PIN)]
+            .iter()
+            .zip(lines)
+        {
+            let wire = render(base, version, pin).unwrap();
+            let raw = decode(&wire).unwrap();
+            assert!(raw.contains("HERMES_WINDOWS_WMI_WORKER = r'''"));
+            assert!(raw.contains("[sys.executable, '-I', '-B', '-c', HERMES_WINDOWS_WMI_WORKER]"));
+            assert_eq!(
+                raw.as_bytes(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(line)
+                    .unwrap()
+            );
+            println!(
+                "COM body parity {version}: raw={}, wire={}, sha={:x}",
+                raw.len(),
+                wire.len(),
+                Sha256::digest(raw.as_bytes())
+            );
+        }
+    }
+
     fn base() -> String {
         "import os,hashlib\nPIN='d923a5eb487a17c0a68801bba9ef0f56c81040a8'\nroot=None\ndef _hp(name):pass\ndef require(value,message):assert value,message\ndef restore_policy():pass\ntry:\n    _hp('main_b')\n    print('fixture')\nfinally:\n    restore_policy()\n".into()
     }
