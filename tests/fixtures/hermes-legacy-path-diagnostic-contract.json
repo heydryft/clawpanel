@@ -1,0 +1,31 @@
+{
+  "baseline": "4ca2783d3e2ea0cf4430ae71a2c5904f18d0f982",
+  "sourceHashes": {
+    "hermes_cli/__init__.py": "d05c98cd44e22781497a20cd968af0d9b8962406b909f1889168c624545b229e",
+    "hermes_cli/main.py": "3b89b46e67f35398ba0af6b3441172490469702cd0e4e0381ff7e45ea78b2eef",
+    "hermes_cli/gateway.py": "d8cdbd900dbebcbaffc0406442711bbd592f292614e1d59578f9b4c163c379f3",
+    "hermes_cli/_subprocess_compat.py": "f7b8523add2524094ab0b0ea781c718c8cbcb43a49746dfc8c09c20050974825",
+    "hermes_cli/local_runtime/__init__.py": "bf9ecb796553a40a231163520caaeeb3d3eb5486ea13ea1745b3717c19fa1de8",
+    "hermes_cli/local_runtime/processes.py": "763c450a9fe8b7eea5684576564b1fe8ffd58d6c16fc444dfd5e3b14986efb2b",
+    "hermes_cli/gateway_windows.py": "b7fc0d1549baf46f55931fdb28eed47984869ea4efa4d910ff5e701a05795e1c",
+    "hermes_cli/service_manager.py": "9f1e567f9c77f4bd697844feac59e57736df84ed96f9e99723372f5590bf604c",
+    "hermes_cli/_startup_fast.py": "694995a782f451a887c139895e8ac29b3d0f20e86f1f0368cbd19b9e6990ef58",
+    "hermes_cli/_early_recovery.py": "f1e62e68dde843d0575fcca24c9c3782f36f492a366d8edd480bc8f09c7f9c14",
+    "hermes_bootstrap.py": "7e46edcde82897d5dbd95e7ae8a601b9b1f13009f98d8a07d19116c85d7f4d2a",
+    "gateway/__init__.py": "8920ead12b3b78cc727b2c6257192e954bc790717676484ad66b3238e511b95e",
+    "gateway/status.py": "b7923018b5285d042313cf41421c3aec3260e560c4b5a326544b64f000ca424c"
+  },
+  "unchangedAstExceptSlotKeywords": {
+    "_require": "bebdb8250f1717df9d02f121834c2291a446b63950674a327ebb95a6a1c219bd",
+    "_runtime_facts": "8509bb825f82641a65f3d110095b1419883c6fc653a0acb8b1e5e65b39974ec9",
+    "_validate_layout": "b2a4c4cdc4f7c5743a2678037e597af72e1620d469ef0667bde4079551af173a",
+    "_validate_effective_home": "b1169211b132479d007d06c7487a6aafeaf1fbbdb714cdc542ff0d4b02eddb73",
+    "_SourceContract": "d97a8954a473a7608bdb18fa0f4d46d07dc980c441f013c9a871b06c0e8e4aea",
+    "_check_interface": "926a0102f623de495fa7e535abf93983c37a2a5d5100f92e91452924f01a8568",
+    "_GatewayLoader": "75919722f29c42d90d94df2c7ef56e2b8d51cc8090aa29e19851a5fa4872594e",
+    "_OwnedIdentityHooks": "452f3505a9c1ee9f017d7301e670e4cafea379bbcee9d16fc62f384bd51f469a",
+    "_PinnedFinder": "038ca6ef21df14f94a6faafef05d585e0f0b60fca8443f65379f91d852f20187",
+    "_run_console": "edd00b614af9f5318fce07f9fc54a343abe2dcb111fc11f02ce090d7ea54f153",
+    "_parse_args": "c18ab0279eff5cfc7d270327333f19f1f0fb38a37a2cd4168d2b4b930cc22045"
+  }
+}
