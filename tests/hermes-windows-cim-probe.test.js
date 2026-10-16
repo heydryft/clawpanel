@@ -45,6 +45,7 @@ query="""Get-CimInstance Win32_Process | ForEach-Object {   'CommandLine=' + ($_
 argv=['powershell.exe','-NoProfile','-Command',query]
 def listing():
  if mode=='listing-error':raise ValueError('fixture unknown inventory')
+ if mode=='empty-result':return ''
  r=c.bounded_probe_run(argv,timeout=.7,errors='ignore');return None if r is None or r.returncode else r.stdout
 g._windows_process_listing=listing
 restore=None
@@ -78,8 +79,8 @@ test('父进程已退出、后代仍持管道时先关闭自有 Job，不白等�
 
 test('固定CIM调用只投影原来实际使用的两个字段，仍遍历全进程，不减少冲突检查', { timeout: 10000 }, t => {
   const r = probe(t, 'inherited-pipe')
-  assert.match(r.state.query, /^Get-CimInstance Win32_Process -Property ProcessId,CommandLine \|/)
-  assert.doesNotMatch(r.state.query, /-Filter|-Query|Where-Object|Select-Object|ErrorAction/)
+  assert.match(r.state.query, /Get-CimInstance Win32_Process -Property ProcessId,CommandLine/)
+  assert.doesNotMatch(r.state.query, /-Filter|-Query|Where-Object|Select-Object|-ErrorAction\s+(?:Ignore|Continue|SilentlyContinue)/)
   assert.match(r.state.query, /'CommandLine='/); assert.match(r.state.query, /'ProcessId='/)
 })
 test('实际子进程未退出仍守原 deadline，未知列表明确失败，不把空集合当无冲突', { timeout: 10000 }, t => {
@@ -123,4 +124,19 @@ test('CIM专属PowerShell子环境不继承异版PSModulePath，其他变量和�
   assert.equal(r.state.explicitEnv, true); assert.equal(r.state.foreignModulePath, false)
   assert.equal(r.state.otherEnv, 'retained'); assert.equal(r.state.parentEnvUnchanged, true)
   assert.equal(r.error, null); assert.equal(r.restored, true)
+})
+
+test('Windows PS5用本地WMI完整表，Core保留CIM；UTF8和Stop错误策略，不添加远程或提权参数', { timeout: 10000 }, t => {
+  const r = probe(t, 'inherited-pipe')
+  assert.match(r.state.query, /\$PSVersionTable\.PSEdition -eq 'Desktop'/)
+  assert.match(r.state.query, /Get-WmiObject -Class Win32_Process -Property ProcessId,CommandLine/)
+  assert.match(r.state.query, /else \{ Get-CimInstance Win32_Process -Property ProcessId,CommandLine \}/)
+  assert.match(r.state.query, /\$ErrorActionPreference='Stop'/)
+  assert.match(r.state.query, /\[Console\]::OutputEncoding=.*UTF8Encoding/)
+  assert.doesNotMatch(r.state.query, /ComputerName|Credential|EnableAllPrivileges|Set-MpPreference|ErrorAction\s+(?:Ignore|Continue)/)
+})
+
+test('空进程表不等于没有冲突，保持失败；真实Windows至少有查询进程自身', { timeout: 10000 }, t => {
+  const r = probe(t, 'empty-result')
+  assert.equal(r.error?.type, 'SystemExit'); assert.equal(r.result, null); assert.equal(r.restored, true)
 })
