@@ -14905,6 +14905,118 @@ pub async fn hermes_update_model(
 }
 
 // ---------------------------------------------------------------------------
+fn hermes_gateway_status_output(out: std::process::Output) -> Result<String, String> {
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() {
+        return Ok(stdout);
+    }
+    let mut detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !stdout.is_empty() {
+        detail.push_str(&format!("\npartial stdout (not status): {stdout}"));
+    }
+    // 与 Web 既有 redactor 一致，先脱敏再保留至多6000字符尾部；不解释状态正文。
+    for pattern in [
+        r#"(?i)(Bearer\s+)[^\s"']+"#,
+        r#"(?i)((?:api[_-]?key|token|password|secret)\s*[=:]\s*["']?)[^\s,"'}]+"#,
+    ] {
+        detail = regex::Regex::new(pattern)
+            .expect("固定脱敏模式")
+            .replace_all(&detail, "${1}[REDACTED]")
+            .into_owned();
+    }
+    detail = regex::Regex::new(r"\bsk-[a-zA-Z0-9_-]+")
+        .expect("固定脱敏模式")
+        .replace_all(&detail, "[REDACTED]")
+        .into_owned();
+    let tail: String = detail.chars().rev().take(6000).collect();
+    let detail: String = tail.chars().rev().collect();
+    let code = out
+        .status
+        .code()
+        .map_or_else(|| "null".into(), |n| n.to_string());
+    Err(format!(
+        "Gateway 状态查询失败: CLI failed (code={code}; {})\n{detail}",
+        out.status
+    ))
+}
+
+#[cfg(test)]
+mod hermes_gateway_status_error_tests {
+    use super::hermes_gateway_status_output;
+
+    fn fixture_output(code: u32, stdout: &str, stderr: &str) -> std::process::Output {
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code)
+        };
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw((code as i32) << 8)
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn status_exit7_keeps_error_not_partial_running() {
+        let out = fixture_output(
+            7,
+            "Gateway running PID 12345",
+            "fixture failure Bearer fixture-bearer api_key=fixture-key token=fixture-token password=fixture-password secret=fixture-secret sk-fixture-key",
+        );
+        let error = hermes_gateway_status_output(out).unwrap_err();
+        assert!(error.contains("Gateway 状态查询失败"));
+        assert!(error.contains("7"));
+        assert!(error.contains("fixture failure"));
+        for secret in [
+            "fixture-bearer",
+            "fixture-key",
+            "fixture-token",
+            "fixture-password",
+            "fixture-secret",
+        ] {
+            assert!(!error.contains(secret));
+        }
+    }
+
+    #[test]
+    fn status_exit0_keeps_text_including_unknown_and_empty() {
+        for text in [
+            "  Gateway running PID 12345\n完整 Unicode 🦀\n",
+            "Gateway is not running.\n",
+            "unknown",
+            "",
+        ] {
+            assert_eq!(
+                hermes_gateway_status_output(fixture_output(0, text, "ignored stderr")).unwrap(),
+                text.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn status_error_tail_is_bounded_and_redacted() {
+        let stderr = format!("{}\nfixture-tail token=fixture-token", "界".repeat(8000));
+        let error = hermes_gateway_status_output(fixture_output(7, "", &stderr)).unwrap_err();
+        assert!(error.chars().count() <= 6400);
+        assert!(error.contains("fixture-tail"));
+        assert!(!error.contains("fixture-token"));
+    }
+
+    #[test]
+    fn status_failure_without_stderr_is_still_error() {
+        assert!(
+            hermes_gateway_status_output(fixture_output(7, "Gateway running PID 12345", ""))
+                .is_err()
+        );
+    }
+}
+
 // hermes_gateway_action — Gateway 管理
 // ---------------------------------------------------------------------------
 
@@ -15194,8 +15306,7 @@ pub async fn hermes_gateway_action(
             #[cfg(target_os = "windows")]
             cmd.creation_flags(CREATE_NO_WINDOW);
             let out = cmd.output().await.map_err(|e| format!("查询失败: {e}"))?;
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            Ok(stdout)
+            hermes_gateway_status_output(out)
         }
         "install" => {
             let mut cmd = hermes_tokio_command()?;

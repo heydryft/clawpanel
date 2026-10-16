@@ -511,12 +511,28 @@ async function runHermesSilent(program, args) {
       child.stdin?.end()
     })
     if (!result.error) return { ok: true, stdout: String(result.stdout || '').trim() }
-    return { ok: false, stderr: String(result.stderr || result.error.message || result.error).trim() }
+    return {
+      ok: false, stderr: String(result.stderr || result.error.message || result.error).trim(),
+      // 双流仍由原 maxBuffer 约束；仅 status 的错误投影消费这些附加诊断。
+      stdout: String(result.stdout || '').trim(),
+      code: result.error.code ?? null, signal: result.error.signal ?? null,
+      killed: result.error.killed === true,
+      // execFile 只有原 deadline / maxBuffer 会主动 kill；后者有独立错误 code。
+      timedOut: result.error.killed === true && result.error.signal === 'SIGTERM' && result.error.code == null,
+    }
   } catch (e) {
     return { ok: false, stderr: String(e) }
   } finally {
     release?.()
   }
+}
+
+function hermesGatewayStatusError(result) {
+  const reason = result.timedOut ? 'CLI timeout/deadline exceeded (15000ms)' : 'CLI failed'
+  const metadata = `code=${result.code ?? 'null'}; signal=${result.signal ?? 'null'}; killed=${result.killed === true}`
+  // 先脱敏再按已有 CLI 错误尾部上限截断；原因留在截断之外，partial stdout 不是状态。
+  const detail = redactPluginOutput([result.stderr, result.stdout ? `partial stdout (not status): ${result.stdout}` : ''].filter(Boolean).join('\n')).slice(-6000)
+  return `Gateway 状态查询失败: ${reason} (${metadata})${detail ? `\n${detail}` : ''}`
 }
 
 async function runHermesManagedMetadataSilent() {
@@ -17386,7 +17402,8 @@ const handlers = {
     }
     if (action === 'status') {
       const r = await runHermesSilent('hermes', ['gateway', 'status'])
-      return r.ok ? r.stdout : 'unknown'
+      if (!r.ok) throw new Error(hermesGatewayStatusError(r))
+      return r.stdout
     }
     throw new Error(`不支持的操作: ${action}`)
   },
