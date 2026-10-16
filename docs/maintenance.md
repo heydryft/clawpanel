@@ -83,6 +83,10 @@ Linux 使用原可信 Runtime.Dockerfile、非 root、只读 tooling、无 Docke
 
 原始证据保留在一次性 runner，公开 artifact 仅包含另外生成的脱敏副本；不上传 HOME、dotenv、运行时、缓存或真实凭据，trace ZIP 逐成员脱敏。资格验收本身不提交、不升级用户机器、不打 tag。
 
+`weixin-qualification.yml` 是独立的手工 Windows 原生验收：固定官方宿主5.12/9.8/10.4、完整候选SHA，真实VM/SID准入后才进行私有安装、no-bundle构建和WebView2操作。`ui-origin` 只记录已执行的安装确认及来源边界阶段，不构成完整发版资格；`complete` 对缺失负向或清理证据保持失败。报告分别列出真实UI、SDK/配置回读、有效票据的iframe拒绝、上游策略拒绝及窗口覆盖缺口，不用fixture、缺API或框架拒绝创建窗口代替产品来源拒绝。工作流只有读权限，不安装本机运行时、不修改官网或控制器发版开关。
+
+Hermes Windows的生产STOP验收须有新鲜、非空的停止前PID及CreationDate、同一集合的停止后观察和两个配置端口的实际关闭证据。空进程集合、空stdout、旧历史Set和单纯基础设施清理都不构成生产STOP通过。CLI的execFile观察只保留脱敏诊断，不替换原回调、双流、退出码或预算。
+
 在仓库根目录执行（不会改动真实运行时）：
 
 ```powershell

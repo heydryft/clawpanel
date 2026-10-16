@@ -12,6 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { prepareStartupDiagnosticSpawn, startHermesFilePhaseObservation } from './hermes-startup-diagnostic.mjs'
 import { observeHermesPythonCache } from './hermes-python-cache-observation.mjs'
 import { classifyHermesMetadataRequest } from './hermes-qualification-provider.mjs'
+import { createHermesExecFileObserver } from './hermes-exec-observation.mjs'
 
 export const STAGES = ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve']
 const tooling = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -417,13 +418,60 @@ export function createHermesPhaseReceiver(fs, file, childPid, observerPid, enabl
 
 // 只旁听真实 spawn 的参数/输出/退出，不替换返回值、环境、信号或阶段执行。
 export function spawnAuditSource(log, diagnostic = null) {
+  // execute仍只在真实VM准入后生成；内联可信tooling，不从候选目录加载观察器。
+  const execObservation = `const createHermesExecFileObserver=${createHermesExecFileObserver.toString()};cp.execFile=createHermesExecFileObserver(cp.execFile,{write:event=>fs.appendFileSync(file,JSON.stringify(event)+'\\n'),secrets:['qualification-local-no-secret']});`
   const injection = diagnostic ? `const startHermesFilePhaseObservation=${startHermesFilePhaseObservation.toString()};const configFile=${JSON.stringify(diagnostic.configFile)};const prepareStartupDiagnosticSpawn=${prepareStartupDiagnosticSpawn.toString()};` : ''
   const prepare = diagnostic ? `let diagnosticConfig=null;let diagnosticSpawn=false;if(Array.isArray(args[1])&&fs.existsSync(configFile)){diagnosticConfig=JSON.parse(fs.readFileSync(configFile,'utf8'));const originalSpec={program:args[0],args:args[1],options:args[2]};const prepared=prepareStartupDiagnosticSpawn(originalSpec,diagnosticConfig);diagnosticSpawn=prepared!==originalSpec;args=[prepared.program,prepared.args,prepared.options]};` : ''
   const fileObservation = diagnostic ? `if(diagnosticSpawn&&child.pid){const receiver=phaseReceiver(fs,diagnosticConfig.phaseOutput,child.pid,process.pid,true);const stopFile=startHermesFilePhaseObservation({fs,path,file:diagnosticConfig.gatewayLog,receive:receiver,onFinish:receipt=>record({event:'hermes-file-observation',receipt})});child.once('close',()=>stopFile())};` : ''
-  return `import cp from 'node:child_process';import fs from 'node:fs';import path from 'node:path';import {StringDecoder} from 'node:string_decoder';import {syncBuiltinESMExports} from 'node:module';const original=cp.spawn;${injection}const file=${JSON.stringify(log)};const phaseReceiver=${createHermesPhaseReceiver.toString()};cp.spawn=function(...args){${prepare}const child=Reflect.apply(original,this,args);const a=Array.isArray(args[1])?args[1]:[];const i=a.findIndex(x=>String(x).toLowerCase()==='-stage');const record=v=>fs.appendFileSync(file,JSON.stringify({pid:child.pid,program:args[0],args:a,stage:i>=0?a[i+1]:null,...v,at:new Date().toISOString()})+'\\n');if(child.pid)record({event:'start'});const phase=phaseReceiver(fs,file,child.pid,process.pid,process.env.CLAWPANEL_HERMES_PHASE_TIMING==='1');const outDecoder=new StringDecoder('utf8'),errDecoder=new StringDecoder('utf8');${fileObservation}let stdout='',stderr='';child.stdout?.on('data',d=>{stdout=(stdout+(typeof d==='string'?d:outDecoder.write(d))).slice(-1048576)});child.stderr?.on('data',d=>{stderr=(stderr+(typeof d==='string'?d:errDecoder.write(d))).slice(-1048576);phase(d)});child.on('close',(code,signal)=>{stdout=(stdout+outDecoder.end()).slice(-1048576);stderr=(stderr+errDecoder.end()).slice(-1048576);record({event:'close',exitCode:code,signal,stdout,stderr})});return child};syncBuiltinESMExports();`
+  return `import cp from 'node:child_process';import fs from 'node:fs';import path from 'node:path';import {StringDecoder} from 'node:string_decoder';import {syncBuiltinESMExports} from 'node:module';const original=cp.spawn;${injection}const file=${JSON.stringify(log)};const phaseReceiver=${createHermesPhaseReceiver.toString()};cp.spawn=function(...args){${prepare}const child=Reflect.apply(original,this,args);const a=Array.isArray(args[1])?args[1]:[];const i=a.findIndex(x=>String(x).toLowerCase()==='-stage');const record=v=>fs.appendFileSync(file,JSON.stringify({pid:child.pid,program:args[0],args:a,stage:i>=0?a[i+1]:null,...v,at:new Date().toISOString()})+'\\n');if(child.pid)record({event:'start'});const phase=phaseReceiver(fs,file,child.pid,process.pid,process.env.CLAWPANEL_HERMES_PHASE_TIMING==='1');const outDecoder=new StringDecoder('utf8'),errDecoder=new StringDecoder('utf8');${fileObservation}let stdout='',stderr='';child.stdout?.on('data',d=>{stdout=(stdout+(typeof d==='string'?d:outDecoder.write(d))).slice(-1048576)});child.stderr?.on('data',d=>{stderr=(stderr+(typeof d==='string'?d:errDecoder.write(d))).slice(-1048576);phase(d)});child.on('close',(code,signal)=>{stdout=(stdout+outDecoder.end()).slice(-1048576);stderr=(stderr+errDecoder.end()).slice(-1048576);record({event:'close',exitCode:code,signal,stdout,stderr})});return child};${execObservation}syncBuiltinESMExports();`
 }
 
 async function reachable(port) { return new Promise(resolve => { const s = net.connect({ host: '127.0.0.1', port }); s.on('connect', () => { s.destroy(); resolve(true) }); s.on('error', () => resolve(false)); s.setTimeout(750, () => { s.destroy(); resolve(false) }) }) }
+// 显式JSON envelope：零行也有query与processes=[]，不把空stdout当作进程已退出。
+export function hermesRuntimeProcessSnapshotSource({ home, pids }) {
+  const byPid = pids !== undefined
+  if (byPid) assert.ok(Array.isArray(pids) && pids.length > 0 && pids.length <= 256 && new Set(pids).size === pids.length && pids.every(pid => Number.isSafeInteger(pid) && pid > 0), 'runtime terminal query requires nonempty exact PIDs')
+  else assert.ok(typeof home === 'string' && home.length > 0, 'runtime observation requires private HOME')
+  const prefix = byPid ? '' : `$h=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(home).toString('base64')}'));`
+  const query = byPid ? `Get-CimInstance Win32_Process -Filter '${pids.map(pid => `ProcessId=${pid}`).join(' OR ')}' -ErrorAction Stop` : 'Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {$_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($h)}'
+  const binding = byPid ? `@{kind='pids';pids=@(${pids.join(',')})}` : "@{kind='home'}"
+  return `$ErrorActionPreference='Stop';${prefix}$rows=@(${query}|ForEach-Object {[pscustomobject]@{ProcessId=[int]$_.ProcessId;ParentProcessId=[int]$_.ParentProcessId;ExecutablePath=$_.ExecutablePath;CommandLine=${byPid ? '$null' : '$_.CommandLine'};CreationDate=$(if($null -ne $_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null})}});ConvertTo-Json -InputObject @{schemaVersion=1;observedAt=[DateTime]::UtcNow.ToString('o');query=${binding};processes=@($rows)} -Depth 6 -Compress`
+}
+export function assertHermesRuntimeIdentities(rows, allowEmpty = false) {
+  assert.ok(Array.isArray(rows) && (allowEmpty || rows.length > 0), 'STOP requires fresh nonempty preStop runtime identities')
+  assert.ok(rows.length <= 256 && new Set(rows.map(row => row?.ProcessId)).size === rows.length, 'runtime identities duplicate/over-budget')
+  for (const row of rows) {
+    assert.ok(Number.isSafeInteger(row?.ProcessId) && row.ProcessId > 0, 'runtime identity missing valid PID')
+    assert.ok(typeof row.CreationDate === 'string' && /^\d{4}-\d\d-\d\dT.+(?:Z|[+-]\d\d:\d\d)$/.test(row.CreationDate) && Number.isFinite(Date.parse(row.CreationDate)), 'runtime identity missing exact CreationDate')
+  }
+}
+// 超时/其它网络错误是未知，不伪称关闭；沿用原本750ms单次TCP预算。
+export function observeHermesRuntimePort(port) {
+  assert.ok(Number.isSafeInteger(port) && port > 0 && port <= 65535, 'runtime configured port invalid')
+  return new Promise(resolve => {
+    const host = '127.0.0.1', socket = net.connect({ host, port }); let finished = false
+    const finish = (reachable, errorCode) => { if(finished)return;finished=true;socket.destroy();resolve({host,port,observedAt:new Date().toISOString(),reachable,closed:!reachable&&errorCode==='ECONNREFUSED',errorCode}) }
+    socket.once('connect',()=>finish(true,null));socket.once('error',error=>finish(false,error.code));socket.setTimeout(750,()=>finish(false,'ETIMEDOUT'))
+  })
+}
+export function assertHermesRuntimeStopEvidence(receipt, expectedPorts) {
+  assertHermesRuntimeIdentities(receipt.preStop)
+  const pids = receipt.preStop.map(row=>row.ProcessId).sort((a,b)=>a-b), post = receipt.postStop
+  assert.ok(post?.schemaVersion===1 && post.query?.kind==='pids' && typeof post.observedAt==='string' && Number.isFinite(Date.parse(post.observedAt)), 'STOP terminal observation incomplete')
+  assert.deepEqual(post.query.pids?.slice().sort((a,b)=>a-b),pids,'STOP terminal query does not bind preStop PIDs')
+  assertHermesRuntimeIdentities(post.processes,true)
+  assert.ok(post.processes.every(row=>pids.includes(row.ProcessId)), 'STOP terminal contains unqueried PID')
+  const identities=receipt.preStop.map(row=>{
+    const current=post.processes.find(p=>p.ProcessId===row.ProcessId)
+    assert.ok(!current || current.CreationDate!==row.CreationDate, 'STOP original PID+CreationDate still present')
+    return {ProcessId:row.ProcessId,CreationDate:row.CreationDate,exited:true,reason:current?'pid-reused':'pid-absent',postCreationDate:current?.CreationDate??null}
+  })
+  assert.ok(Array.isArray(expectedPorts)&&expectedPorts.length===2&&new Set(expectedPorts).size===2&&expectedPorts.every(port=>Number.isSafeInteger(port)&&port>0&&port<=65535),'STOP requires two exact configured ports')
+  assert.ok(Array.isArray(receipt.portEvidence)&&receipt.portEvidence.length===2,'STOP configured port observations missing')
+  assert.deepEqual(receipt.portEvidence.map(p=>p?.port).sort((a,b)=>a-b),expectedPorts.slice().sort((a,b)=>a-b),'STOP configured ports mismatch')
+  for(const port of receipt.portEvidence)assert.ok(port?.host==='127.0.0.1'&&port.reachable===false&&port.closed===true&&port.errorCode==='ECONNREFUSED'&&typeof port.observedAt==='string'&&Number.isFinite(Date.parse(port.observedAt)),'STOP configured port not proven closed')
+  return identities
+}
 async function freePort() { return new Promise((resolve, reject) => { const s = net.createServer(); s.once('error', reject); s.listen(0, '127.0.0.1', () => { const port = s.address().port; s.close(() => resolve(port)) }) }) }
 async function until(fn, timeout = 120000) { const start = Date.now(); while (Date.now() - start < timeout) { const x = await fn(); if (x) return x; await wait(500) } throw new Error('有界等待超时') }
 
@@ -525,16 +573,32 @@ async function execute(o) {
   }
   function markInstall() { const f = path.join(output, 'spawn-audit.jsonl'); installCursor = fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).length : 0 }
   async function capturePids() {
-    const encoded = Buffer.from(env.HERMES_HOME).toString('base64')
-    const rows = ps(`$h=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'));@(Get-CimInstance Win32_Process|Where-Object {$_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($h)}|Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate)|ConvertTo-Json -Depth 4`)
-    for (const p of (Array.isArray(rows) ? rows : rows ? [rows] : [])) runtimePids.add(p.ProcessId)
-    assert.ok(runtimePids.size, '没有真实 Hermes runtime PID'); write('runtime-pids.json', { pids: [...runtimePids], actual: rows }); return rows
+    const snapshot = ps(hermesRuntimeProcessSnapshotSource({ home: env.HERMES_HOME }))
+    assert.ok(snapshot?.schemaVersion===1&&snapshot.query?.kind==='home'&&Array.isArray(snapshot.processes),'runtime inventory missing complete snapshot')
+    const rows=snapshot.processes
+    write('runtime-pids.json',{pids:rows.map(row=>row.ProcessId),actual:rows,snapshot})
+    assertHermesRuntimeIdentities(rows)
+    for(const row of rows)runtimePids.add(row.ProcessId)
+    return rows
   }
   async function stopRuntime() {
     if (!base || stopped) return
-    await api('hermes_dashboard_stop'); await api('hermes_gateway_action', { action: 'stop' })
-    await until(async () => !(await reachable(runtimePort)) && !(await reachable(dashboardPort)) && [...runtimePids].every(pid => !alive(pid)), 30000)
-    write('stop-pids-ports.json', { productionStop: true, pids: [...runtimePids], pidsExited: true, ports: [runtimePort, dashboardPort], portsClosed: true }); stopped = true
+    const receipt={status:'failed',productionStop:false,preStop:[],ports:[runtimePort,dashboardPort],startedAt:new Date().toISOString(),errors:[]}
+    try {
+      // 新鲜证据不能用历史Set代替；取证失败仍独立执行原两个停止API。
+      try {receipt.preStop=await capturePids();assertHermesRuntimeIdentities(receipt.preStop)}catch(error){receipt.errors.push(String(error))}
+      for(const [cmd,args] of [['hermes_dashboard_stop',undefined],['hermes_gateway_action',{action:'stop'}]]) {
+        try {await api(cmd,args)}catch(error){receipt.errors.push(`${cmd}: ${error}`)}
+      }
+      if(receipt.errors.length)throw new Error(receipt.errors.join('\n'))
+      await until(async () => !(await reachable(runtimePort)) && !(await reachable(dashboardPort)) && [...runtimePids].every(pid => !alive(pid)), 30000)
+      const pids=receipt.preStop.map(row=>row.ProcessId)
+      receipt.postStop=ps(hermesRuntimeProcessSnapshotSource({pids}))
+      receipt.portEvidence=await Promise.all([runtimePort,dashboardPort].map(observeHermesRuntimePort))
+      receipt.identities=assertHermesRuntimeStopEvidence(receipt,[runtimePort,dashboardPort])
+      Object.assign(receipt,{status:'passed',productionStop:true,pids,pidsExited:true,portsClosed:true});stopped=true
+    } catch(error) {receipt.error=String(error);throw error}
+    finally {receipt.finishedAt=new Date().toISOString();write('stop-pids-ports.json',receipt)}
   }
   const history = async () => {
     const sessions = await api('hermes_sessions_list', { limit: 100 }); const list = Array.isArray(sessions) ? sessions : sessions.sessions
@@ -547,7 +611,7 @@ async function execute(o) {
     r.runnerAdmission = { passed: false, failedConditions: runnerProofFailures(proof) }
     r.runnerAdmission.passed = r.runnerAdmission.failedConditions.length === 0
     write('runner-admission.json', r.runnerAdmission); save(); validateRunnerProof(proof)
-    r.toolingDependencies = Object.fromEntries(['scripts/test-hermes-windows-qualification.mjs', 'scripts/hermes-qualification-provider.mjs', 'scripts/hermes-startup-diagnostic.mjs', 'scripts/hermes-python-cache-observation.mjs'].map(file => [file, hash(path.join(tooling, file))]))
+    r.toolingDependencies = Object.fromEntries(['scripts/test-hermes-windows-qualification.mjs', 'scripts/hermes-qualification-provider.mjs', 'scripts/hermes-startup-diagnostic.mjs', 'scripts/hermes-python-cache-observation.mjs', 'scripts/hermes-exec-observation.mjs'].map(file => [file, hash(path.join(tooling, file))]))
     write('tooling-dependencies.json', { sha: proof.toolingSha, files: r.toolingDependencies })
     assert.ok(within(physical(process.env.RUNNER_TEMP), output), '输出不在本次 RUNNER_TEMP')
     checkout = resolveQualificationCheckout(o['--root'])
@@ -703,7 +767,7 @@ async function execute(o) {
     if (provider) { provider.closeAllConnections(); await new Promise(resolve => provider.close(resolve)) }
     try {
       await until(async () => (!web || !alive(web.pid)) && (!r.webPort || !(await reachable(r.webPort))) && (!r.providerPort || !(await reachable(r.providerPort))) && pending.every(pid => !alive(pid)) && [...runtimePids].every(pid => !alive(pid)), 15000)
-      write('infrastructure-stop.json', { webPid: web?.pid || null, webExited: true, webPort: r.webPort, providerPort: r.providerPort, allPortsClosed: true, pendingOwnedPids: pending, pendingOwnedPidsExited: true, runtimePids: [...runtimePids], runtimePidsExited: true })
+      write('infrastructure-stop.json', { webPid: web?.pid || null, webExited: true, webPort: r.webPort, providerPort: r.providerPort, allPortsClosed: true, pendingOwnedPids: pending, pendingOwnedPidsExited: true, runtimePids: [...runtimePids], runtimePidsExited: runtimePids.size ? true : null, runtimeIdentityScope: 'infrastructure raw PID cleanup only; production identity proof is separate stop-pids-ports.json' })
     } catch (e) { r.cleanupError = String(e) }
     if (before) { try { const after = hostSnapshot(proof); write('host-after.json', after); assertHostUnchanged(before, after); r.hostUnchanged = true } catch (e) { r.hostUnchanged = false; r.hostChangeError = e.message } }
     if (r.sourceHashes) { r.sourceDrift = Object.keys(r.sourceHashes).filter(f => !fs.existsSync(path.join(project, f)) || hash(path.join(project, f)) !== r.sourceHashes[f]); if (r.sourceDrift.length) r.error = '源文件发生漂移' }

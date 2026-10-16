@@ -1,0 +1,85 @@
+name: Manual Weixin Native Qualification
+
+# 先审查注册 main；只在一次性 hosted VM 构建/私有安装，不操作业务微信账户或发布。
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: '已审查且集成 Rust+UI 的完整40位候选SHA；不接受branch/tag'
+        type: string
+        required: true
+      scope:
+        description: 'complete缺任何真实负向即失败；ui-origin仅首阶段，永不pass-native'
+        type: choice
+        options: [complete, ui-origin]
+        default: complete
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weixin-native-qualification
+  cancel-in-progress: false
+
+jobs:
+  native:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'qingchencloud/clawpanel'
+    name: Windows official ${{ matrix.host }} / ${{ inputs.scope }} (partial is not qualification)
+    runs-on: windows-2025
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        host: ['2026.5.12', '2026.9.8', '2026.10.4']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: tooling
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.16.0
+      - name: 先检查完整SHA（仅plan，无安装/GUI；不插值到shell）
+        shell: pwsh
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          node tooling/scripts/test-weixin-windows-qualification.mjs --plan --sha "$env:CANDIDATE_SHA"
+          exit $LASTEXITCODE
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: candidate
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+      - name: 真实VM资格后私有安装、同SHA no-bundle/W3C UI及来源负向
+        shell: pwsh
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          OPENCLAW_HOST_VERSION: ${{ matrix.host }}
+          QUALIFICATION_SCOPE: ${{ inputs.scope }}
+        run: |
+          node tooling/scripts/test-weixin-windows-qualification.mjs --execute --root candidate --sha "$env:CANDIDATE_SHA" --host "$env:OPENCLAW_HOST_VERSION" --scope "$env:QUALIFICATION_SCOPE" --output "$env:RUNNER_TEMP/weixin-native-$env:OPENCLAW_HOST_VERSION"
+          exit $LASTEXITCODE
+      - name: 摘要保留partial/未执行负向，不按job绿灯宣称完整
+        if: always()
+        shell: pwsh
+        env:
+          OPENCLAW_HOST_VERSION: ${{ matrix.host }}
+        run: |
+          $report = "$env:RUNNER_TEMP/weixin-native-$env:OPENCLAW_HOST_VERSION/public/report.json"
+          if (Test-Path -LiteralPath $report) {
+            $r = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+            "### Weixin $env:OPENCLAW_HOST_VERSION — $($r.status)" >> $env:GITHUB_STEP_SUMMARY
+            "Candidate: $($r.candidateSha); scope: $($r.scope). UI-origin is partial, not pass-native." >> $env:GITHUB_STEP_SUMMARY
+            foreach ($gap in $r.gaps) { "- NOT EXECUTED: $gap" >> $env:GITHUB_STEP_SUMMARY }
+          } else { "No admission/runtime report; NOT qualified." >> $env:GITHUB_STEP_SUMMARY }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: weixin-native-${{ matrix.host }}-${{ inputs.candidate_sha }}-${{ inputs.scope }}
+          path: ${{ runner.temp }}/weixin-native-${{ matrix.host }}/public/
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: false
