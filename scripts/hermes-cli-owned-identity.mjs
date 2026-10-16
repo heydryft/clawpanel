@@ -145,3 +145,99 @@ export function encodeFixtureIdentityEvidence(result) {
   if (Buffer.byteLength(line) > FIXTURE_IDENTITY_LIMITS.outputBytes) fail('OUTPUT_BUDGET')
   return line
 }
+
+// finally阶段独立资格：不复用peak的结论，不把后续fail/recovery冒充已验并发。
+// 只消费原snapshot与原kill0材料；不查询、不重试、不控制进程。
+export function qualifyFixtureCleanup(material, { nativeIdentityAvailable = true } = {}) {
+  let bytes
+  try { bytes = Buffer.byteLength(JSON.stringify(material)) } catch { fail('CLEANUP_SCHEMA') }
+  if (bytes > FIXTURE_IDENTITY_LIMITS.materialBytes || material.materialOverflow) fail('CLEANUP_MATERIAL_BUDGET')
+  const { events, historyNativeRows, cleanupNativeRows, rawProbes, rawOrder, observerErrors } = material
+  if (![events, historyNativeRows, cleanupNativeRows, rawProbes, observerErrors].every(Array.isArray) || !rawOrder) fail('CLEANUP_SCHEMA')
+  if (observerErrors.length) fail('CLEANUP_OBSERVATION_FAILED')
+  const starts = events.filter(e => e.event === 'start'), byPid = new Map()
+  if (!starts.length || starts.length > FIXTURE_IDENTITY_LIMITS.starts || historyNativeRows.length + cleanupNativeRows.length > FIXTURE_IDENTITY_LIMITS.nativeRows) fail('CLEANUP_MATERIAL_BUDGET')
+  for (const s of starts) {
+    if (!Number.isSafeInteger(s.pid) || s.pid <= 0 || !integer(s.at) || !integer(s.monotonicMs) || !/^(?:burst-\d{1,3}|fail|recovery)$/.test(s.name || '') || typeof s.birthId !== 'string' || !s.birthId.length || s.birthId.length > 128) fail('CLEANUP_START_SCHEMA')
+    if (byPid.has(s.pid)) fail('CLEANUP_START_PID_REUSED')
+    byPid.set(s.pid, s)
+  }
+  if (rawProbes.length !== starts.length || cleanupNativeRows.length !== (nativeIdentityAvailable ? starts.length : 0)) fail('CLEANUP_MISSING_MATERIAL')
+  const legacy = rawOrder.kind === 'frozen-source-order-lower-bound'
+  if (legacy) {
+    // 旧CI未捕获raw时点/错误码：仅接受显式冻结源码的await顺序下界，不补造时间或ESRCH。
+    if (!nativeIdentityAvailable || rawOrder.awaitFinalNativeBeforeRaw !== true || !/^[0-9a-f]{40}$/.test(rawOrder.sourceSha || '') || !/^[0-9a-f]{64}$/.test(rawOrder.sourceTestSha256 || '') || !integer(rawOrder.notBeforeMs) ||
+      rawOrder.notBeforeMs !== Math.max(...cleanupNativeRows.map(row => row.queryCompletedAtMs)) - 1) fail('CLEANUP_SOURCE_ORDER_MISSING')
+  } else if (rawOrder.kind !== (nativeIdentityAvailable ? 'captured-after-final-native' : 'captured-raw-only') || !integer(rawOrder.startedAtMs) || !integer(rawOrder.completedAtMs) || rawOrder.completedAtMs < rawOrder.startedAtMs ||
+    (nativeIdentityAvailable && (!integer(rawOrder.nativeCompletedAtMs) || rawOrder.nativeCompletedAtMs > rawOrder.startedAtMs))) fail('CLEANUP_RAW_ORDER')
+  if (!nativeIdentityAvailable && historyNativeRows.length) fail('CLEANUP_NATIVE_UNAVAILABLE')
+  const rowsByPid = new Map(), finals = new Map()
+  const validateRow = row => {
+    const start = byPid.get(row.pid)
+    if (!start || !integer(row.queryStartedAtMs) || !integer(row.queryCompletedAtMs) || row.queryStartedAtMs > row.queryCompletedAtMs || row.queryCompletedAtMs !== row.sampledAtMs) fail('CLEANUP_NATIVE_INTERVAL')
+    if (row.receipt && (startKey(row.receipt) !== startKey(start) || row.receipt.birthId !== start.birthId)) fail('CLEANUP_NATIVE_RECEIPT')
+    if (['createdAtMs', 'exitAtMs', 'waitResult', 'nativeError', 'imageQueryError'].some(k => row[k] != null && !integer(row[k]))) fail('CLEANUP_NATIVE_SCHEMA')
+    if (row.status === 'missing') {
+      if (row.nativeError !== 87 || row.creationTimeFileTimeHex || row.waitResult !== 4294967295 || row.imageQueryError !== 0) fail('CLEANUP_NATIVE_UNKNOWN_MISSING')
+    } else if (row.status === 'running' || row.status === 'exited') {
+      const birth = ticks(row.creationTimeFileTimeHex), birthMs = Number((birth - epoch) / 10000n)
+      if (!integer(row.createdAtMs) || Math.abs(birthMs - row.createdAtMs) > 1 || birth > lowerTick(row.queryCompletedAtMs + 1) || row.nativeError !== 0 || typeof row.belongsToFixture !== 'boolean') fail('CLEANUP_NATIVE_IDENTITY')
+      if (row.status === 'running' && (row.waitResult !== 258 || row.imageQueryError !== 0 || row.exitAtMs !== 0)) fail('CLEANUP_NATIVE_RUNNING')
+      if (row.status === 'exited' && (row.waitResult !== 0 || !integer(row.exitAtMs) || row.exitAtMs <= row.createdAtMs || row.exitAtMs > row.queryCompletedAtMs + 1)) fail('CLEANUP_NATIVE_EXIT')
+    } else fail('CLEANUP_NATIVE_UNKNOWN')
+    if (!rowsByPid.has(row.pid)) rowsByPid.set(row.pid, [])
+    rowsByPid.get(row.pid).push(row)
+  }
+  historyNativeRows.forEach(validateRow)
+  for (const row of cleanupNativeRows) {
+    validateRow(row)
+    if (finals.has(row.pid)) fail('CLEANUP_NATIVE_DUPLICATE')
+    finals.set(row.pid, row)
+    const bound = legacy ? rawOrder.notBeforeMs : rawOrder.nativeCompletedAtMs
+    // 原PS -as[long]四舍五入，JS Date.now向下取整；只核验不矛盾的1ms包络。
+    // 排除仍用原始raw毫秒下界/更保守的旧源码下界，绝不把+1当成出生证明。
+    if (row.queryCompletedAtMs > bound + 1) fail('CLEANUP_NATIVE_AFTER_RAW_BOUND')
+  }
+  let previousNs = -1n, rawAliveCount = 0
+  const rows = rawProbes.map((probe, index) => {
+    const start = starts[index], pid = start.pid, final = finals.get(pid)
+    if (probe.pid !== pid || typeof probe.alive !== 'boolean' || probe.observationFailed) fail('CLEANUP_RAW_MISSING_OR_UNKNOWN')
+    let rawLowerBoundMs
+    if (legacy) {
+      if (probe.startedAtMs !== undefined || probe.completedAtMs !== undefined || probe.startedAtNs !== undefined || probe.completedAtNs !== undefined) fail('CLEANUP_LEGACY_INVENTED_RAW_TIME')
+      rawLowerBoundMs = rawOrder.notBeforeMs
+    } else {
+      if (!integer(probe.startedAtMs) || !integer(probe.completedAtMs) || probe.startedAtMs < rawOrder.startedAtMs || probe.completedAtMs > rawOrder.completedAtMs || probe.completedAtMs < probe.startedAtMs || !/^\d{1,24}$/.test(probe.startedAtNs || '') || !/^\d{1,24}$/.test(probe.completedAtNs || '') || BigInt(probe.completedAtNs) < BigInt(probe.startedAtNs) || BigInt(probe.startedAtNs) < previousNs) fail('CLEANUP_RAW_INTERVAL')
+      previousNs = BigInt(probe.completedAtNs); rawLowerBoundMs = probe.startedAtMs
+    }
+    if (rawLowerBoundMs <= start.at || (probe.alive && (legacy ? probe.errorCode != null : probe.errorCode !== null)) || (!probe.alive && probe.errorCode !== 'ESRCH' && !(legacy && probe.errorCode === undefined))) fail('CLEANUP_RAW_ERROR_OR_TIME')
+    const history = rowsByPid.get(pid) || []
+    const candidates = history.filter(r => r.status === 'running' && r.belongsToFixture && ticks(r.creationTimeFileTimeHex) < lowerTick(start.at) && r.queryCompletedAtMs < rawLowerBoundMs)
+    if (new Set(candidates.map(r => r.creationTimeFileTimeHex)).size > 1) fail('CLEANUP_BASELINE_AMBIGUOUS')
+    const baseline = candidates.sort((a, b) => a.queryCompletedAtMs - b.queryCompletedAtMs)[0]
+    if (baseline) {
+      for (const r of history) {
+        const different = r.status !== 'missing' && r.creationTimeFileTimeHex !== baseline.creationTimeFileTimeHex
+        if (different && ticks(r.creationTimeFileTimeHex) <= lowerTick(start.at + 1)) fail('CLEANUP_START_IDENTITY_CONFLICT')
+        const gone = r.status === 'missing' && r.queryStartedAtMs > baseline.queryCompletedAtMs + 1 ? r.queryCompletedAtMs
+          : r.status === 'exited' && r.creationTimeFileTimeHex === baseline.creationTimeFileTimeHex ? r.exitAtMs : different ? r.createdAtMs : null
+        if (gone !== null && history.some(old => old.status === 'running' && old.creationTimeFileTimeHex === baseline.creationTimeFileTimeHex && old.queryStartedAtMs > gone + 1)) fail('CLEANUP_NATIVE_CONTRADICTION')
+      }
+    }
+    let proof = null
+    if (!probe.alive && probe.errorCode === 'ESRCH') proof = { kind: 'raw-esrch' }
+    else if (!probe.alive && final?.status === 'missing' && final.queryStartedAtMs > start.at + 1) proof = { kind: 'explicit-native-missing-before-raw', witness: pickNative(final) }
+    else if (probe.alive && nativeIdentityAvailable) {
+      if (!baseline) fail('CLEANUP_BASELINE_MISSING')
+      if (final.status !== 'missing' && final.creationTimeFileTimeHex !== baseline.creationTimeFileTimeHex && ticks(final.creationTimeFileTimeHex) > lowerTick(start.at + 1) && ticks(final.creationTimeFileTimeHex) < lowerTick(rawLowerBoundMs)) proof = { kind: 'replacement-born-before-raw', baseline: pickNative(baseline), witness: pickNative(final) }
+      else if (final.status === 'exited' && final.creationTimeFileTimeHex === baseline.creationTimeFileTimeHex && final.exitAtMs + 1 < rawLowerBoundMs) proof = { kind: 'same-creation-os-exit-before-raw', baseline: pickNative(baseline), witness: pickNative(final) }
+      else if (final.status === 'missing' && final.queryStartedAtMs > baseline.queryCompletedAtMs + 1 && final.queryCompletedAtMs + 1 < rawLowerBoundMs) proof = { kind: 'known-native-absence-before-raw', baseline: pickNative(baseline), witness: pickNative(final) }
+    }
+    if (probe.alive) rawAliveCount++
+    return { pid, name: start.name, rawAlive: probe.alive, rawErrorCode: probe.errorCode ?? (legacy ? 'not-captured' : null), rawLowerBoundMs,
+      oldFixtureIdentityAbsent: proof !== null, proof, ...(legacy ? {} : { rawStartedAtMs: probe.startedAtMs, rawCompletedAtMs: probe.completedAtMs, rawStartedAtNs: probe.startedAtNs, rawCompletedAtNs: probe.completedAtNs }) }
+  })
+  return { event: 'hermes-bounds-cleanup-identity', schema: 1, phase: 'cleanup-not-peak', samplingNotAtomic: true,
+    rawTiming: legacy ? 'source-order-lower-bound-not-captured-raw-time' : 'captured-original-kill0', rawAliveCount,
+    allOldFixtureIdentitiesAbsent: rows.every(row => row.oldFixtureIdentityAbsent), rows }
+}

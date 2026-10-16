@@ -369,6 +369,7 @@ mod tests {
             ("XDG_CACHE_HOME", "home/cache"),
             ("TEMP", "temp"),
             ("TMP", "temp"),
+            ("TMPDIR", "temp"),
         ] {
             let directory = root.join(directory);
             std::fs::create_dir_all(&directory).unwrap();

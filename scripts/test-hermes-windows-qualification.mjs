@@ -600,6 +600,17 @@ export function verifyLinuxEvidence(output, sha, version) {
   return { status: 'passed-linux-fresh11-and-two-warm-long-ui', sha, version, nativeTauri: 'not-run', coldInstallations: 1, uiRounds: 2 }
 }
 
+// 只留直接孩子与双流的事件/字节数；进度、exit和close都不代替原成功门禁。
+export function observeQualificationCommand(child, receipt) {
+  const state = receipt.commandObservation = { schemaVersion: 1, pid: child.pid, exitReceived: false, closeReceived: false, stdoutBytes: 0, stderrBytes: 0 }
+  const count = (kind, chunk) => { state[kind + 'Bytes'] += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk); state[kind + 'LastDataAt'] = new Date().toISOString() }
+  child.stdout?.on('data', chunk => count('stdout', chunk))
+  child.stderr?.on('data', chunk => count('stderr', chunk))
+  child.once('exit', (code, signal) => { Object.assign(state, { exitReceived: true, directExitCode: code, directSignal: signal, exitedAt: new Date().toISOString() }) })
+  child.once('close', (code, signal) => { Object.assign(state, { closeReceived: true, closeCode: code, closeSignal: signal, closedAt: new Date().toISOString() }) })
+  return { timeout() { Object.assign(state, { timedOutAt: new Date().toISOString(), directExitCodeAtTimeout: child.exitCode, directSignalAtTimeout: child.signalCode, stdoutEndedAtTimeout: child.stdout?.readableEnded ?? null, stderrEndedAtTimeout: child.stderr?.readableEnded ?? null }) } }
+}
+
 async function execute(o) {
   if (o['--startup-stack-samples']) assert.ok(o['--version'] === '0.22.2' && o['--variant'] === 'new', 'stack samples require new candidate')
   for (const k of ['--root', '--sha', '--version', '--variant', '--output']) assert.ok(o[k], `缺少 ${k}`)
@@ -612,13 +623,14 @@ async function execute(o) {
   let env, home, project, checkout, before, proof, web, provider, base, runtimePort, dashboardPort, browser, context, cli, python, release, lastSession, stopped = true, installCursor = 0
   const runtimePids = new Set(), pendingCommands = new Set(), calls = [], providerHTTP = [], apiReceipts = []
   const npmCli = path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js')
-  async function run(program, args, { cwd = project, timeout = 120000 } = {}) {
+  async function run(program, args, { cwd = project, timeout = 120000, browserDiagnostics = false } = {}) {
     const index = r.commands.length, item = { program, args, cwd, startedAt: new Date().toISOString() }; r.commands.push(item); save()
     const log = path.join(output, `command-${index}`)
     const result = await new Promise((resolve, reject) => {
-      const child = spawn(program, args, { cwd, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); item.pid = child.pid; if (child.pid) pendingCommands.add(child.pid)
+      const child = spawn(program, args, { cwd, env: browserDiagnostics ? { ...env, DEBUG: 'pw:install' } : env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); item.pid = child.pid; if (child.pid) pendingCommands.add(child.pid)
+      const observation = browserDiagnostics ? observeQualificationCommand(child, item) : null
       let stdout = '', stderr = ''; child.stdout.on('data', d => { fs.appendFileSync(log + '.stdout.log', d); stdout = (stdout + d).slice(-16777216) }); child.stderr.on('data', d => { fs.appendFileSync(log + '.stderr.log', d); stderr = (stderr + d).slice(-16777216) })
-      const timer = setTimeout(() => { child.kill(); reject(new Error(`命令超时: ${program}`)) }, timeout)
+      const timer = setTimeout(() => { observation?.timeout(); child.kill(); reject(new Error(`命令超时: ${program}`)) }, timeout)
       child.once('error', e => { clearTimeout(timer); reject(e) }); child.once('close', code => { clearTimeout(timer); pendingCommands.delete(child.pid); Object.assign(item, { exitCode: code, finishedAt: new Date().toISOString() }); save(); resolve({ code, stdout, stderr }) })
     })
     assert.equal(result.code, 0, `${program}: ${result.stderr.slice(-3000)}`); return result.stdout.trim()
@@ -817,7 +829,7 @@ async function execute(o) {
       const dash = await api('hermes_dashboard_start'); assert.equal(dash.started, true); assert.equal((await api('hermes_dashboard_probe')).running, true); await capturePids()
       await run(process.execPath, [npmCli, 'install', '--prefix', path.join(home, 'browser-tools'), '--no-save', '--ignore-scripts', '--package-lock=false', 'playwright@1.58.2'], { timeout: 600000 })
       // 本验收只用默认headless shell；不再下载未使用的headed Chrome，原600秒和真实启动/长UI门禁不变。
-      await run(process.execPath, [path.join(home, 'browser-tools/node_modules/playwright/cli.js'), 'install', '--only-shell', 'chromium'], { timeout: 600000 })
+      await run(process.execPath, [path.join(home, 'browser-tools/node_modules/playwright/cli.js'), 'install', '--only-shell', 'chromium'], { timeout: 600000, browserDiagnostics: true })
       const { chromium } = await import(pathToFileURL(path.join(home, 'browser-tools/node_modules/playwright/index.mjs')))
       browser = await chromium.launch({ headless: true }); context = await browser.newContext({ locale: 'zh-CN' }); await context.tracing.start({ screenshots: true, snapshots: true, sources: true })
       const pageErrors = [], screenshots = [], prompts = []; context.on('page', p => p.on('pageerror', e => pageErrors.push(String(e))))

@@ -2,6 +2,7 @@
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
+import { createHash } from 'node:crypto'
 
 const imageKey = value => path.win32.normalize(String(value || '')).toLowerCase()
 
@@ -66,6 +67,13 @@ const nativeScript = String.raw`
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+# 固定数字/枚举诊断，不读环境或新增进程查询；ready仍是原协议唯一就绪信号。
+function Fixture-Phase([string]$phase) {
+  $at=([DateTime]::UtcNow.Ticks - 621355968000000000L) / 10000L -as [long]
+  [Console]::Out.WriteLine(('{"event":"observer-phase","protocol":1,"phase":"'+$phase+'","pid":'+$PID+',"atMs":'+$at+'}'))
+}
+Fixture-Phase 'script-entry'
+Fixture-Phase 'bindings-begin'
 # 只为这5个只读Win32签名创建内存绑定；不用Add-Type/csc，不启动编译器孩子。
 $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName('FixtureProcessNative')), [Reflection.Emit.AssemblyBuilderAccess]::Run)
 $module = $assembly.DefineDynamicModule('native')
@@ -96,6 +104,7 @@ Add-FixtureNativeMethod 'QueryFullProcessImageNameW' ([bool]) @([IntPtr], [uint3
 Add-FixtureNativeMethod 'WaitForSingleObject' ([uint32]) @([IntPtr], [uint32])
 Add-FixtureNativeMethod 'CloseHandle' ([bool]) @([IntPtr])
 $native = $type.CreateType()
+Fixture-Phase 'bindings-ready'
 function Fixture-Now { return ([DateTime]::UtcNow.Ticks - 621355968000000000L) / 10000L -as [long] }
 function Fixture-Unix([long]$fileTime) { if($fileTime -eq 0){return 0L}; return ([DateTime]::FromFileTimeUtc($fileTime).Ticks - 621355968000000000L) / 10000L -as [long] }
 function Read-FixtureIdentity([int]$processId) {
@@ -133,10 +142,13 @@ function Read-FixtureIdentity([int]$processId) {
   } finally { $row.sampledAtMs=Fixture-Now; $row.queryCompletedAtMs=$row.sampledAtMs; $null=$native::CloseHandle($handle) }
 }
 # 在ready前预热只读本观察器自身：JIT/JSON不挤占首个实际样本的2秒预算。
+Fixture-Phase 'warmup-begin'
 $warm = Read-FixtureIdentity $PID
 if($warm.status -ne 'running'){throw 'native identity observer warmup failed'}
+Fixture-Phase 'warmup-end'
 $null = ConvertFrom-Json '{"id":0,"pids":[]}'
 $null = @{id=0;processes=@($warm)} | ConvertTo-Json -Depth 6 -Compress
+Fixture-Phase 'json-warmup-end'
 [Console]::Out.WriteLine('{"event":"ready","protocol":1}')
 while ($null -ne ($line = [Console]::ReadLine())) {
   $request = ConvertFrom-Json $line
@@ -146,52 +158,116 @@ while ($null -ne ($line = [Console]::ReadLine())) {
 }
 `
 
-export async function startWindowsFixtureProcessObserver({ spawnProcess = spawn } = {}) {
+export async function startWindowsFixtureProcessObserver({ spawnProcess = spawn, onDiagnostic } = {}) {
   if (process.platform !== 'win32') throw new Error('Windows native fixture observer requires Windows')
   const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe')
+  const launch = { requestedAtMs: Date.now(), requestedMonotonicMs: performance.now() }
   const child = spawnProcess(executable, ['-NoProfile', '-NonInteractive', '-Command', nativeScript], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, NODE_OPTIONS: '' } })
-  return startFixtureObserverTransport(child)
+  Object.assign(launch, { returnedAtMs: Date.now(), returnedMonotonicMs: performance.now() })
+  return startFixtureObserverTransport(child, { onDiagnostic, launch })
+}
+
+const startupPhases = ['script-entry', 'bindings-begin', 'bindings-ready', 'warmup-begin', 'warmup-end', 'json-warmup-end']
+
+// 只观察现有ChildProcess/流事件。没有额外PID查询、重试、CPU/AV推断或原文日志输出。
+function observerDiagnostic(child, launch) {
+  const origin = launch?.requestedMonotonicMs ?? performance.now(), events = [], streams = {}
+  let eventCount = 0, eventOverflow = false
+  const record = (event, fields = {}, atMs = Date.now(), mono = performance.now()) => {
+    eventCount++
+    if (events.length < 32) events.push({ event, atMs, elapsedMs: Math.round((mono - origin) * 1000) / 1000, ...fields })
+    else eventOverflow = true
+  }
+  if (launch) {
+    record('spawn-request', {}, launch.requestedAtMs, launch.requestedMonotonicMs)
+    record('spawn-return', {}, launch.returnedAtMs, launch.returnedMonotonicMs)
+  }
+  record('transport-start')
+  for (const name of ['stdout', 'stderr']) {
+    const state = { bytes: 0, chunks: 0, firstAtMs: null, lastAtMs: null, hash: createHash('sha256') }; streams[name] = state
+    child[name].on('data', bytes => {
+      const at = Date.now(); state.bytes += bytes.length; state.chunks++
+      if (state.firstAtMs === null) { state.firstAtMs = at; record(name + '-first', {}, at) }
+      state.lastAtMs = at; state.hash.update(bytes)
+    })
+    child[name].once('end', () => record(name + '-end'))
+  }
+  return { record, render(state) {
+    const safeStreams = Object.fromEntries(Object.entries(streams).map(([name, s]) => [name, { bytes: s.bytes, chunks: s.chunks, firstAtMs: s.firstAtMs, lastAtMs: s.lastAtMs, sha256: s.hash.copy().digest('hex') }]))
+    const result = { event: 'hermes-observer-diagnostic', schema: 1, pid: Number.isSafeInteger(child.pid) ? child.pid : null, startupBudgetMs: 7000, requestBudgetMs: 2000,
+      launch: { requestedAtMs: launch?.requestedAtMs ?? null, returnedAtMs: launch?.returnedAtMs ?? null }, events: [...events], eventCount, eventOverflow, streams: safeStreams, ...state }
+    // 报告只含固定枚举/数字/摘要。任何未来超限显式报材料不完整，绝不改变原失败或假称完整。
+    if (Buffer.byteLength(JSON.stringify(result)) > 8192) { result.events = []; result.eventOverflow = true; result.evidenceBudgetExceeded = true }
+    return result
+  } }
 }
 
 // 只服务合成测试子进程；所有失败终止本观察器，保留首红，不重放查询。
-export async function startFixtureObserverTransport(child) {
+export async function startFixtureObserverTransport(child, { onDiagnostic, launch } = {}) {
+  const diagnostic = observerDiagnostic(child, launch)
   const lines = createInterface({ input: child.stdout })
   let nextId = 0, stderr = '', readyResolve, readyReject, closed = false, failure = null
+  let reason = null, readyAtMs = null, closeInfo = null, deliveryFailed = false, emitted = false, normalClose = false, lastPhaseIndex = -1
+  const getDiagnostic = () => diagnostic.render({ reason, readyAtMs, close: closeInfo, terminal: closed, deliveryFailed })
+  const attach = () => { if (failure && typeof failure === 'object') failure.observerDiagnostic = getDiagnostic() }
+  const publish = () => {
+    if (emitted) return
+    emitted = true; attach()
+    const failedWrite = () => { deliveryFailed = true; attach() }
+    try {
+      if (onDiagnostic) { const pendingWrite = onDiagnostic(getDiagnostic()); if (pendingWrite?.then) Promise.resolve(pendingWrite).catch(failedWrite) }
+      else if (reason !== 'normal-close') console.log(JSON.stringify(getDiagnostic()))
+    } catch { failedWrite() }
+    attach()
+  }
   const pending = new Map()
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject })
-  const onFailure = error => {
+  const onFailure = (error, cause = 'protocol') => {
     if (failure) return
-    failure = error
+    failure = error; reason = cause
+    if (cause !== 'normal-close') diagnostic.record('failure', { cause })
     readyReject(error)
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(error) }
     pending.clear()
     if (!closed) child.kill()
   }
   child.stderr.on('data', data => { stderr = (stderr + data).slice(-12000) })
-  child.once('error', onFailure)
-  child.stdin.on('error', onFailure)
-  const exited = new Promise(resolve => child.once('close', (code, signal) => { closed = true; onFailure(new Error(`fixture identity observer closed ${code}/${signal}: ${stderr}`)); resolve() }))
+  child.once('spawn', () => diagnostic.record('spawn'))
+  child.once('exit', (code, signal) => diagnostic.record('exit', { code: Number.isInteger(code) ? code : null, signal: signal === null ? null : /^SIG[A-Z0-9]{1,16}$/.test(signal) ? signal : 'other' }))
+  child.once('error', error => { diagnostic.record('child-error'); onFailure(error, 'child-error') })
+  child.stdin.on('error', error => onFailure(error, 'stdin-error'))
+  const exited = new Promise(resolve => child.once('close', (code, signal) => {
+    closed = true; closeInfo = { code: Number.isInteger(code) ? code : null, signal: signal === null ? null : /^SIG[A-Z0-9]{1,16}$/.test(signal) ? signal : 'other', killed: child.killed, atMs: Date.now() }
+    diagnostic.record('close'); onFailure(new Error(`fixture identity observer closed ${code}/${signal}: ${stderr}`), normalClose ? 'normal-close' : 'child-close'); publish(); resolve()
+  }))
   lines.on('line', line => {
     if (failure) return
     try {
       const message = JSON.parse(line)
-      if (message.event === 'ready') { if (message.protocol !== 1) throw new Error('identity observer protocol mismatch'); readyResolve(); return }
+      if (message.event === 'observer-phase') {
+        const index = startupPhases.indexOf(message.phase)
+        if (message.protocol !== 1 || message.pid !== child.pid || !Number.isSafeInteger(message.atMs) || message.atMs < 0 || index !== lastPhaseIndex + 1 || readyAtMs !== null) throw new Error('identity observer phase protocol mismatch')
+        lastPhaseIndex = index; diagnostic.record('phase', { phase: message.phase, nativeAtMs: message.atMs }); return
+      }
+      if (message.event === 'ready') { if (message.protocol !== 1) throw new Error('identity observer protocol mismatch'); readyAtMs = Date.now(); diagnostic.record('ready', {}, readyAtMs); readyResolve(); return }
       const item = pending.get(message.id)
       if (!item) throw new Error('unexpected identity observer response ' + message.id)
       pending.delete(message.id); clearTimeout(item.timer); item.resolve(message)
     } catch (error) { onFailure(error) }
   })
-  const startupTimer = setTimeout(() => onFailure(new Error('fixture identity observer startup timeout: ' + stderr)), 7000)
+  diagnostic.record('startup-timer')
+  const startupTimer = setTimeout(() => onFailure(new Error('fixture identity observer startup timeout: ' + stderr), 'startup-timeout'), 7000)
   try { await ready } catch (error) { if (!closed) child.kill(); await exited; throw error } finally { clearTimeout(startupTimer) }
   return {
     pid: child.pid,
+    getDiagnostic,
     async snapshot(pids) {
       if (failure) throw failure
       if (closed) throw new Error('fixture identity observer closed')
       if (!pids.every(pid => Number.isSafeInteger(pid) && pid > 0)) throw new Error('invalid fixture PID')
       const id = ++nextId, startedAtMs = Date.now(), monotonicStart = performance.now()
       const reply = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => onFailure(new Error('fixture identity observation timeout')), 2000)
+        const timer = setTimeout(() => onFailure(new Error('fixture identity observation timeout'), 'request-timeout'), 2000)
         pending.set(id, { resolve, reject, timer })
         child.stdin.write(JSON.stringify({ id, pids }) + '\n', error => { if (error) onFailure(error) })
       })
@@ -200,6 +276,7 @@ export async function startFixtureObserverTransport(child) {
     },
     async close() {
       if (closed) return
+      normalClose = true; diagnostic.record('close-request')
       child.stdin.end()
       const timer = setTimeout(() => { if (!closed) child.kill() }, 2000)
       try { await exited } finally { clearTimeout(timer); lines.close() }

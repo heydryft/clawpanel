@@ -53,12 +53,12 @@ test('R5压缩包入口绑定exact host/SRI/压缩字节，不让fixture/zipbomb
 })
 test('R5安装回读仅允许精确pending删除；其它缺失/变更/链接/pending保留均红',async()=>{
  const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.verifyHostMemberHashes,'function')
- const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'weixin-host-readback-'))),body=Buffer.from('original'),pending=Buffer.from('pending\n'),members=[{name:'package/a',size:body.length,sha256:byteHash(body)},{name:'package/.openclaw-lifecycle-pending',size:pending.length,sha256:byteHash(pending)}],marker=members[1]
+ const base=fs.realpathSync.native(os.tmpdir()),root=fs.realpathSync.native(fs.mkdtempSync(path.join(base,'weixin-host-readback-'))),body=Buffer.from('original'),pending=Buffer.from('pending\n'),members=[{name:'package/a',size:body.length,sha256:byteHash(body)},{name:'package/.openclaw-lifecycle-pending',size:pending.length,sha256:byteHash(pending)}],marker=members[1]
  try{fs.writeFileSync(path.join(root,'a'),body);fs.writeFileSync(path.join(root,'.openclaw-lifecycle-pending'),pending)
   await assert.rejects(m.verifyHostMemberHashes(root,members,marker),/pending|marker/)
   fs.unlinkSync(path.join(root,'.openclaw-lifecycle-pending'));assert.deepEqual(await m.verifyHostMemberHashes(root,members,marker),{a:byteHash(body)})
   await assert.rejects(m.verifyHostMemberHashes(root,members,null));await assert.rejects(m.verifyHostMemberHashes(root,members,{...marker,sha256:'0'.repeat(64)}));fs.writeFileSync(path.join(root,'a'),'changed');await assert.rejects(m.verifyHostMemberHashes(root,members,marker));fs.unlinkSync(path.join(root,'a'));await assert.rejects(m.verifyHostMemberHashes(root,members,marker));fs.mkdirSync(path.join(root,'.openclaw-lifecycle-pending'));await assert.rejects(m.verifyHostMemberHashes(root,members,marker))
- }finally{fs.rmSync(root,{recursive:true,force:true})}
+ }finally{const rel=path.relative(base,fs.realpathSync.native(root));assert.ok(rel&&!rel.startsWith('..')&&!path.isAbsolute(rel),'只清理本次physical fixture');fs.rmSync(root,{recursive:true,force:true})}
 })
 test('R5 lifecycle完成收据需固定hook+真实npm成功命令和foreground输出，非零/静默/改hook均红',async()=>{
  const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.assertHostLifecycleReceipt,'function')

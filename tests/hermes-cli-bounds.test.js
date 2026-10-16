@@ -7,7 +7,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { evaluateFixtureBoundsGate, encodeFixtureIdentityEvidence, FIXTURE_IDENTITY_LIMITS } from '../scripts/hermes-cli-owned-identity.mjs'
+import { evaluateFixtureBoundsGate, qualifyFixtureCleanup, encodeFixtureIdentityEvidence, FIXTURE_IDENTITY_LIMITS } from '../scripts/hermes-cli-owned-identity.mjs'
 
 const root = path.resolve(process.env.HERMES_ASYNC_TEST_ROOT || fileURLToPath(new URL('..', import.meta.url)))
 const evidence = process.env.HERMES_BOUNDS_TEST_EVIDENCE
@@ -207,17 +207,40 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
     if (gateway) { gateway.closeAllConnections(); await new Promise(resolve => gateway.close(resolve)) }
     report.events = readEvents(); report.peak = rawUnqualifiedPeak; report.rawUnqualifiedPeak = rawUnqualifiedPeak
     const pids = [...new Set(report.events.map(e => e.pid))]
+    const sink = { count: 0, probes: [] }
     if (observer) {
       try {
         const native = await observer.snapshot(pids)
         const classified = (await import('../scripts/hermes-cli-bounds-observation.mjs')).classifyFixtureIdentitySample({ starts: report.events.filter(e => e.event === 'start'), processes: native.processes, expectedExecutable })
-        report.cleanup = classified.processes.map(row => { const rawAlive = alive(row.pid); return { ...row, rawAlive, alive: rawAlive, nativeOwnedActive: row.active } })
+        const startedAtMs = Date.now()
+        rawProbeSink = sink
+        try { report.cleanup = classified.processes.map(row => { const rawAlive = alive(row.pid); return { ...row, rawAlive, alive: rawAlive, nativeOwnedActive: row.active } }) }
+        finally { rawProbeSink = null }
+        report.cleanupRawOrder = { kind: 'captured-after-final-native', nativeCompletedAtMs: native.completedAtMs, startedAtMs, completedAtMs: Date.now() }
       } catch (error) { report.observerErrors.push(String(error)); report.cleanup = pids.map(pid => ({ pid, alive: true, observationFailed: true })) }
       await observer.close()
-    } else report.cleanup = pids.map(pid => ({ pid, alive: alive(pid) }))
+    } else {
+      const startedAtMs = Date.now()
+      rawProbeSink = sink
+      try { report.cleanup = pids.map(pid => ({ pid, alive: alive(pid) })) }
+      finally { rawProbeSink = null }
+      report.cleanupRawOrder = { kind: 'captured-raw-only', startedAtMs, completedAtMs: Date.now() }
+    }
+    report.cleanupRawProbes = sink.probes
+    // 仍保留所有raw存活事实；清理只证明原创建身份不存在，不宣称历史PID均不活跃。
+    try {
+      report.cleanupGate = qualifyFixtureCleanup({ events: report.events, historyNativeRows: report.observations.flatMap(o => o.processes), cleanupNativeRows: observer ? report.cleanup : [],
+        rawProbes: report.cleanupRawProbes, rawOrder: report.cleanupRawOrder, observerErrors: report.observerErrors, materialOverflow: report.materialOverflow }, { nativeIdentityAvailable: !!observer })
+      console.log(encodeFixtureIdentityEvidence(report.cleanupGate))
+    } catch (error) {
+      const code = /^[A-Z_]{1,64}$/.test(error.code || '') ? error.code : 'EVIDENCE_INVALID'
+      report.cleanupGateFailure = { code }
+      console.log(JSON.stringify({ event: 'hermes-bounds-cleanup-identity-failure', phase: 'cleanup-not-peak', code }))
+    }
     if (evidence) { fs.mkdirSync(evidence, { recursive: true }); fs.writeFileSync(path.join(evidence, 'bounds-http-report.json'), JSON.stringify(report, null, 2)) }
     assert.deepEqual(report.observerErrors, [], '身份观察失败必须显式红灯')
-    assert.ok(report.cleanup.every(p => !p.alive), JSON.stringify(report.cleanup))
+    assert.equal(report.cleanupGateFailure, undefined, '清理材料缺失/未知/超预算必须红；见独立cleanup JSON行')
+    assert.ok(report.cleanupGate.allOldFixtureIdentitiesAbsent, '旧fixture创建身份仍在或证据不足；原raw存活结果保留，见独立cleanup JSON行')
     const rel = path.relative(base, fs.realpathSync(dir)); assert.ok(rel && !rel.startsWith('..') && !path.isAbsolute(rel)); fs.rmSync(dir, { recursive: true, force: true })
   })
   fs.mkdirSync(path.join(home, '.openclaw'), { recursive: true }); fs.mkdirSync(bin, { recursive: true })
