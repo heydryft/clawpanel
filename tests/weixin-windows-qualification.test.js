@@ -116,6 +116,13 @@ test('crates官方固定API真实HTTP契约：具名UA才200，固定version/has
 })
 
 const driverHelp='USAGE: tauri-driver [FLAGS] [OPTIONS]\n\nFLAGS:\n  -h, --help              Prints help information\n\nOPTIONS:\n  --port NUMBER           Sets the tauri-driver intermediary port\n  --native-port NUMBER    Sets the port of the underlying WebDriver\n  --native-host HOST      Sets the host of the underlying WebDriver (Linux only)\n  --native-driver PATH    Sets the path to the native WebDriver binary'
+test('真实R4 CI=1的bool解析红灯：构建显式--ci覆盖env，Cargo --locked置于Tauri分隔符之后',()=>{
+ const source=fs.readFileSync(new URL('../scripts/test-weixin-windows-qualification.mjs',import.meta.url),'utf8'),call=/await run\(process.execPath,(\[npm,'run','tauri','build'[^\n]+?\]),(\d+)\)/.exec(source)
+ assert.ok(call,'缺少实际npm/Tauri构建调用');const args=Array.from(vm.runInNewContext(call[1],{npm:'fixture-npm-cli.js'}))
+ assert.deepEqual(args,['fixture-npm-cli.js','run','tauri','build','--','--no-bundle','--ci','--','--locked'],'固定CLI2.10 CI bool不接受1，显式flag优先级已用坏schema本机无build验证；不得删锁或给Cargo错误位置')
+ assert.equal(Number(call[2]),2400000,'构建预算不变');assert.doesNotMatch(source,/(?:process\.env|env)\.CI\s*=/,'无需改变父环境或共享CI值')
+ assert.match(source,/report\.source.after=gitSnapshot\(candidate,o\['--sha'\]\)/);assert.match(source,/report\.tooling.after=gitSnapshot\(tooling,proof.toolingSha\)/)
+})
 test('真实38962119578微软154输出新名称仍严格提取四段版本，不伪造工具stdout',async()=>{
  const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.parseMicrosoftEdgeDriverVersion,'function','原run两host真实exit0新名称被旧MSEdgeDriver正则解析为undefined')
  const actual='Microsoft Edge WebDriver 154.0.4258.62 (49f7c5590dad654f33b924537ccc8be227c5a43a)\r\n'

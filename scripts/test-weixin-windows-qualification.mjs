@@ -297,7 +297,7 @@ async function execute(o){
   const edgeVersion=parseMicrosoftEdgeDriverVersion(await run(edge,['--version']));assert.equal(edgeVersion,runtime.version)
   report.drivers={tauri:tauriEvidence,edge:{path:edge,version:edgeVersion,runtimeVersion:runtime.version,sha256:hash(edge),zipSha256:sha(edgeBytes),runtime}};save()
   await run(process.execPath,[npm,'ci','--registry=https://registry.npmjs.org','--no-audit','--no-fund'],600000)
-  await run(process.execPath,[npm,'run','tauri','build','--','--no-bundle'],2400000)
+  await run(process.execPath,[npm,'run','tauri','build','--','--no-bundle','--ci','--','--locked'],2400000)
   const registry=path.join(env.CARGO_HOME,'registry/src');const tauriRoots=fs.readdirSync(registry).map(d=>path.join(registry,d,'tauri-2.11.1')).filter(d=>fs.existsSync(d));assert.equal(tauriRoots.length,1,'不明确的Tauri实际编译源码')
   for(const [file,expected]of [['src/webview/mod.rs','954cf212cb79d6b566c10b76d2ff2da05bc637cfc9f666c2f03d4e3dddf35f1c'],['src/ipc/mod.rs','8c18c612897de97dc4e1b3c1aa62869b66d610e85093e2015b1b6abc3418364d']]){const bytes=fs.readFileSync(path.join(tauriRoots[0],file));assert.equal(sha(bytes),expected,'Tauri2.11.1框架源不符');fs.writeFileSync(path.join(pub,'tauri-2.11.1-'+file.replaceAll('/','-')),bytes)}
   const buildOutputs=path.join(env.CARGO_TARGET_DIR,'release/build');for(const name of ['capabilities.json','acl-manifests.json']){const matches=fs.readdirSync(buildOutputs).filter(d=>d.startsWith('clawpanel-')).map(d=>path.join(buildOutputs,d,'out',name)).filter(f=>fs.existsSync(f));assert.equal(matches.length,1,'实际生成ACL输出不明确');fs.copyFileSync(matches[0],path.join(pub,'generated-'+name))}
