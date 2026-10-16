@@ -12,8 +12,15 @@ function probe(t, mode) {
   t.after(() => { assert.equal(path.dirname(fs.realpathSync.native(dir)), base); fs.rmSync(dir, { recursive: true, force: true }) })
   const module = path.resolve('scripts/hermes-windows-cim-probe.py')
   const driver = String.raw`
-import sys,os,time,pathlib,subprocess,json,types
+import sys,os,time,pathlib,subprocess,json,types,importlib.util,importlib.abc
 root=pathlib.Path(sys.argv[1]);mode=sys.argv[2];source=pathlib.Path(sys.argv[3]);marker=root/'closed';state={'closes':0,'polls':0};children=[]
+if os.environ.get('CLAWPANEL_TEST_NO_PSUTIL')=='1':
+ class DenyPsutil(importlib.abc.MetaPathFinder):
+  def find_spec(self,fullname,*a):
+   if fullname=='psutil':raise ModuleNotFoundError('fixture optional diagnostic module absent')
+ sys.meta_path.insert(0,DenyPsutil())
+try:state['psutilAvailable']=importlib.util.find_spec('psutil') is not None
+except ModuleNotFoundError:state['psutilAvailable']=False
 if mode=='observe-timeout':os.environ['CLAWPANEL_HERMES_PHASE_TIMING']='1'
 os.environ['PSModulePath']='fixture-pwsh7-only-module';os.environ['CLAWPANEL_CIM_ENV_CANARY']='retained';parent_env=dict(os.environ)
 class Job:
@@ -65,7 +72,7 @@ for p in children:
  except Exception:p.kill();p.communicate(timeout=2)
 print(json.dumps({'result':result,'error':error,'elapsed':elapsed,'state':state,'restored':c.bounded_probe_run is old and g._windows_process_listing is listing}))
 `
-  const r = spawnSync(process.env.PYTHON || 'python', ['-I', '-B', '-c', driver, dir, mode, module], { encoding: 'utf8', windowsHide: true, timeout: 7000, maxBuffer: 1048576 })
+  const r = spawnSync(process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), ['-I', '-B', '-c', driver, dir, mode, module], { encoding: 'utf8', windowsHide: true, timeout: 7000, maxBuffer: 1048576 })
   assert.equal(r.status, 0, r.stderr)
   const result = JSON.parse(r.stdout)
   result.observation = r.stderr.split(/\r?\n/).filter(s => s.startsWith('CLAWPANEL_HERMES_CIM_PROBE ')).map(s => JSON.parse(s.slice('CLAWPANEL_HERMES_CIM_PROBE '.length)))
@@ -113,10 +120,17 @@ test('实际deadline失败只记录数值/类型/直接子进程状态，不打�
   assert.ok(failed.pid > 0); assert.equal(r.error?.type, 'SystemExit')
   for (const row of r.observation) for (const key of Object.keys(row)) assert.ok(['event','pid','elapsedMs','exceptionType','directExitCode','deadlineMs','status','threads','cpuUserMs','cpuSystemMs'].includes(key), key)
   const state = r.observation.find(v => v.event === 'child-state')
-  assert.ok(state, '实际活子进程必须区分suspended/CPU工作，不能继续猜测管道')
-  assert.ok(['running','suspended','stopped','unknown'].includes(state.status))
-  assert.ok(Number.isInteger(state.threads) && state.threads > 0)
-  assert.ok(Number.isFinite(state.cpuUserMs) && Number.isFinite(state.cpuSystemMs))
+  if (r.state.psutilAvailable) {
+    assert.ok(state, '实际活子进程必须区分suspended/CPU工作，不能继续猜测管道')
+    assert.ok(['running','suspended','stopped','unknown'].includes(state.status))
+    assert.ok(Number.isInteger(state.threads) && state.threads > 0)
+    assert.ok(Number.isFinite(state.cpuUserMs) && Number.isFinite(state.cpuSystemMs))
+  } else {
+    // 普通Node CI不安装Hermes依赖；可选只读元数据缺失不准改写已断言的timeout失败。
+    assert.equal(state, undefined)
+    assert.equal(r.observation.find(v => v.event === 'child-state-unavailable')?.exceptionType, 'ModuleNotFoundError')
+    assert.equal(r.error?.type, 'SystemExit'); assert.equal(r.result, null)
+  }
 })
 
 test('CIM专属PowerShell子环境不继承异版PSModulePath，其他变量和父环境不变', { timeout: 10000 }, t => {
