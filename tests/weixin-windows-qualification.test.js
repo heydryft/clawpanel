@@ -8,9 +8,67 @@ import vm from 'node:vm'
 import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import zlib from 'node:zlib'
 import { parseArgs, runnerProofFailures, validateRunnerProof, HOSTS, REQUIRED_CASES, assertNativeComplete, assertOriginDenial, inspectTarMember, W3C, redact, processObservationSource, assertInstallObservation, assertPreparedTicket, expectedArtifact } from '../scripts/test-weixin-windows-qualification.mjs'
 
 const proof = () => ({ platform:'win32',arch:'x64',runnerEnvironment:'github-hosted',runnerOS:'Windows',event:'workflow_dispatch',ref:'refs/heads/main',repository:'qingchencloud/clawpanel',workflowRef:'qingchencloud/clawpanel/.github/workflows/weixin-qualification.yml@refs/heads/main',workflowSha:'a'.repeat(40),toolingSha:'a'.repeat(40),runId:'1234',attempt:'1',virtualMachine:true,imageOS:'win25',imageVersion:'20261017.1',userName:'runneradmin',sid:'S-1-5-21-123-234-345-1001',actualProfile:'C:\\Users\\runneradmin',registeredProfile:'C:\\Users\\runneradmin' })
+
+// R5 first-red：整包解压、大成员、lifecycle 唯一转换；不安装 runtime 或伪造 native 成功。
+function contractTar(rows){const blocks=[];for(const [name,body=Buffer.from('x'),type='0']of rows){const header=Buffer.alloc(512);header.write(name);header.write(body.length.toString(8).padStart(11,'0')+'\0',124);header[156]=type.charCodeAt();header.write('ustar\0',257);header.write('00',263);header.fill(32,148,156);header.write(header.reduce((a,b)=>a+b,0).toString(8).padStart(6,'0')+'\0 ',148);blocks.push(header,body,Buffer.alloc((-body.length)%512+((body.length%512)?512:0)))}return Buffer.concat([...blocks,Buffer.alloc(1024)])}
+const byteHash=b=>crypto.createHash('sha256').update(b).digest('hex')
+const contractLimits=(b,rows)=>({tarBytes:b.length,unpackedSize:rows.reduce((s,r)=>s+(r[1]??Buffer.from('x')).length,0),fileCount:rows.length,largeMembers:[]})
+async function* oddChunks(b){for(let n=0;n<b.length;n+=37)yield b.subarray(n,n+37)}
+test('R5 official metadata必须精确已审大小/文件数/SRI/版本，未知及缺大小均拒绝',async()=>{
+ const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.validateHostArchiveMetadata,'function')
+ for(const version of Object.keys(HOSTS)){const pin=HOSTS[version],meta={name:'openclaw',version,dist:{integrity:pin.integrity,tarball:`https://registry.npmjs.org/openclaw/-/openclaw-${version}.tgz`,unpackedSize:pin.unpackedSize,fileCount:pin.fileCount}};m.validateHostArchiveMetadata(version,meta)
+  for(const patch of [{unpackedSize:undefined},{unpackedSize:0},{unpackedSize:String(pin.unpackedSize)},{unpackedSize:pin.unpackedSize+1},{fileCount:undefined},{fileCount:pin.fileCount+1},{integrity:HOSTS['2026.5.12'].integrity+'x'},{tarball:'https://example.invalid/x.tgz'}])assert.throws(()=>m.validateHostArchiveMetadata(version,{...meta,dist:{...meta.dist,...patch}}))
+  assert.throws(()=>m.validateHostArchiveMetadata(version,{...meta,version:'2026.10.5'}))
+ }assert.throws(()=>m.validateHostArchiveMetadata('2026.10.5',{}))
+})
+test('R5有界tar流逐成员hash，不缓存成员；截断/总量/数量/协议/路径/重复红灯',async()=>{
+ const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.hashHostTarStream,'function')
+ const rows=[['package/package.json',Buffer.from('{}')],['package/a',Buffer.from('abc')]],b=contractTar(rows),limits=contractLimits(b,rows)
+ const r=await m.hashHostTarStream(oddChunks(b),limits);assert.deepEqual(r.members,rows.map(([name,v])=>({name,size:v.length,sha256:byteHash(v)})));assert.ok(r.peakBufferedBytes<=65536);assert.equal(r.tarBytes,b.length)
+ for(const changed of [{tarBytes:b.length-1},{tarBytes:b.length+512},{unpackedSize:6},{fileCount:1},{fileCount:3}])await assert.rejects(m.hashHostTarStream(oddChunks(b),{...limits,...changed}))
+ for(const broken of [b.subarray(0,b.length-512),Buffer.concat([b,Buffer.alloc(512)]),Buffer.from(b)]){if(broken.length===b.length)broken[200]^=1;await assert.rejects(m.hashHostTarStream(oddChunks(broken),limits))}
+ for(const name of ['../x','package/../x','package/a//b','package/C:evil','package/a\\b','package/x.','package/./x']){const rows=[[name]],tar=contractTar(rows);await assert.rejects(m.hashHostTarStream(oddChunks(tar),contractLimits(tar,rows)))}
+ for(const rows of [[['package/a'],['package/a']],[['package/A'],['package/a']],[['package/link',Buffer.from('x'),'2']],[['package/pax',Buffer.from('x'),'x']]]){const tar=contractTar(rows);await assert.rejects(m.hashHostTarStream(oddChunks(tar),contractLimits(tar,rows)))}
+ const padding=Buffer.from(b);padding[514]=1;await assert.rejects(m.hashHostTarStream(oddChunks(padding),limits))
+})
+test('R5大成员仅精确已审path+size+hash可流过，未知大成员仍32MiB且超量立即cancel',async()=>{
+ const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.hashHostTarStream,'function')
+ const body=Buffer.alloc(32*1024*1024+1,97),rows=[['package/big',body]],b=contractTar(rows),limits=contractLimits(b,rows),approved={name:'package/big',size:body.length,sha256:byteHash(body)}
+ await assert.rejects(m.hashHostTarStream(oddChunks(b.subarray(0,512)),limits),/成员预算/)
+ const r=await m.hashHostTarStream([b],{...limits,largeMembers:[approved]});assert.equal(r.members[0].sha256,approved.sha256);assert.ok(r.peakBufferedBytes<=65536)
+ for(const patch of [{name:'package/other'},{size:body.length+1},{sha256:'0'.repeat(64)}])await assert.rejects(m.hashHostTarStream([b],{...limits,largeMembers:[{...approved,...patch}]}))
+ let closed=false,produced=0;async function* overflow(){try{while(true){produced++;yield Buffer.alloc(65536)}}finally{closed=true}}
+ await assert.rejects(m.hashHostTarStream(overflow(),{tarBytes:1024,unpackedSize:1,fileCount:1,largeMembers:[]}));assert.equal(closed,true);assert.equal(produced,1)
+})
+test('R5压缩包入口绑定exact host/SRI/压缩字节，不让fixture/zipbomb/跨版本进入解压',async()=>{
+ const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.inspectHostArchive,'function')
+ const version='2026.10.4',pin=HOSTS[version],meta={name:'openclaw',version,dist:{integrity:pin.integrity,tarball:`https://registry.npmjs.org/openclaw/-/openclaw-${version}.tgz`,unpackedSize:pin.unpackedSize,fileCount:pin.fileCount}}
+ await assert.rejects(m.inspectHostArchive(version,zlib.gzipSync(Buffer.alloc(2*1024*1024)),meta))
+ await assert.rejects(m.inspectHostArchive('2026.10.5',Buffer.alloc(0),meta))
+ await assert.rejects(m.inspectHostArchive(version,Buffer.alloc(pin.compressedSize),meta),/SRI|归档摘要/)
+})
+test('R5安装回读仅允许精确pending删除；其它缺失/变更/链接/pending保留均红',async()=>{
+ const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.verifyHostMemberHashes,'function')
+ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'weixin-host-readback-'))),body=Buffer.from('original'),pending=Buffer.from('pending\n'),members=[{name:'package/a',size:body.length,sha256:byteHash(body)},{name:'package/.openclaw-lifecycle-pending',size:pending.length,sha256:byteHash(pending)}],marker=members[1]
+ try{fs.writeFileSync(path.join(root,'a'),body);fs.writeFileSync(path.join(root,'.openclaw-lifecycle-pending'),pending)
+  await assert.rejects(m.verifyHostMemberHashes(root,members,marker),/pending|marker/)
+  fs.unlinkSync(path.join(root,'.openclaw-lifecycle-pending'));assert.deepEqual(await m.verifyHostMemberHashes(root,members,marker),{a:byteHash(body)})
+  await assert.rejects(m.verifyHostMemberHashes(root,members,null));await assert.rejects(m.verifyHostMemberHashes(root,members,{...marker,sha256:'0'.repeat(64)}));fs.writeFileSync(path.join(root,'a'),'changed');await assert.rejects(m.verifyHostMemberHashes(root,members,marker));fs.unlinkSync(path.join(root,'a'));await assert.rejects(m.verifyHostMemberHashes(root,members,marker));fs.mkdirSync(path.join(root,'.openclaw-lifecycle-pending'));await assert.rejects(m.verifyHostMemberHashes(root,members,marker))
+ }finally{fs.rmSync(root,{recursive:true,force:true})}
+})
+test('R5 lifecycle完成收据需固定hook+真实npm成功命令和foreground输出，非零/静默/改hook均红',async()=>{
+ const m=await import('../scripts/test-weixin-windows-qualification.mjs');assert.equal(typeof m.assertHostLifecycleReceipt,'function')
+ for(const version of Object.keys(HOSTS)){const pin=HOSTS[version],members=Object.entries(pin.lifecycleHashes).map(([name,sha256])=>({name:'package/'+name,sha256,size:1}));if(pin.pending)members.push({name:'package/.openclaw-lifecycle-pending',...pin.pending})
+  const cmd={ok:true,code:0,signal:null,pid:123,program:'C:\\private\\node.exe',cwd:'C:\\private\\host',args:['npm-cli.js','install','--global','--prefix','C:\\private\\host\\npm','--registry=https://registry.npmjs.org','--no-audit','--no-fund','--ignore-scripts=false','--foreground-scripts','C:\\private\\host\\openclaw.tgz']},stdout=`> openclaw@${version} postinstall\n> node scripts/postinstall-bundled-plugins.mjs\n`
+  assert.equal(m.assertHostLifecycleReceipt(version,members,cmd,stdout).stdoutSha256,byteHash(Buffer.from(stdout)))
+  for(const changed of [{code:1},{pid:0},{ok:false},{signal:'SIGTERM'},{args:cmd.args.filter(x=>x!=='--foreground-scripts')},{args:[...cmd.args,'--ignore-scripts']}])assert.throws(()=>m.assertHostLifecycleReceipt(version,members,{...cmd,...changed},stdout))
+  assert.throws(()=>m.assertHostLifecycleReceipt(version,members,cmd,''));assert.throws(()=>m.assertHostLifecycleReceipt(version,members,cmd,stdout.replace(version,'other')));assert.throws(()=>m.assertHostLifecycleReceipt(version,[{...members[0],sha256:'0'.repeat(64)},...members.slice(1)],cmd,stdout))
+ }
+})
 test('新 workflow 自己验证完整合取，不把 ref 改写后交老 validator',()=>{
   validateRunnerProof(proof()); assert.deepEqual(runnerProofFailures(proof()),[])
   assert.throws(()=>validateRunnerProof({...proof(),workflowRef:'qingchencloud/clawpanel/.github/workflows/hermes-qualification.yml@refs/heads/main'}))

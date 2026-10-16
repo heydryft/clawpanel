@@ -13,10 +13,10 @@ const hex = ms => (epoch + BigInt(ms) * 10000n).toString(16).padStart(16, '0')
 const copy = value => structuredClone(value)
 const moduleUrl = new URL('../scripts/hermes-cli-owned-identity.mjs', import.meta.url)
 const load = () => import(moduleUrl)
-const native = (pid, at = B + 50, birth = B + pid) => ({ pid, status: 'running', sampledAtMs: at, creationTimeFileTimeHex: hex(birth), createdAtMs: birth, exitAtMs: 0, belongsToFixture: true, waitResult: 258, nativeError: 0, imageQueryError: 0 })
+const native = (pid, at = B + 50, birth = B + pid) => ({ pid, status: 'running', sampledAtMs: at, queryStartedAtMs: at, queryCompletedAtMs: at, creationTimeFileTimeHex: hex(birth), createdAtMs: birth, exitAtMs: 0, belongsToFixture: true, waitResult: 258, nativeError: 0, imageQueryError: 0 })
 function material() {
   const events = [1, 2, 3].map(pid => ({ event: 'start', pid, name: `burst-${pid}`, birthId: `fixture-${pid}`, at: B + 20, monotonicMs: 20 }))
-  return { events, rawSweeps: [{ startedAtMs: B + 1000, completedAtMs: B + 1001, probeCount: 3, starts: copy(events), probes: events.map((e, i) => ({ pid: e.pid, alive: true, startedAtMs: B + 1000, completedAtMs: B + 1001, startedAtNs: String(1000000000 + i * 10000), completedAtNs: String(1000001000 + i * 10000), errorCode: null })) }], nativeRows: events.map(e => native(e.pid)), observerErrors: [] }
+  return { events, rawSweeps: [{ startedAtMs: B + 1000, completedAtMs: B + 1001, journalEventCount: events.length, probeCount: 3, starts: copy(events), probes: events.map((e, i) => ({ pid: e.pid, alive: true, startedAtMs: B + 1000, completedAtMs: B + 1001, startedAtNs: String(1000000000 + i * 10000), completedAtNs: String(1000001000 + i * 10000), errorCode: null })) }], nativeRows: events.map(e => native(e.pid)), observerErrors: [] }
 }
 function replacement(input, birth = B + 800) {
   input.nativeRows.push({ ...native(3, Math.max(B + 1010, birth + 5), birth), belongsToFixture: false })
@@ -35,11 +35,11 @@ function actualReplay() {
   return { saved, input: { events, rawSweeps: [{ ...s, starts: s.pids.map(p => p.start), probes: s.pids.map(({ pid, alive, startedAtMs, completedAtMs, startedAtNs, completedAtNs }) => ({ pid, alive, startedAtMs, completedAtMs, startedAtNs, completedAtNs, errorCode: alive ? null : undefined })) }], nativeRows: s.pids.flatMap(p => [p.nativeFirst, p.nativeBefore, p.nativeAfter].map(row => ({ pid: p.pid, ...row }))), observerErrors: [] } }
 }
 
-test('真实407完整样本：raw3保留，旧false探针错误码缺失仍红，不补造ESRCH', async () => {
+test('真实407完整样本：raw3保留，旧捕获缺原生查询区间仍红，false码也不补造', async () => {
   const { input, saved } = actualReplay(), before = copy(input)
   assert.equal(saved.provenance.sourceSha, '407519bcc3ed15a00f9b8b1d4d6099e2b283f6e2')
   assert.equal(input.rawSweeps[0].probes.filter(p => p.alive).length, 3)
-  await assert.rejects(gate(input), /RAW_ERROR_UNKNOWN/)
+  await assert.rejects(gate(input), /NATIVE_INTERVAL_MISSING/)
   assert.deepEqual(input, before)
 })
 
@@ -47,7 +47,10 @@ test('真实407三个原true探针逐项重放：7056有前置出生证明，另
   const { input } = actualReplay(), { qualifyFixtureIdentityHistory } = await load(), results = []
   for (const probe of input.rawSweeps[0].probes.filter(p => p.alive)) {
     const start = input.events.find(e => e.event === 'start' && e.pid === probe.pid)
-    const r = qualifyFixtureIdentityHistory({ events: [start], rawSweeps: [{ ...input.rawSweeps[0], starts: [start], probes: [probe], probeCount: 1, count: 1 }], nativeRows: input.nativeRows.filter(r => r.pid === probe.pid), observerErrors: [] })
+    // 仅此旧单项诊断投影使用[Unix epoch, 已捕获完成时间]的保守包络；不是新增原始捕获。
+    // 宽包络不能证明missing发生在baseline之后；7056仍只使用精确FILETIME出生证明。
+    const nativeRows = input.nativeRows.filter(r => r.pid === probe.pid).map(r => ({ ...r, queryStartedAtMs: 0, queryCompletedAtMs: r.sampledAtMs }))
+    const r = qualifyFixtureIdentityHistory({ events: [start], rawSweeps: [{ ...input.rawSweeps[0], journalEventCount: 1, starts: [start], probes: [probe], probeCount: 1, count: 1 }], nativeRows, observerErrors: [] })
     results.push(r)
   }
   assert.equal(results.reduce((n, r) => n + r.rawUnqualifiedPeak, 0), 3)
@@ -65,12 +68,12 @@ test('三个当前fixture身份仍活跃：原<=2必须红，不靠native另时�
 for (const [label, mutate] of [
   ['替代仅在raw后新生', m => replacement(m, B + 1002)],
   ['替代出生恰在raw毫秒下界', m => replacement(m, B + 1000)],
-  ['仅raw后的missing', m => m.nativeRows.push({ pid: 3, status: 'missing', sampledAtMs: B + 1002, nativeError: 87, waitResult: 4294967295, creationTimeFileTimeHex: null })],
+  ['仅raw后的missing', m => m.nativeRows.push({ pid: 3, status: 'missing', sampledAtMs: B + 1002, queryStartedAtMs: B + 1002, queryCompletedAtMs: B + 1002, nativeError: 87, waitResult: 4294967295, creationTimeFileTimeHex: null })],
   ['仅JS exit而无OS证据', m => m.events.push({ ...m.events[2], event: 'exit', at: B + 700 })],
 ]) test(`无足够前置证明仍红：${label}`, async () => { const m = material(); mutate(m); await assert.rejects(gate(m), { code: 'ERR_ASSERTION' }) })
 
 for (const [label, mutate] of [
-  ['旧身份存在后原生missing87早于raw', m => m.nativeRows.push({ pid: 3, status: 'missing', sampledAtMs: B + 700, nativeError: 87, waitResult: 4294967295, creationTimeFileTimeHex: null })],
+  ['旧身份存在后原生missing87早于raw', m => m.nativeRows.push({ pid: 3, status: 'missing', sampledAtMs: B + 700, queryStartedAtMs: B + 700, queryCompletedAtMs: B + 700, nativeError: 87, waitResult: 4294967295, creationTimeFileTimeHex: null })],
   ['同一旧创建身份OS exit早于raw', m => m.nativeRows.push({ ...native(3, B + 1010), status: 'exited', exitAtMs: B + 700, waitResult: 0, imageQueryError: 31 })],
 ]) test(`独立前置时间证明可排除：${label}`, async () => { const m = material(); mutate(m); const r = await gate(m); assert.equal(r.rawUnqualifiedPeak, 3); assert.equal(r.ownedPeak, 2); assert.equal(r.exclusions.length, 1) })
 
@@ -90,7 +93,7 @@ for (const [label, mutate, code] of [
 
 for (const [label, mutate, code] of [
   ['raw=false也不接受无baseline的start', m => { m.nativeRows.pop(); Object.assign(m.rawSweeps[0].probes[2], { alive: false, errorCode: 'ESRCH' }) }, 'BASELINE'],
-  ['missing之后旧创建身份又running', m => { m.nativeRows.push({ pid: 3, status: 'missing', sampledAtMs: B + 700, nativeError: 87 }); m.nativeRows.push(native(3, B + 900)) }, 'CONFLICT'],
+  ['missing之后旧创建身份又running', m => { m.nativeRows.push({ pid: 3, status: 'missing', sampledAtMs: B + 700, queryStartedAtMs: B + 700, queryCompletedAtMs: B + 700, nativeError: 87 }); m.nativeRows.push(native(3, B + 900)) }, 'CONFLICT'],
   ['OS exit之后旧创建身份又running', m => { m.nativeRows.push({ ...native(3, B + 800), status: 'exited', exitAtMs: B + 700, waitResult: 0 }); m.nativeRows.push(native(3, B + 900)) }, 'CONFLICT'],
   ['raw探针次序重叠', m => { m.rawSweeps[0].probes[1].startedAtNs = '999999999' }, 'RAW'],
   ['先前已见历史start被下一轮丢弃', m => { const r = copy(m.rawSweeps[0]); r.startedAtMs++; r.completedAtMs++; r.starts.pop(); r.probes.pop(); r.probeCount--; r.probes.forEach(p => { p.startedAtMs++; p.completedAtMs++; p.startedAtNs = String(BigInt(p.startedAtNs) + 1000000n); p.completedAtNs = String(BigInt(p.completedAtNs) + 1000000n) }); m.rawSweeps.push(r) }, 'RAW'],
@@ -163,7 +166,7 @@ test('Windows真实三活跃：原25ms kill0加短句柄native身份，owned3必
     events.push({ event: 'start', pid: child.pid, name: 'burst-' + i, at: Date.now(), monotonicMs: Number(process.hrtime.bigint() / 1000000n) })
   }
   const before = await observer.snapshot(events.map(e => e.pid))
-  const raw = await new Promise(resolve => { timer = setInterval(() => { const startedAtMs = Date.now(), probes = events.map(e => { const p = { pid: e.pid, startedAtMs: Date.now(), startedAtNs: process.hrtime.bigint().toString(), errorCode: null }; try { process.kill(e.pid, 0); p.alive = true } catch (error) { p.alive = false; p.errorCode = error.code } return { ...p, completedAtMs: Date.now(), completedAtNs: process.hrtime.bigint().toString() } }); clearInterval(timer); resolve({ startedAtMs, completedAtMs: Date.now(), starts: events, probes, probeCount: probes.length }) }, 25) })
+  const raw = await new Promise(resolve => { timer = setInterval(() => { const startedAtMs = Date.now(), probes = events.map(e => { const p = { pid: e.pid, startedAtMs: Date.now(), startedAtNs: process.hrtime.bigint().toString(), errorCode: null }; try { process.kill(e.pid, 0); p.alive = true } catch (error) { p.alive = false; p.errorCode = error.code } return { ...p, completedAtMs: Date.now(), completedAtNs: process.hrtime.bigint().toString() } }); clearInterval(timer); resolve({ startedAtMs, completedAtMs: Date.now(), journalEventCount: events.length, starts: events, probes, probeCount: probes.length }) }, 25) })
   const after = await observer.snapshot(events.map(e => e.pid))
   const nativeRows = [before, after].flatMap(sample => classifyFixtureIdentitySample({ starts: events, processes: sample.processes, expectedExecutable: executable }).processes)
   const r = qualifyFixtureIdentityHistory({ events, rawSweeps: [raw], nativeRows, observerErrors: [] })

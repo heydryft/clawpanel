@@ -6,7 +6,7 @@ const integer = n => Number.isSafeInteger(n) && n >= 0
 const ticks = hex => { if (!/^[0-9a-f]{16}$/i.test(hex || '')) fail('NATIVE_IDENTITY'); return BigInt('0x' + hex) }
 const lowerTick = ms => epoch + BigInt(ms) * 10000n
 const startKey = s => `${s.pid}/${s.name}/${s.at}/${s.monotonicMs}`
-const pickNative = r => ({ status: r.status, sampledAtMs: r.sampledAtMs, creationTimeFileTimeHex: r.creationTimeFileTimeHex ?? null, createdAtMs: r.createdAtMs ?? null, exitAtMs: r.exitAtMs ?? null, belongsToFixture: r.belongsToFixture ?? null, waitResult: r.waitResult, nativeError: r.nativeError, imageQueryError: r.imageQueryError ?? null })
+const pickNative = r => ({ status: r.status, sampledAtMs: r.sampledAtMs, queryStartedAtMs: r.queryStartedAtMs, queryCompletedAtMs: r.queryCompletedAtMs, creationTimeFileTimeHex: r.creationTimeFileTimeHex ?? null, createdAtMs: r.createdAtMs ?? null, exitAtMs: r.exitAtMs ?? null, belongsToFixture: r.belongsToFixture ?? null, waitResult: r.waitResult, nativeError: r.nativeError, imageQueryError: r.imageQueryError ?? null })
 
 export function qualifyFixtureIdentityHistory(material, { nativeIdentityAvailable = true } = {}) {
   let size
@@ -26,6 +26,8 @@ export function qualifyFixtureIdentityHistory(material, { nativeIdentityAvailabl
   for (const row of nativeRows) {
     if (!byPid.has(row.pid) || !integer(row.sampledAtMs)) fail('NATIVE_SCHEMA')
     if (['createdAtMs', 'exitAtMs', 'waitResult', 'nativeError', 'imageQueryError'].some(key => row[key] != null && !integer(row[key])) || (row.belongsToFixture != null && typeof row.belongsToFixture !== 'boolean')) fail('NATIVE_SCHEMA')
+    if (!integer(row.queryStartedAtMs) || !integer(row.queryCompletedAtMs)) fail('NATIVE_INTERVAL_MISSING')
+    if (row.queryStartedAtMs > row.queryCompletedAtMs || row.queryCompletedAtMs !== row.sampledAtMs) fail('NATIVE_INTERVAL_INVALID')
     if (row.status === 'missing') {
       if (row.nativeError !== 87 || row.creationTimeFileTimeHex) fail('NATIVE_UNKNOWN_ABSENCE')
     } else if (row.status === 'running' || row.status === 'exited') {
@@ -52,18 +54,18 @@ export function qualifyFixtureIdentityHistory(material, { nativeIdentityAvailabl
     const replacements = rows.filter(r => r.status !== 'missing' && r.creationTimeFileTimeHex !== first.creationTimeFileTimeHex)
     for (const next of replacements) {
       if (ticks(next.creationTimeFileTimeHex) <= lowerTick(info.start.at + 1)) fail('START_IDENTITY_CONFLICT')
-      if (rows.some(r => r.status === 'running' && r.creationTimeFileTimeHex === first.creationTimeFileTimeHex && r.sampledAtMs > next.createdAtMs + 1)) fail('NATIVE_IDENTITY_CONFLICT')
+      if (rows.some(r => r.status === 'running' && r.creationTimeFileTimeHex === first.creationTimeFileTimeHex && r.queryStartedAtMs > next.createdAtMs + 1)) fail('NATIVE_IDENTITY_CONFLICT')
     }
     for (const gone of rows) {
-      const goneAt = gone.status === 'missing' && gone.sampledAtMs > first.sampledAtMs + 1 ? gone.sampledAtMs
+      const goneAt = gone.status === 'missing' && gone.queryStartedAtMs > first.queryCompletedAtMs + 1 ? gone.queryCompletedAtMs
         : gone.status === 'exited' && gone.creationTimeFileTimeHex === first.creationTimeFileTimeHex ? gone.exitAtMs : null
-      if (goneAt !== null && rows.some(r => r.status === 'running' && r.creationTimeFileTimeHex === first.creationTimeFileTimeHex && r.sampledAtMs > goneAt + 1)) fail('NATIVE_ABSENCE_CONFLICT')
+      if (goneAt !== null && rows.some(r => r.status === 'running' && r.creationTimeFileTimeHex === first.creationTimeFileTimeHex && r.queryStartedAtMs > goneAt + 1)) fail('NATIVE_ABSENCE_CONFLICT')
     }
     baseline.set(pid, { first, rows, replacements })
   }
   let rawUnqualifiedPeak = 0, ownedPeak = 0, rawProbeCount = 0, rawPeakWitness = null, ownedPeakWitness = null, lastSweepAt = -1
   const proofs = [], proofIds = new Map(), exclusions = [], historical = new Set()
-  let previousProbeEndNs = -1n
+  let previousProbeEndNs = -1n, previousJournalCount = 0
   for (const [sweepIndex, sweep] of rawSweeps.entries()) {
     if (!integer(sweep.startedAtMs) || !integer(sweep.completedAtMs) || sweep.completedAtMs < sweep.startedAtMs || sweep.startedAtMs < lastSweepAt || !Array.isArray(sweep.starts) || !Array.isArray(sweep.probes)) fail('RAW_SCHEMA')
     lastSweepAt = sweep.startedAtMs
@@ -74,7 +76,6 @@ export function qualifyFixtureIdentityHistory(material, { nativeIdentityAvailabl
       seen.set(s.pid, s)
     }
     if ([...historical].some(pid => !seen.has(pid))) fail('RAW_HISTORY_MISSING')
-    if (starts.some(s => s.at + 1 < sweep.startedAtMs && !seen.has(s.pid))) fail('RAW_START_MISSING')
     for (const pid of seen.keys()) historical.add(pid)
     if (sweep.probeCount !== sweep.probes.length || seen.size !== sweep.probes.length) fail('RAW_PROBE_MISSING')
     rawProbeCount += sweep.probes.length
@@ -102,7 +103,7 @@ export function qualifyFixtureIdentityHistory(material, { nativeIdentityAvailabl
         if (row) kind = 'same-creation-os-exit-before-probe'
       }
       if (!row) {
-        row = base.rows.find(r => r.status === 'missing' && r.sampledAtMs > base.first.sampledAtMs + 1 && r.sampledAtMs + 1 < probe.startedAtMs)
+        row = base.rows.find(r => r.status === 'missing' && r.queryStartedAtMs > base.first.queryCompletedAtMs + 1 && r.queryCompletedAtMs + 1 < probe.startedAtMs)
         if (row) kind = 'known-native-absence-before-probe'
       }
       if (!row) { ownedCount++; witness.push({ ...point, startId: start.id, expectedCreation: base.first.creationTimeFileTimeHex, classification: 'conservatively-owned' }); continue }
@@ -115,6 +116,12 @@ export function qualifyFixtureIdentityHistory(material, { nativeIdentityAvailabl
       exclusions.push([sweepIndex, probeIndex, proofId, probe.startedAtMs, probe.completedAtMs])
       witness.push({ ...point, startId: start.id, expectedCreation: base.first.creationTimeFileTimeHex, classification: 'proved-not-old-start', proofId })
     }
+    // 产生时间不是文件可见时间。用同一次完整readEvents的长度对照最终追加journal前缀，
+    // 同时保留以前已见历史与最终全start覆盖；收据缺失/回退/确证遗漏一律失败。
+    if (!integer(sweep.journalEventCount) || sweep.journalEventCount < previousJournalCount || sweep.journalEventCount > events.length) fail('RAW_JOURNAL_RECEIPT')
+    const visibleStarts = events.slice(0, sweep.journalEventCount).filter(e => e.event === 'start')
+    if (visibleStarts.length !== seen.size || visibleStarts.some((s, i) => s.pid !== sweep.starts[i]?.pid)) fail('RAW_START_MISSING')
+    previousJournalCount = sweep.journalEventCount
     if (sweep.count !== undefined && sweep.count !== rawCount) fail('RAW_COUNT_CONFLICT')
     const snapshot = { sweepIndex, startedAtMs: sweep.startedAtMs, completedAtMs: sweep.completedAtMs, rawCount, ownedCount, probes: witness }
     if (rawCount > rawUnqualifiedPeak) { rawUnqualifiedPeak = rawCount; rawPeakWitness = snapshot }

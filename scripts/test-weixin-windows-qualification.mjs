@@ -7,6 +7,8 @@ import http from 'node:http'
 import net from 'node:net'
 import crypto from 'node:crypto'
 import zlib from 'node:zlib'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import vm from 'node:vm'
 import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -26,9 +28,16 @@ const wait=ms=>new Promise(r=>setTimeout(r,ms))
 const read=f=>JSON.parse(fs.readFileSync(f,'utf8').replace(/^\uFEFF/,''))
 const inside=(root,file)=>{const r=path.relative(root,file);return r!==''&&r!=='..'&&!r.startsWith('..'+path.sep)&&!path.isAbsolute(r)}
 export const HOSTS=Object.freeze({
- '2026.5.12':Object.freeze({integrity:'sha512-hHg88OFSF0rhDNUbmjMEJO0UdnGn4mNq0F23Hk/NmTKY3OaPCUXiHutd8Ea6S5TGouponytMMWCYgPRrwsW2Xg==',manifest:'84cb48b639a69a10703eb9d24c612f8f4780f73163dc09927309a6e0026968f2',entry:'ee861ae6f3298a0c2062ff52a682b5ce4786ae515a3eb816921f9a128341c733',accept:false}),
- '2026.9.8':Object.freeze({integrity:'sha512-G+JkNUhtpDE3cXR4AEi2NyyG9fqI/T2WUSl8ZnR8AATH8Dh1kC3qYFL7wwPoZtgHiP/cszA86PEiE0PDysxb9Q==',manifest:'d2e734563bfb126d273beeb1e2cc5d4525b4d59efe00fdfec50a39b427524f56',entry:'aa8606ca0d62ff133ef5b7bd2323ec8ff3f8eb384404399cd5e742918d63b0a1',accept:true}),
- '2026.10.4':Object.freeze({integrity:'sha512-+FH0StZF1tlTazM7JJGY6JePeJmhFNSRByi2Q3jXPRiLO7o4dJh2xa9Vy4Dk8Cd2ic8B7Zkf5NfEaCCWUkgqnQ==',manifest:'1ef9c6031d4789c57f1d7632d0b1c149d31e194b2a9441d93dcfc0010d8d74f6',entry:'aa8606ca0d62ff133ef5b7bd2323ec8ff3f8eb384404399cd5e742918d63b0a1',accept:true}),
+ '2026.5.12':Object.freeze({integrity:'sha512-hHg88OFSF0rhDNUbmjMEJO0UdnGn4mNq0F23Hk/NmTKY3OaPCUXiHutd8Ea6S5TGouponytMMWCYgPRrwsW2Xg==',manifest:'84cb48b639a69a10703eb9d24c612f8f4780f73163dc09927309a6e0026968f2',entry:'ee861ae6f3298a0c2062ff52a682b5ce4786ae515a3eb816921f9a128341c733',accept:false,
+  compressedSize:23362052,archiveSha256:'1cae4d1d4132e5fd548478ab3ad3c578627a9c78e37e67379dde7659c674bf1e',tarBytes:89555456,unpackedSize:80071393,fileCount:12035,inventorySha256:'e8e4c3f217d368695bae4935ce14bfd5de4f7253bb37f7d4af4bc5dd90e21b6c',largeMembers:Object.freeze([]),pending:null,
+  lifecycleHashes:Object.freeze({'scripts/postinstall-bundled-plugins.mjs':'7e580df194c9548ff09739b38a730b1983b8f612c80d5af569922e2a2bcb60f8'})}),
+ '2026.9.8':Object.freeze({integrity:'sha512-G+JkNUhtpDE3cXR4AEi2NyyG9fqI/T2WUSl8ZnR8AATH8Dh1kC3qYFL7wwPoZtgHiP/cszA86PEiE0PDysxb9Q==',manifest:'d2e734563bfb126d273beeb1e2cc5d4525b4d59efe00fdfec50a39b427524f56',entry:'aa8606ca0d62ff133ef5b7bd2323ec8ff3f8eb384404399cd5e742918d63b0a1',accept:true,
+  compressedSize:113916525,archiveSha256:'317e0a58db32b386e01187fe9c5c4de541f4ce6d815657bf79a102609b81752a',tarBytes:399390208,unpackedSize:388955824,fileCount:13320,inventorySha256:'3278a8c30a3edebfbea393720c28cf26dcc242442b1f1709b82fe0fc781ba80d',
+  largeMembers:Object.freeze([Object.freeze({name:'package/dist/package-update-activation-recovery.mjs',size:66255827,sha256:'e08dfc1fb3ba7962f9e01d7a6770117c6cd77406b3fa4f7ba94788a670030ba0'}),Object.freeze({name:'package/dist/worker/sqlite-store.worker.mjs',size:49455296,sha256:'168be2b4e38f9e3a6b0682ddc45c04e6f7bcfe31ab3d0bdb08e548f13cfecca2'}),Object.freeze({name:'package/dist/worker/worker.mjs',size:55473425,sha256:'45da9962621c5dee917f56e315d2abf7161bc5f31297e2e8361343d7f9e69294'})]),
+  pending:Object.freeze({size:8,sha256:'52d26753462488ad21852bc6718e21b84835f53765304d0a1e1b89d05a2a71b1'}),lifecycleHashes:Object.freeze({'scripts/postinstall-bundled-plugins.mjs':'46f51eda38ca5342ae2fdb0c902f0f42a2047abc785bbf8252c4fc42ff4b3e68','scripts/lib/package-lifecycle-marker.mjs':'32c50197ecc6f10b78f9f8ef588b868e7cdf428233e00fb912044dee5da46e1a','scripts/lib/fs-safe-prebuild.mjs':'a44256cf9f4a3bb16e3fa8aa44f63cc26ab60d6ff288d687a2a5fd3388c9ecc9'})}),
+ '2026.10.4':Object.freeze({integrity:'sha512-+FH0StZF1tlTazM7JJGY6JePeJmhFNSRByi2Q3jXPRiLO7o4dJh2xa9Vy4Dk8Cd2ic8B7Zkf5NfEaCCWUkgqnQ==',manifest:'1ef9c6031d4789c57f1d7632d0b1c149d31e194b2a9441d93dcfc0010d8d74f6',entry:'aa8606ca0d62ff133ef5b7bd2323ec8ff3f8eb384404399cd5e742918d63b0a1',accept:true,
+  compressedSize:102973323,archiveSha256:'0a41c2ed708abc812498de58d71d058dde322700488d6e8062c7c070dfdca6dc',tarBytes:268790272,unpackedSize:257836855,fileCount:13985,inventorySha256:'1fb60580a624775482f824ecbab7e7be5f14f0685bb45f2114a86a7ca8ed2b7c',largeMembers:Object.freeze([]),
+  pending:Object.freeze({size:8,sha256:'52d26753462488ad21852bc6718e21b84835f53765304d0a1e1b89d05a2a71b1'}),lifecycleHashes:Object.freeze({'scripts/postinstall-bundled-plugins.mjs':'1fd5c17ff69871d23f234256170c8208517041327e5332f87da71d2d8ed77eb1','scripts/lib/package-lifecycle-marker.mjs':'32c50197ecc6f10b78f9f8ef588b868e7cdf428233e00fb912044dee5da46e1a','scripts/lib/fs-safe-prebuild.mjs':'77ed4b2af4f963b4b98570ff106ad76d12d9ca54b8b155aa1df0ed07a5cb0052'})}),
 })
 const REVIEW_TOKEN='4a6ad49339885fb96a4109d552d1cb3c87838ec519726805888d8cadd73d696d'
 const ARTIFACTS=Object.freeze({
@@ -159,6 +168,74 @@ function tarEntries(bytes){
  }throw Error('tar缺结束标记')
 }
 export function inspectTarMember(bytes,name){const rows=tarEntries(bytes).filter(x=>x.name===name);assert.equal(rows.length,1,'固定tar成员缺失');return rows[0].bytes}
+export function validateHostArchiveMetadata(version,metadata){
+ assert.ok(Object.hasOwn(HOSTS,version),'未知host归档');const pin=HOSTS[version]
+ assert.equal(metadata?.name,'openclaw');assert.equal(metadata.version,version)
+ for(const key of ['integrity','unpackedSize','fileCount'])assert.equal(metadata.dist?.[key],pin[key],'固定official metadata '+key)
+ assert.equal(metadata.dist?.tarball,`https://registry.npmjs.org/openclaw/-/openclaw-${version}.tgz`)
+ return pin
+}
+function hostMemberName(name){
+ assert.ok(name.startsWith('package/')&&!/[\\<>:"|?*\x00-\x1f]/.test(name),'tar路径')
+ const parts=name.split('/');assert.ok(parts.every(p=>p&&p!=='.'&&p!=='..'&&!/[. ]$/.test(p)),'tar路径')
+ return name
+}
+export async function hashHostTarStream(chunks,limits){
+ // 只保留512字节header与逐成员hash，绝不把解压包/大成员收进Buffer。
+ for(const k of ['tarBytes','unpackedSize','fileCount'])assert.ok(Number.isSafeInteger(limits[k])&&limits[k]>0,'未知tar大小/数量')
+ assert.ok(limits.fileCount<=25000&&Array.isArray(limits.largeMembers));const header=Buffer.alloc(512),seen=new Set(),members=[]
+ let head=0,current=null,padding=0,end=0,total=0,unpackedSize=0,records=0,maxInputChunkBytes=0
+ const text=b=>{const i=b.indexOf(0);if(i>=0)assert.ok(b.subarray(i).every(x=>x===0),'tar字段尾部');return new TextDecoder('utf-8',{fatal:true}).decode(i<0?b:b.subarray(0,i))}
+ const oct=b=>{assert.match(b.toString('ascii'),/^[0-7]+[\x00 ]*$/,'tar非八进制字段');const n=parseInt(b.toString('ascii').replace(/[\x00 ]+$/,''),8);assert.ok(Number.isSafeInteger(n));return n}
+ const finish=()=>{const row={name:current.name,size:current.size,sha256:current.hash.digest('hex')};if(current.large)assert.equal(row.sha256,current.large.sha256,'已审大成员hash');members.push(row);current=null}
+ for await(const raw of chunks){assert.ok(raw instanceof Uint8Array);const chunk=Buffer.isBuffer(raw)?raw:Buffer.from(raw.buffer,raw.byteOffset,raw.byteLength);total+=chunk.length;maxInputChunkBytes=Math.max(maxInputChunkBytes,chunk.length);assert.ok(total<=limits.tarBytes,'tar总量预算')
+  let pos=0;while(pos<chunk.length){
+   if(end){assert.ok(chunk.subarray(pos).every(x=>x===0),'tar结束后非零数据');end+=chunk.length-pos;break}
+   if(current){const n=Math.min(current.left,chunk.length-pos);current.hash.update(chunk.subarray(pos,pos+n));pos+=n;current.left-=n;if(!current.left)finish();continue}
+   if(padding){const n=Math.min(padding,chunk.length-pos);assert.ok(chunk.subarray(pos,pos+n).every(x=>x===0),'tar非零padding');pos+=n;padding-=n;continue}
+   const n=Math.min(512-head,chunk.length-pos);chunk.copy(header,head,pos,pos+n);pos+=n;head+=n;if(head!==512)continue;head=0
+   if(header.every(x=>x===0)){end=512;continue}
+   assert.ok(++records<=25000,'tar header数量预算');assert.equal(header.reduce((s,b,i)=>s+(i>=148&&i<156?32:b),0),oct(header.subarray(148,156)),'tar checksum');assert.equal(header.subarray(257,265).toString('binary'),'ustar\x0000','tar协议非已审ustar')
+   const name=hostMemberName([text(header.subarray(345,500)),text(header.subarray(0,100))].filter(Boolean).join('/')),size=oct(header.subarray(124,136)),type=header[156],key=name.toLowerCase()
+   assert.ok(!seen.has(key),'tar路径/重复');seen.add(key);assert.ok([0,48,53].includes(type),'tar链接/扩展协议');assert.ok(header.subarray(157,257).every(x=>x===0),'tar linkname')
+   if(type===53){assert.equal(size,0);continue}
+   const large=limits.largeMembers.find(m=>m.name===name);assert.ok(size<=32*1024*1024||large&&large.size===size,'tar成员预算');if(large)assert.equal(size,large.size,'已审大成员size')
+   unpackedSize+=size;assert.ok(unpackedSize<=limits.unpackedSize,'tar unpacked总量');assert.ok(members.length<limits.fileCount,'tar文件数量');padding=(-size%512+512)%512;current={name,size,left:size,hash:crypto.createHash('sha256'),large};if(!size)finish()
+  }
+ }
+ assert.equal(total,limits.tarBytes,'tar总字节');assert.ok(end>=1024&&end%512===0&&!head&&!current&&!padding,'tar截断/缺结束标记');assert.equal(unpackedSize,limits.unpackedSize,'tar unpacked大小');assert.equal(members.length,limits.fileCount,'tar文件数量')
+ return {tarBytes:total,unpackedSize,fileCount:members.length,peakBufferedBytes:header.length,maxInputChunkBytes,members}
+}
+export async function inspectHostArchive(version,bytes,metadata){
+ const pin=validateHostArchiveMetadata(version,metadata);assert.ok(Buffer.isBuffer(bytes)&&bytes.length<=150*1024*1024);assert.equal(bytes.length,pin.compressedSize,'固定压缩大小');assert.equal('sha512-'+crypto.createHash('sha512').update(bytes).digest('base64'),pin.integrity,'固定SRI');assert.equal(sha(bytes),pin.archiveSha256,'固定归档摘要')
+ let result;async function* input(){for(let n=0;n<bytes.length;n+=65536)yield bytes.subarray(n,n+65536)}
+ await pipeline(Readable.from(input()),zlib.createGunzip({chunkSize:65536,highWaterMark:65536}),async stream=>{result=await hashHostTarStream(stream,pin)})
+ assert.equal(sha(Buffer.from(JSON.stringify(result.members))),pin.inventorySha256,'固定归档inventory')
+ for(const [name,pinned]of [['package/package.json',pin.manifest],['package/openclaw.mjs',pin.entry],...Object.entries(pin.lifecycleHashes).map(([f,h])=>['package/'+f,h])])assert.equal(result.members.find(m=>m.name===name)?.sha256,pinned,'固定归档source '+name)
+ return {...result,version,archiveSha256:pin.archiveSha256,integrity:pin.integrity,compressedSize:bytes.length,inventorySha256:pin.inventorySha256}
+}
+export function assertHostLifecycleReceipt(version,members,command,stdout){
+ assert.ok(Object.hasOwn(HOSTS,version));const pin=HOSTS[version],kind=/^[a-z]:\\/i.test(command?.cwd||'')?path.win32:path
+ assert.equal(command?.ok,true);assert.equal(command.code,0);assert.equal(command.signal,null);assert.ok(Number.isInteger(command.pid)&&command.pid>0,'实际npm PID缺失')
+ assert.ok(command.program&&command.args?.[0]?.endsWith('npm-cli.js'));assert.deepEqual(command.args,[command.args[0],'install','--global','--prefix',kind.join(command.cwd,'npm'),'--registry=https://registry.npmjs.org','--no-audit','--no-fund','--ignore-scripts=false','--foreground-scripts',kind.join(command.cwd,'openclaw.tgz')],'npm lifecycle实际命令')
+ const output=stdout.replace(/\r\n/g,'\n'),banner=`> openclaw@${version} postinstall\n> node scripts/postinstall-bundled-plugins.mjs`
+ assert.equal(output.split(banner).length,2,'没有唯一实际postinstall输出')
+ for(const [f,h]of Object.entries(pin.lifecycleHashes))assert.equal(members.find(m=>m.name==='package/'+f)?.sha256,h,'lifecycle hook源码hash')
+ const pending=members.filter(m=>m.name==='package/.openclaw-lifecycle-pending');assert.equal(pending.length,pin.pending?1:0,'pending归档契约');if(pin.pending){assert.equal(pending[0].size,pin.pending.size);assert.equal(pending[0].sha256,pin.pending.sha256)}
+ return {version,command,stdoutSha256:sha(Buffer.from(stdout)),postinstallBanner:banner,hookHashes:pin.lifecycleHashes,removedMarker:pending[0]||null}
+}
+export async function verifyHostMemberHashes(pkg,members,removedMarker){
+ const root=physical(pkg),source={},seen=new Set()
+ if(removedMarker){assert.equal(removedMarker.name,'package/.openclaw-lifecycle-pending');assert.equal(removedMarker.size,8);assert.equal(removedMarker.sha256,'52d26753462488ad21852bc6718e21b84835f53765304d0a1e1b89d05a2a71b1');const matching=members.filter(m=>m.name===removedMarker.name);assert.equal(matching.length,1);assert.deepEqual(matching[0],removedMarker)
+  try{fs.lstatSync(path.join(root,'.openclaw-lifecycle-pending'));throw Error('pending marker仍存在')}catch(e){assert.equal(e.code,'ENOENT','pending marker仍存在')}
+ }
+ for(const m of members){hostMemberName(m.name);assert.ok(!seen.has(m.name.toLowerCase()));seen.add(m.name.toLowerCase());if(removedMarker&&m.name===removedMarker.name)continue
+  assert.ok(Number.isSafeInteger(m.size)&&m.size>=0&&validHash(m.sha256));const rel=m.name.slice(8),file=physical(path.join(root,rel));assert.ok(inside(root,file));const before=fs.lstatSync(file);assert.ok(before.isFile()&&!before.isSymbolicLink());assert.equal(before.size,m.size,'安装成员大小 '+rel)
+  const digest=crypto.createHash('sha256');let size=0;for await(const chunk of fs.createReadStream(file,{highWaterMark:65536})){size+=chunk.length;assert.ok(size<=m.size);digest.update(chunk)}assert.equal(size,m.size);assert.equal(digest.digest('hex'),m.sha256,'安装source不等于官方包 '+rel);const after=fs.lstatSync(file);for(const k of ['size','ino','dev','mtimeMs'])assert.equal(after[k],before[k],'读取期间成员变化');source[rel]=m.sha256
+ }
+ if(removedMarker){try{fs.lstatSync(path.join(root,'.openclaw-lifecycle-pending'));throw Error('pending marker重新出现')}catch(e){assert.equal(e.code,'ENOENT','pending marker重新出现')}}
+ return source
+}
 export class W3C{
  constructor(base){const u=new URL(base);assert.ok(u.protocol==='http:'&&u.hostname==='127.0.0.1'&&!u.username&&!u.password);this.base=u.origin;this.session=null;this.events=[]}
  async request(method,route,body,timeout=120000){assert.ok(timeout>0&&timeout<=720000);if(typeof body?.script==='string')compileInjected(body.script,route);const start=Date.now();const r=await fetch(this.base+route,{method,...(body===undefined?{}:{headers:{'content-type':'application/json'},body:JSON.stringify(body)}),signal:AbortSignal.timeout(timeout)});const j=await r.json();this.events.push({method,route,status:r.status,elapsedMs:Date.now()-start});assert.ok(r.ok&&!j.value?.error,`W3C ${route}: ${redact(j.value?.message||j.value?.error||r.status)}`);return j.value}
@@ -262,16 +339,16 @@ async function execute(o){
  }
  async function installHost(version){
   const pin=HOSTS[version],hostRoot=path.join(home,'hosts',version);fs.mkdirSync(hostRoot,{recursive:true})
-  const metadata=JSON.parse((await download('https://registry.npmjs.org/openclaw/'+version,2*1024*1024)).toString('utf8'));assert.equal(metadata.version,version);assert.equal(metadata.dist.integrity,pin.integrity)
+  const metadata=JSON.parse((await download('https://registry.npmjs.org/openclaw/'+version,2*1024*1024)).toString('utf8'));validateHostArchiveMetadata(version,metadata)
   const url=`https://registry.npmjs.org/openclaw/-/openclaw-${version}.tgz`;assert.equal(metadata.dist.tarball,url)
   const bytes=await download(url,150*1024*1024);assert.equal('sha512-'+crypto.createHash('sha512').update(bytes).digest('base64'),pin.integrity)
-  const archive=path.join(hostRoot,'openclaw.tgz');fs.writeFileSync(archive,bytes,{flag:'wx'});const tar=zlib.gunzipSync(bytes,{maxOutputLength:300*1024*1024}),members=tarEntries(tar)
-  assert.equal(sha(inspectTarMember(tar,'package/package.json')),pin.manifest);assert.equal(sha(inspectTarMember(tar,'package/openclaw.mjs')),pin.entry)
-  const prefix=path.join(hostRoot,'npm');await run(process.execPath,[npm,'install','--global','--prefix',prefix,'--registry=https://registry.npmjs.org','--no-audit','--no-fund',archive],900000,hostRoot)
+  const archive=path.join(hostRoot,'openclaw.tgz');fs.writeFileSync(archive,bytes,{flag:'wx'});const inventory=await inspectHostArchive(version,bytes,metadata),members=inventory.members;receipt('host-'+version+'-archive',inventory)
+  const prefix=path.join(hostRoot,'npm'),installOutput=await run(process.execPath,[npm,'install','--global','--prefix',prefix,'--registry=https://registry.npmjs.org','--no-audit','--no-fund','--ignore-scripts=false','--foreground-scripts',archive],900000,hostRoot)
   const pkg=path.join(prefix,'node_modules/openclaw'),cli=path.join(prefix,'openclaw.cmd');assert.ok(fs.statSync(cli).isFile());assert.equal(hash(path.join(pkg,'package.json')),pin.manifest);assert.equal(hash(path.join(pkg,'openclaw.mjs')),pin.entry)
-  const source={};for(const m of members){const file=physical(path.join(pkg,m.name.slice('package/'.length)));assert.ok(inside(pkg,file));assert.equal(hash(file),sha(m.bytes),'安装source不等于官方包 '+m.name);source[m.name.slice(8)]=sha(m.bytes)}
+  const installCommandIndex=report.commands.length-1,installCommandReceipt=read(path.join(pub,'command-'+installCommandIndex+'.json'));assert.equal(installCommandReceipt.stdout.trim(),installOutput)
+  const lifecycle=assertHostLifecycleReceipt(version,members,structuredClone(report.commands.at(-1)),installCommandReceipt.stdout),source=await verifyHostMemberHashes(pkg,members,lifecycle.removedMarker);receipt('host-'+version+'-lifecycle',{...lifecycle,commandReceipt:{file:'command-'+installCommandIndex+'.json',sha256:hash(path.join(pub,'command-'+installCommandIndex+'.json'))},installedSourceFiles:Object.keys(source).length,allOtherArchiveHashesUnchanged:true,pendingAbsent:pin.pending?true:null})
   const help=await run(process.execPath,[path.join(pkg,'openclaw.mjs'),'plugins','install','--help'],60000,home);assert.equal(/--accept-capabilities\b/.test(help),pin.accept);assert.match(help,/--force/)
-  const evidence={version,integrity:pin.integrity,tarballSha256:sha(bytes),manifestSha256:pin.manifest,entrySha256:pin.entry,cliSha256:hash(cli),cli,pkg,source,help};receipt('host-'+version,evidence);return evidence
+  const evidence={version,integrity:pin.integrity,tarballSha256:sha(bytes),manifestSha256:pin.manifest,entrySha256:pin.entry,archiveInventorySha256:inventory.inventorySha256,lifecycle,cliSha256:hash(cli),cli,pkg,source,help};receipt('host-'+version,evidence);return evidence
  }
  try{
   report.tooling={sha:proof.toolingSha,before:gitSnapshot(tooling,proof.toolingSha)}

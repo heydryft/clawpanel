@@ -240,12 +240,12 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   }
   // 保留原25ms全部历史PID kill0；不被原生侧车的异步busy/采样速度合并或跳过。
   sampler = setInterval(() => {
-    const starts = readEvents().filter(e => e.event === 'start'), pids = [...new Set(starts.map(e => e.pid))]
+    const events = readEvents(), starts = events.filter(e => e.event === 'start'), pids = [...new Set(starts.map(e => e.pid))]
     const startedAtMs = Date.now(), sink = { count: 0, probes: [] }
     rawProbeSink = sink
     let count
     try { count = pids.filter(alive).length } finally { rawProbeSink = null }
-    const sweep = { count, startedAtMs, completedAtMs: Date.now(), probeCount: sink.count, probes: sink.probes, starts }
+    const sweep = { count, startedAtMs, completedAtMs: Date.now(), journalEventCount: events.length, probeCount: sink.count, probes: sink.probes, starts }
     if (report.rawSweeps.length < FIXTURE_IDENTITY_LIMITS.rawSweeps) report.rawSweeps.push(sweep)
     else report.materialOverflow = true
     if (count > rawUnqualifiedPeak || (count > 2 && report.rawPeakSamples.length < 8)) {

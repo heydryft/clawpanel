@@ -83,4 +83,5 @@ test('HTTP身份接线必须收集完整原raw并先独立输出，再按所属p
   assert.match(source, /report\.materialOverflow = true/)
   assert.doesNotMatch(source, /sink\.probes\.length < 8/)
   assert.doesNotMatch(source, /starts: starts\.slice\(-8\)/)
+  assert.match(source, /journalEventCount: events\.length/)
 })

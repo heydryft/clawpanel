@@ -99,12 +99,12 @@ $native = $type.CreateType()
 function Fixture-Now { return ([DateTime]::UtcNow.Ticks - 621355968000000000L) / 10000L -as [long] }
 function Fixture-Unix([long]$fileTime) { if($fileTime -eq 0){return 0L}; return ([DateTime]::FromFileTimeUtc($fileTime).Ticks - 621355968000000000L) / 10000L -as [long] }
 function Read-FixtureIdentity([int]$processId) {
-  $row = [ordered]@{pid=$processId;status='error';executablePath=$null;creationTimeFileTimeHex=$null;createdAtMs=0L;exitAtMs=0L;sampledAtMs=0L;nativeError=0;imageQueryError=0;waitResult=[uint32]::MaxValue}
+  $row = [ordered]@{pid=$processId;status='error';executablePath=$null;creationTimeFileTimeHex=$null;createdAtMs=0L;exitAtMs=0L;sampledAtMs=0L;queryStartedAtMs=(Fixture-Now);queryCompletedAtMs=0L;nativeError=0;imageQueryError=0;waitResult=[uint32]::MaxValue}
   $handle = $native::OpenProcess(0x00101000, $false, $processId)
   if($handle -eq [IntPtr]::Zero) {
     $row.nativeError=$native::LastError
     if($row.nativeError -eq 87){$row.status='missing'}
-    $row.sampledAtMs=Fixture-Now
+    $row.sampledAtMs=Fixture-Now; $row.queryCompletedAtMs=$row.sampledAtMs
     return $row
   }
   try {
@@ -130,7 +130,7 @@ function Read-FixtureIdentity([int]$processId) {
     elseif($row.waitResult -eq 258 -and $imageOk){$row.status='running'}
     else{$row.nativeError=$row.imageQueryError}
     return $row
-  } finally { $row.sampledAtMs=Fixture-Now; $null=$native::CloseHandle($handle) }
+  } finally { $row.sampledAtMs=Fixture-Now; $row.queryCompletedAtMs=$row.sampledAtMs; $null=$native::CloseHandle($handle) }
 }
 # 在ready前预热只读本观察器自身：JIT/JSON不挤占首个实际样本的2秒预算。
 $warm = Read-FixtureIdentity $PID
