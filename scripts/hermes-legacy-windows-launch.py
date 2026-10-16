@@ -42,7 +42,82 @@ def _require(ok, message):
         raise SystemExit('ClawPanel legacy Windows: ' + message)
 
 
-def _physical(value):
+_PHYSICAL_DIAGNOSTIC_SLOTS = frozenset((
+    'layout.root', 'layout.home', 'layout.venv', 'facts.prefix', 'facts.executable',
+    'layout.venv-executable', 'facts.base-executable', 'layout.python-store', 'facts.base-prefix',
+    'facts.process-executable', 'layout.venv-config', 'venv-config.home', 'layout.git', 'layout.git-head',
+    'effective.home', 'contract.root', 'contract.source', 'contract.spec-origin',
+    'contract.loader-filename', 'contract.loaded-module', 'interface.code-file', 'interface.module-file',
+    'identity.effective-home',
+))
+
+
+def _physical_diagnostic(slot, value, raw, component, info=None, error=None):
+    """仅失败且显式开启时观察元数据；不解析/放行目标，不改变准入结果。"""
+    if os.environ.get('CLAWPANEL_HERMES_PHASE_TIMING') != '1':
+        return
+    try:
+        import json
+        home = os.environ.get('HERMES_HOME', '')
+        known = {'.', 'hermes-agent', 'hermes-agent/venv', 'hermes-agent/venv/Scripts',
+            'hermes-agent/venv/Scripts/python.exe', 'hermes-agent/venv/pyvenv.cfg',
+            'hermes-agent/.git', 'hermes-agent/.git/HEAD', 'hermes-agent/.hermes-runtime',
+            'hermes-agent/.hermes-runtime/python'}
+        for file in SOURCE_HASHES:
+            path = Path('hermes-agent') / file
+            known.add(path.as_posix())
+            known.update(part.as_posix() for part in path.parents)
+
+        def describe(path):
+            text = os.fspath(path)
+            # 只为日志识别本地 extended path；绝不用于原 _physical 的准入/resolve。
+            lexical = text[4:] if text.startswith('\\\\?\\') and re.match(r'[a-zA-Z]:[\\/]', text[4:]) else text
+            relative, scope = None, 'outside'
+            try:
+                if not home or not Path(home).is_absolute():
+                    scope = 'unknown'
+                else:
+                    rel = Path(lexical).relative_to(Path(home)).as_posix()
+                    scope = 'managed-redacted'
+                    if rel in known or re.fullmatch(r'hermes-agent/\.hermes-runtime/python/cpython-3\.11(?:\.\d+)?-windows-x86_64-none(?:/python\.exe)?', rel):
+                        relative, scope = rel, 'managed'
+            except ValueError:
+                pass
+            return dict(sha256=hashlib.sha256(text.encode('utf-8', 'surrogatepass')).hexdigest(),
+                        relative=relative, scope=scope)
+
+        def failure(exc):
+            return dict(type='OSError' if isinstance(exc, OSError) else 'other',
+                errno=getattr(exc, 'errno', None) if isinstance(getattr(exc, 'errno', None), int) else None,
+                winerror=getattr(exc, 'winerror', None) if isinstance(getattr(exc, 'winerror', None), int) else None)
+
+        row = dict(schemaVersion=1, pid=os.getpid(), pathHashKind='path-text-utf8-surrogatepass',
+            pathScope='lexical-only-not-admission', slot=slot if slot in _PHYSICAL_DIAGNOSTIC_SLOTS else 'unknown',
+            reason='path-unavailable' if error is not None else 'link-reparse',
+            valueType='path' if isinstance(value, Path) else 'str' if isinstance(value, str) else 'other',
+            requested=describe(raw), component=describe(component))
+        if error is not None:
+            row['error'] = failure(error)
+        if info is not None:
+            for field, attribute in [('fileAttributes', 'st_file_attributes'), ('reparseTag', 'st_reparse_tag')]:
+                number = getattr(info, attribute, None)
+                row[field] = number if type(number) is int and 0 <= number <= 0xffffffff else None
+            row['componentType'] = 'symlink' if stat.S_ISLNK(info.st_mode) else 'directory' if stat.S_ISDIR(info.st_mode) else 'file' if stat.S_ISREG(info.st_mode) else 'other'
+            try:
+                target = os.readlink(component)
+                target_path = Path(target) if Path(target).is_absolute() else component.parent / target
+                row['target'] = describe(target_path)
+            except Exception as exc:
+                row['readlinkError'] = failure(exc)
+        line = 'CLAWPANEL_HERMES_LEGACY_PATH ' + json.dumps(row, ensure_ascii=True, separators=(',', ':'))
+        if len(line) < 4096:
+            print(line, file=sys.stderr, flush=True)
+    except Exception:
+        # 日志、readlink或JSON故障均不能吞原拒绝，也不能把未知路径当成功。
+        pass
+
+
+def _physical(value, *, slot='unknown'):
     """拒绝链接/重解析点、网络路径、ADS 与父目录逃逸；支持物理 8.3 别名归一。"""
     raw = os.fspath(value)
     _require(isinstance(raw, str) and raw and '\0' not in raw, 'physical path invalid')
@@ -52,10 +127,13 @@ def _physical(value):
     try:
         for part in reversed((p, *p.parents)):
             info = part.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                _physical_diagnostic(slot, value, raw, part, info=info)
             _require(not stat.S_ISLNK(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x400,
                      'physical path link/reparse denied')
         return p.resolve(strict=True)
-    except OSError:
+    except OSError as error:
+        _physical_diagnostic(slot, value, raw, part, error=error)
         raise SystemExit('ClawPanel legacy Windows: physical path unavailable') from None
 
 
@@ -100,47 +178,47 @@ def _validate_layout(root, home, pin, mode, facts):
              facts['native_machine'] == 0x8664 and facts['process_machine'] == 0 and facts['bits'] == 64,
              'native Windows AMD64 required; emulation denied')
     _require(facts['isolated'] == 1 and facts['dont_write_bytecode'], 'isolated -I -B interpreter required')
-    root, home = _physical(root), _physical(home)
+    root, home = _physical(root, slot='layout.root'), _physical(home, slot='layout.home')
     _require(root == home / 'hermes-agent', 'root must be physical managed HOME/hermes-agent')
     _validate_effective_home(home)
-    venv = _physical(root / 'venv')
-    _require(_physical(facts['prefix']) == venv and
-             _physical(facts['executable']) == _physical(venv / 'Scripts/python.exe'), 'managed venv interpreter mismatch')
-    base = _physical(facts['base_executable'])
-    store = _physical(root / '.hermes-runtime/python')
+    venv = _physical(root / 'venv', slot='layout.venv')
+    _require(_physical(facts['prefix'], slot='facts.prefix') == venv and
+             _physical(facts['executable'], slot='facts.executable') == _physical(venv / 'Scripts/python.exe', slot='layout.venv-executable'), 'managed venv interpreter mismatch')
+    base = _physical(facts['base_executable'], slot='facts.base-executable')
+    store = _physical(root / '.hermes-runtime/python', slot='layout.python-store')
     _require(base.name.lower() == 'python.exe' and store in base.parents and
-             _physical(facts['base_prefix']) == base.parent, 'managed base interpreter mismatch')
+             _physical(facts['base_prefix'], slot='facts.base-prefix') == base.parent, 'managed base interpreter mismatch')
     # venv 是启动器/逻辑 Python；此时正在执行的 Win32 image 是真实 base Python。
-    _require(_physical(facts.get('process_executable', '')) == base, 'native process image differs from managed base Python')
+    _require(_physical(facts.get('process_executable', ''), slot='facts.process-executable') == base, 'native process image differs from managed base Python')
     _require(type(facts.get('process_id')) is int and facts['process_id'] == os.getpid(), 'native process PID mismatch')
     created = facts.get('process_create_time_filetime_100ns')
     _require(type(created) is int and created > 116444736000000000, 'native process creation time invalid')
     cfg = {}
-    for line in _physical(venv / 'pyvenv.cfg').read_text(encoding='utf-8').splitlines():
+    for line in _physical(venv / 'pyvenv.cfg', slot='layout.venv-config').read_text(encoding='utf-8').splitlines():
         if '=' in line:
             key, value = line.split('=', 1)
             key = key.strip().lower()
             _require(key not in cfg, 'duplicate venv configuration')
             cfg[key] = value.strip()
     _require(cfg.get('include-system-site-packages', '').lower() == 'false', 'system site packages denied')
-    _require(_physical(cfg.get('home', '')) == base.parent, 'venv base home mismatch')
-    git = _physical(root / '.git')
+    _require(_physical(cfg.get('home', ''), slot='venv-config.home') == base.parent, 'venv base home mismatch')
+    git = _physical(root / '.git', slot='layout.git')
     _require(git.is_dir(), 'physical Git directory required')
-    head = _physical(git / 'HEAD').read_bytes()
+    head = _physical(git / 'HEAD', slot='layout.git-head').read_bytes()
     _require(head in (LEGACY_PIN.encode(), (LEGACY_PIN+'\n').encode(), (LEGACY_PIN+'\r\n').encode()),
              'Git detached pin mismatch')
     return root
 
 
 def _validate_effective_home(home):
-    effective = _physical(os.environ.get('HERMES_HOME', ''))
+    effective = _physical(os.environ.get('HERMES_HOME', ''), slot='effective.home')
     _require(effective == home or (effective.parent.parent == home and effective.parent.name == 'profiles'),
              'HERMES_HOME outside private HOME/profile')
 
 
 class _SourceContract:
     def __init__(self, root, hashes):
-        self.root = _physical(root)
+        self.root = _physical(root, slot='contract.root')
         self.hashes = dict(hashes)
         self.modules = {}
         for rel, digest in self.hashes.items():
@@ -152,7 +230,7 @@ class _SourceContract:
         self.verify_all()
 
     def read(self, rel):
-        p = _physical(self.root / rel)
+        p = _physical(self.root / rel, slot='contract.source')
         _require(p == self.root / rel and p.is_file(), 'source physical origin mismatch')
         raw = p.read_bytes()
         _require(hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest() == self.hashes[rel], 'source hash mismatch: '+rel)
@@ -164,10 +242,10 @@ class _SourceContract:
 
     def check_spec(self, fullname, spec):
         rel = self.modules[fullname]
-        _require(spec is not None and spec.origin and _physical(spec.origin) == self.root / rel, 'module origin mismatch: '+fullname)
+        _require(spec is not None and spec.origin and _physical(spec.origin, slot='contract.spec-origin') == self.root / rel, 'module origin mismatch: '+fullname)
         loader = spec.loader
         _require(type(loader) is importlib.machinery.SourceFileLoader, 'unknown module loader: '+fullname)
-        _require(_physical(loader.get_filename(fullname)) == self.root / rel, 'loader origin mismatch')
+        _require(_physical(loader.get_filename(fullname), slot='contract.loader-filename') == self.root / rel, 'loader origin mismatch')
         raw = self.read(rel)
         # 原 loader 仍负责执行；先拒绝时间戳伪造/旁路 .pyc，不将源 hash 当作执行字节证明。
         code = loader.get_code(fullname)
@@ -177,14 +255,14 @@ class _SourceContract:
 
     def check_module(self, fullname, module):
         _require(isinstance(module, types.ModuleType) and module.__name__ == fullname and
-                 _physical(module.__file__) == self.root / self.modules[fullname], 'loaded module origin mismatch')
+                 _physical(module.__file__, slot='contract.loaded-module') == self.root / self.modules[fullname], 'loaded module origin mismatch')
         self.check_spec(fullname, module.__spec__)
 
 
 def _check_interface(module, name, parameters):
     value = getattr(module, name, None)
     _require(isinstance(value, types.FunctionType) and value.__module__ == module.__name__ and
-             _physical(value.__code__.co_filename) == _physical(module.__file__), 'function interface origin mismatch: '+name)
+             _physical(value.__code__.co_filename, slot='interface.code-file') == _physical(module.__file__, slot='interface.module-file'), 'function interface origin mismatch: '+name)
     actual = [(p.name, p.kind, p.default) for p in inspect.signature(value).parameters.values()]
     _require(actual == parameters, 'function interface mismatch: '+name)
     return value
@@ -286,7 +364,7 @@ class _PinnedFinder:
         self.identity_groups.append(group)
         context = types.MappingProxyType(dict(schema_version=1, version='0.21.5', pin=LEGACY_PIN,
             source_root=str(self.contract.root), owner_home=str(self.contract.root.parent),
-            effective_home=str(_physical(os.environ['HERMES_HOME'])), phase=phase,
+            effective_home=str(_physical(os.environ['HERMES_HOME'], slot='identity.effective-home')), phase=phase,
             cli_argv=tuple(sys.argv), python_orig_argv=self.python_orig_argv,
             runtime_facts=self.runtime_facts, source_hashes=types.MappingProxyType(dict(self.contract.hashes))))
         group.install(self.identity_installer, status, gateway, context)
