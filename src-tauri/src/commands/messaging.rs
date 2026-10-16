@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // 两个安装入口共享配置，拒绝并发操作，避免备份和回滚覆盖另一项安装。
-static CHANNEL_PLUGIN_INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static CHANNEL_PLUGIN_INSTALL_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 fn platform_storage_key(platform: &str) -> &str {
     match platform {
@@ -3890,6 +3891,44 @@ pub async fn verify_bot_token(platform: String, form: Value) -> Result<Value, St
     }
 }
 
+/// 原生主窗口显式确认接口；与 Web 共用字段协议，不共用会话凭证。
+#[tauri::command]
+pub async fn prepare_weixin_install(
+    window: tauri::WebviewWindow,
+    operation: String,
+) -> Result<Value, String> {
+    super::weixin_install_consent::prepare(&window, operation).await
+}
+
+#[tauri::command]
+pub async fn confirm_weixin_install(
+    window: tauri::WebviewWindow,
+    operation_id: String,
+    confirmation_token: String,
+    accepted: bool,
+    artifact_sha256: String,
+    review_token: String,
+) -> Result<Value, String> {
+    super::weixin_install_consent::confirm(
+        &window,
+        operation_id,
+        confirmation_token,
+        accepted,
+        artifact_sha256,
+        review_token,
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn cancel_weixin_install(
+    window: tauri::WebviewWindow,
+    operation_id: String,
+    confirmation_token: String,
+) -> Result<Value, String> {
+    super::weixin_install_consent::cancel(&window, operation_id, confirmation_token)
+}
+
 /// 检测微信插件安装状态与版本
 #[tauri::command]
 pub async fn check_weixin_plugin_status() -> Result<Value, String> {
@@ -3965,6 +4004,9 @@ pub async fn run_channel_action(
     let action = action.trim().to_string();
     if platform.is_empty() || action.is_empty() {
         return Err("platform 和 action 不能为空".into());
+    }
+    if platform == "weixin" && action == "install" {
+        return Err(super::weixin_install_consent::consent_required());
     }
 
     // 安装复用统一检测/回读链路；更新交给 CLI，不预先删除插件或渠道配置。
@@ -4893,6 +4935,12 @@ pub async fn toggle_plugin(plugin_id: String, enabled: bool) -> Result<Value, St
 
 #[tauri::command]
 pub async fn install_plugin(package_name: String) -> Result<Value, String> {
+    if super::weixin_install_consent::requires_consent(&package_name, None) {
+        return Err(super::weixin_install_consent::consent_required());
+    }
+    let _install_guard = CHANNEL_PLUGIN_INSTALL_LOCK
+        .try_lock()
+        .map_err(|_| "已有渠道插件正在安装，请等待完成后再试")?;
     let package_name = package_name.trim().to_string();
     if package_name.is_empty() {
         return Err("包名不能为空".into());
@@ -5589,6 +5637,9 @@ pub async fn install_channel_plugin(
     plugin_id: String,
     version: Option<String>,
 ) -> Result<String, String> {
+    if super::weixin_install_consent::requires_consent(&package_name, Some(&plugin_id)) {
+        return Err(super::weixin_install_consent::consent_required());
+    }
     let _install_guard = CHANNEL_PLUGIN_INSTALL_LOCK
         .try_lock()
         .map_err(|_| "已有渠道插件正在安装，请等待完成后再试")?;

@@ -256,6 +256,9 @@ pub fn run() {
             messaging::install_qqbot_plugin,
             messaging::run_channel_action,
             messaging::check_weixin_plugin_status,
+            messaging::prepare_weixin_install,
+            messaging::confirm_weixin_install,
+            messaging::cancel_weixin_install,
             // Agent 渠道绑定管理
             messaging::get_agent_bindings,
             messaging::list_all_bindings,

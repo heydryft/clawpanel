@@ -39,6 +39,7 @@ pub mod skillhub;
 pub mod skills;
 pub mod update;
 mod weixin_compat;
+mod weixin_install_consent;
 
 /// 默认 OpenClaw 配置目录
 /// Windows 上优先使用 USERPROFILE（与 Node.js os.homedir() 一致），
