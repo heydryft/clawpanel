@@ -608,7 +608,7 @@ export function hermesInstallerPlan(home = hermesHome()) {
         argsForStage: (scriptPath, stage, wrapperPath) => [
           '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', wrapperPath, '-InstallerPath', scriptPath,
           '-HermesHome', home, '-InstallDir', installDir, '-Branch', HERMES_STABLE_BRANCH, '-Commit', HERMES_STABLE_COMMIT,
-          '-SkipSetup', '-SkipComputerUse', '-NonInteractive', '-Json', '-Stage', stage,
+          '-ForceCommit', '-SkipSetup', '-SkipComputerUse', '-NonInteractive', '-Json', '-Stage', stage,
         ],
       }
     }
