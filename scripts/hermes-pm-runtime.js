@@ -35,6 +35,15 @@ def require(condition, message):
         raise RuntimeError('Hermes private completion: ' + message)
 
 
+def reexec_selected_python(python):
+    command = [str(python), *sys.orig_argv[1:]]
+    # Windows CRT execv 不转义多行-c/空格参数，会把首行注释当完整程序并空成功。
+    # subprocess 使用正确列表转义并等待真实退出；标准输出仍由原调用方核验。
+    if os.name == 'nt':
+        raise SystemExit(subprocess.run(command, check=False).returncode)
+    os.execv(str(python), command)
+
+
 def prepare_currency_checker(root, store_python):
     # 显式安装尾部：bootstrap Python 创建的 PM checker 不等于 store Python 的 checker。
     # 仅用已安装的工具准备原独立 PM runtime；不让 fallback 去获取工具或改应用依赖。
@@ -98,7 +107,7 @@ same = os.path.normcase(os.path.abspath(store_python)) == os.path.normcase(os.pa
 if not same:
     require(os.environ.get('CLAWPANEL_HERMES_COMPLETION_REEXEC') != PIN, 'store Python identity mismatch')
     os.environ['CLAWPANEL_HERMES_COMPLETION_REEXEC'] = PIN
-    os.execv(str(store_python), [str(store_python), *sys.orig_argv[1:]])
+    reexec_selected_python(store_python)
 
 # 沿用原 completion 的 own-script 身份，防止导入 bootstrap 再进入同一尾部。
 sys.argv[0] = str(root / 'hermes_cli' / 'source_completion.py')
@@ -183,6 +192,14 @@ finally:
 export const HERMES_PRIVATE_METADATA_SCRIPT = String.raw`
 import hashlib, inspect, os, subprocess, sys
 from pathlib import Path
+
+def reexec_selected_python(python):
+    command = [str(python), *sys.orig_argv[1:]]
+    # Windows CRT不能直接承载多行-c；保留参数列表并同步传播真实退出码。
+    if os.name == 'nt':
+        raise SystemExit(subprocess.run(command, check=False).returncode)
+    os.execv(str(python), command)
+
 root = Path(sys.argv[1]).resolve()
 pin = 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
 home = Path(os.environ['HERMES_HOME']).resolve()
@@ -207,7 +224,7 @@ if os.path.normcase(os.path.abspath(python)) != os.path.normcase(os.path.abspath
     if os.environ.get('CLAWPANEL_HERMES_METADATA_REEXEC') == pin:
         raise RuntimeError('Hermes metadata: store Python identity mismatch')
     os.environ['CLAWPANEL_HERMES_METADATA_REEXEC'] = pin
-    os.execv(str(python),[str(python),*sys.orig_argv[1:]])
+    reexec_selected_python(python)
 sys.argv[1:] = ['--version']
 from pm.environments import activate_dependencies
 activate_dependencies(root)
@@ -260,6 +277,14 @@ HASHES = {
 def require(condition, message):
     if not condition:
         raise RuntimeError('Hermes private preflight: ' + message)
+
+
+def reexec_selected_python(python):
+    command = [str(python), *sys.orig_argv[1:]]
+    # Windows CRT不能直接承载多行-c；保留参数列表并同步传播真实退出码。
+    if os.name == 'nt':
+        raise SystemExit(subprocess.run(command, check=False).returncode)
+    os.execv(str(python), command)
 
 
 def native_windows_amd64():
@@ -589,6 +614,9 @@ def install_private_runtime_policy(root, owner_home, launch_script, portable=Fal
     def route_execvpe(executable, command, env):
         require(executable == sys.executable, 'dashboard reexec interpreter changed')
         guarded = guarded_route_command(command)
+        # 仅固定Dashboard路由的私有代理；不改变其他模块的os/subprocess。
+        if os.name == 'nt':
+            raise SystemExit(subprocess.run(guarded, env=env, check=False).returncode)
         return route_os.execvpe(guarded[0], guarded, env)
     class RouteProxy:
         def __init__(self, original, **overrides):
@@ -649,7 +677,7 @@ same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abs
 if not same:
     require(os.environ.get('CLAWPANEL_HERMES_LAUNCH_REEXEC') != PIN, 'selected store Python identity mismatch')
     os.environ['CLAWPANEL_HERMES_LAUNCH_REEXEC'] = PIN
-    os.execv(str(python), [str(python), *sys.orig_argv[1:]])
+    reexec_selected_python(python)
 
 # 仅 bootstrap 阶段使用原 tail 身份，防止在 preflight 前隐式修复。
 sys.argv = [str(root / 'hermes_cli/source_completion.py'), '--version']

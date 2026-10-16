@@ -131,7 +131,9 @@ test('仅LAUNCH边界固定source/signature，COM只读missing明确区分，com
  assert.ok(script.indexOf('restore_profile_policy = install_private_profile_task_policy(root, home)')<script.indexOf("runpy.run_module('hermes_cli.main'"))
  assert.match(script,/return \[str\(selected\), '-I', '-B', '-c', launch_script/)
  assert.match(completion,/def prepare_currency_checker\(/)
- assert.equal(crypto.createHash('sha256').update(completion).digest('hex'),'05d7cde012fe3800e0197682b51860ee9280f6f5bbdf7e77ca438f0a1f118e0a')
+ // 只允许另行真实验证的Windows参数转义差异；PM currency/原completion主体逐字保持。
+ const currencyUnchanged = completion.replace(/def reexec_selected_python\(python\):[^]*?\n\n\n/, '').replace('    reexec_selected_python(store_python)', '    os.execv(str(store_python), [str(store_python), *sys.orig_argv[1:]])')
+ assert.equal(crypto.createHash('sha256').update(currencyUnchanged).digest('hex'),'05d7cde012fe3800e0197682b51860ee9280f6f5bbdf7e77ca438f0a1f118e0a')
 })
 
 test('只读查询backend：非0/timeout/坏JSON/accessDenied不伪装missing，子env不改父env',()=>{
