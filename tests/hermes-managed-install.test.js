@@ -11,6 +11,20 @@ const root = fileURLToPath(new URL('../', import.meta.url))
 const wrapper = path.join(root, 'scripts/hermes-managed-install.ps1')
 const sha = s => crypto.createHash('sha256').update(s).digest('hex')
 const psQuote = s => `'${s.replaceAll("'", "''")}'`
+// 推荐版本变化后仍执行生产函数的旧pin分支，原11阶段和wrapper断言不删除。
+function legacyPlan(home) {
+  const source = fs.readFileSync(path.join(root, 'scripts/dev-api.js'), 'utf8')
+    .match(/export function hermesInstallerPlan\([^]*?\n\}/)?.[0]
+  assert.ok(source)
+  return new Function('isWindows', 'path', 'hermesHome', 'hermesSourceDir',
+    'HERMES_STABLE_VERSION', 'HERMES_STABLE_COMMIT', 'HERMES_STABLE_TAG', 'HERMES_STABLE_BRANCH',
+    'HERMES_INSTALLER_BASE_URL', 'HERMES_INSTALLER_SHA256',
+    source.replace(/^export /, '') + ';return hermesInstallerPlan')(
+    process.platform === 'win32', path, () => home, h => path.join(h, 'hermes-agent'),
+    '0.21.5', 'f97608f178d1ffeca59860195ab7da295f7c8e5f', 'v0.21.5', 'release/0.21.5',
+    'https://raw.githubusercontent.com/NousResearch/hermes-agent/f97608f178d1ffeca59860195ab7da295f7c8e5f/scripts',
+    { windows: '0a80dfeb7434229933bac32e73140d10086dff81bd84b156e71be9abc87cddf2' })(home)
+}
 // 只有结构化适配入口处理此合成源；产品执行入口仍须固定官方原字节 hash。
 const fixture = `function Set-ManagedNodeFirstOnUserPath {
 param([string]$NodeDir)
@@ -101,7 +115,7 @@ test('Web真实私有cache写入与Windows11个实际argv均绑定同一wrapper�
   assert.equal(typeof hermesInstallerPlan, 'function')
   const temp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'hermes-wrapper-bytes-'))
   try {
-    const plan = hermesInstallerPlan(temp)
+    const plan = legacyPlan(temp)
     fs.mkdirSync(path.dirname(plan.scriptPath), { recursive: true })
     const before = fs.readFileSync(wrapper)
     const cache = ensureHermesManagedWrapper(plan)
@@ -123,6 +137,22 @@ test('Web真实私有cache写入与Windows11个实际argv均绑定同一wrapper�
       }
     }
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
+})
+
+test('当前22.2生产安装计划实际五阶段不进入旧wrapper，完整pin/参数保持', async () => {
+  const { hermesInstallerPlan } = await import('../scripts/dev-api.js')
+  const plan = hermesInstallerPlan(path.join(fs.realpathSync(os.tmpdir()), 'hermes-plan-only'))
+  assert.deepEqual(plan.stages, ['repository', 'venv', 'python-deps', 'config', 'complete'])
+  for (const stage of plan.stages) {
+    const argv = plan.argsForStage(plan.scriptPath, stage, 'legacy-wrapper-must-not-run.ps1')
+    assert.equal(argv.includes('legacy-wrapper-must-not-run.ps1'), false)
+    if (process.platform === 'win32') {
+      assert.equal(argv[argv.indexOf('-File') + 1], plan.scriptPath)
+      assert.equal(argv.includes('-InstallerPath'), false)
+      assert.equal(argv[argv.indexOf('-Commit') + 1], 'd923a5eb487a17c0a68801bba9ef0f56c81040a8')
+      assert.equal(argv[argv.indexOf('-Stage') + 1], stage)
+    }
+  }
 })
 
 test('PS5真实临时sink：精确5节点适配/原字节不变，签名类型key目标数量异常均失败', { skip: process.platform !== 'win32' }, t => {

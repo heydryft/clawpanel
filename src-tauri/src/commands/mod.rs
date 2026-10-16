@@ -23,6 +23,7 @@ pub mod diagnose;
 pub mod extensions;
 pub mod hermes;
 pub mod hermes_providers;
+mod hermes_windows;
 pub mod logs;
 pub mod media;
 pub mod memory;
