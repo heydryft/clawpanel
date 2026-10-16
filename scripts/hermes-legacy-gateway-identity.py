@@ -80,17 +80,43 @@ def _legacy_identity_runtime_facts():
         dont_write_bytecode=sys.dont_write_bytecode)
 
 
+def _legacy_identity_base_physical(value, root, facts, *, slot):
+    """仅三个base字段接固定entry resolver；独立身份事实及其他物理守卫不变。"""
+    alias = root / '.hermes-runtime/python/cpython-3.11-windows-x86_64-none'
+    if slot not in ('facts.base-executable', 'facts.base-prefix', 'venv-config.home') or Path(value) not in (alias, alias / 'python.exe'):
+        return _legacy_identity_physical(value)
+    try:
+        if not getattr(alias.lstat(), 'st_file_attributes', 0) & 0x400:
+            return _legacy_identity_physical(value)
+        collector, resolver = globals().get('_runtime_facts'), globals().get('_legacy_managed_base_physical')
+        _legacy_identity_require(all(type(fn) is types.FunctionType and fn.__globals__ is globals()
+            for fn in (collector, resolver)), 'trusted entry runtime resolver unavailable')
+        full = collector()
+        keys = ('executable', 'prefix', 'base_executable', 'base_prefix', 'platform', 'os_name',
+                'native_machine', 'process_machine', 'bits', 'isolated', 'dont_write_bytecode')
+        _legacy_identity_require(type(full) is dict and all(k in full and k in facts and
+            type(full[k]) is type(facts[k]) and full[k] == facts[k] for k in keys), 'entry/identity runtime facts differ')
+        _legacy_identity_require(type(full.get('process_executable')) is str and full['process_executable'] and
+            type(full.get('process_id')) is int and full['process_id'] == os.getpid() and
+            type(full.get('process_create_time_filetime_100ns')) is int and
+            full['process_create_time_filetime_100ns'] > 116444736000000000, 'full native process facts unavailable')
+        # 原始完整fresh facts直接传入；不从context/有限身份字段制造canonical facts，不缓存alias成功。
+        return resolver(value, root, full, slot=slot)
+    except (OSError, ValueError, TypeError, KeyError):
+        raise SystemExit('ClawPanel legacy identity: managed base admission unavailable') from None
+
+
 def _legacy_runtime_layout(root, home, facts):
     _legacy_identity_require(facts['platform'] == 'win32' and facts['os_name'] == 'nt' and facts['native_machine'] == 0x8664 and
         facts['process_machine'] == 0 and facts['bits'] == 64 and facts['isolated'] == 1 and facts['dont_write_bytecode'], 'native AMD64 isolated runtime required')
     root, home = _legacy_identity_physical(root), _legacy_identity_physical(home)
     _legacy_identity_require(root == home / 'hermes-agent', 'source outside private HOME')
     venv = _legacy_identity_physical(root / 'venv/Scripts/python.exe')
-    base = _legacy_identity_physical(facts['base_executable'])
+    base = _legacy_identity_base_physical(facts['base_executable'], root, facts, slot='facts.base-executable')
     store = _legacy_identity_physical(root / '.hermes-runtime/python')
     _legacy_identity_require(_legacy_identity_physical(facts['executable']) == venv and
         _legacy_identity_physical(facts['prefix']) == root / 'venv' and base.name.lower() == 'python.exe' and
-        store in base.parents and _legacy_identity_physical(facts['base_prefix']) == base.parent, 'venv/base interpreter identity mismatch')
+        store in base.parents and _legacy_identity_base_physical(facts['base_prefix'], root, facts, slot='facts.base-prefix') == base.parent, 'venv/base interpreter identity mismatch')
     cfg = {}
     for line in _legacy_identity_physical(root / 'venv/pyvenv.cfg').read_text(encoding='utf-8').splitlines():
         if '=' in line:
@@ -98,7 +124,7 @@ def _legacy_runtime_layout(root, home, facts):
             _legacy_identity_require(key not in cfg, 'duplicate venv configuration')
             cfg[key] = value.strip()
     _legacy_identity_require(cfg.get('include-system-site-packages', '').lower() == 'false' and
-        _legacy_identity_physical(cfg.get('home', '')) == base.parent, 'venv base configuration mismatch')
+        _legacy_identity_base_physical(cfg.get('home', ''), root, facts, slot='venv-config.home') == base.parent, 'venv base configuration mismatch')
     git = _legacy_identity_physical(root / '.git')
     _legacy_identity_require(git.is_dir() and _legacy_identity_physical(git / 'HEAD').read_bytes() in
         (LEGACY_IDENTITY_PIN.encode(), (LEGACY_IDENTITY_PIN+'\n').encode(), (LEGACY_IDENTITY_PIN+'\r\n').encode()), 'detached source pin mismatch')
