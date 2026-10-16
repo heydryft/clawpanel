@@ -30,9 +30,11 @@ def install_windows_cim_probe(gateway, compat, spawn_server, platform=None):
             # 上游只消费这两个字段。CIM仍遍历全部进程，不过滤PID/解释器/其他HOME。
             projected = [*argv[:3], query.replace('Get-CimInstance Win32_Process |',
                 'Get-CimInstance Win32_Process -Property ProcessId,CommandLine |', 1)]
+            # 与既有安装器/task presence一致：PS5不能继承启动面板的PS7模块目录。
+            child_env = {key: value for key, value in os.environ.items() if key.lower() != 'psmodulepath'}
             proc, job = spawn_server(projected, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors=errors,
-                env=None, cwd=None, creationflags=compat.windows_hide_flags())
+                env=child_env, cwd=None, creationflags=compat.windows_hide_flags())
             observe('start', deadlineMs=timeout*1000)
             if job is None:
                 raise RuntimeError('owned probe Job missing')
@@ -56,6 +58,16 @@ def install_windows_cim_probe(gateway, compat, spawn_server, platform=None):
             return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
         except Exception as error:
             observe('failure', exceptionType=type(error).__name__, directExitCode=proc.poll() if proc else None)
+            if proc is not None and os.environ.get('CLAWPANEL_HERMES_PHASE_TIMING') == '1':
+                try:
+                    import psutil
+                    child = psutil.Process(proc.pid)
+                    status = child.status()
+                    cpu = child.cpu_times()
+                    observe('child-state', status=status if status in ('running','suspended','stopped') else 'unknown',
+                        threads=len(child.threads()), cpuUserMs=round(cpu.user*1000,3), cpuSystemMs=round(cpu.system*1000,3))
+                except Exception as state_error:
+                    observe('child-state-unavailable', exceptionType=type(state_error).__name__)
             compat._close_job(job)
             job = None
             if proc is not None:

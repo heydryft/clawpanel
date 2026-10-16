@@ -15,17 +15,19 @@ function probe(t, mode) {
 import sys,os,time,pathlib,subprocess,json,types
 root=pathlib.Path(sys.argv[1]);mode=sys.argv[2];source=pathlib.Path(sys.argv[3]);marker=root/'closed';state={'closes':0,'polls':0};children=[]
 if mode=='observe-timeout':os.environ['CLAWPANEL_HERMES_PHASE_TIMING']='1'
+os.environ['PSModulePath']='fixture-pwsh7-only-module';os.environ['CLAWPANEL_CIM_ENV_CANARY']='retained';parent_env=dict(os.environ)
 class Job:
  def close(self):
   state['closes']+=1;marker.write_text('closed')
 def spawn_server(argv,**kw):
  state['query']=argv[3] if len(argv)==4 else None
+ state['explicitEnv']=isinstance(kw.get('env'),dict);state['foreignModulePath']=any(k.lower()=='psmodulepath' for k in (kw.get('env') or os.environ));state['otherEnv']=(kw.get('env') or os.environ).get('CLAWPANEL_CIM_ENV_CANARY')
  if mode=='spawn-error':raise OSError('fixture spawn failed')
  code="import time,pathlib,sys; sys.stdout.reconfigure(encoding='utf-8'); m=pathlib.Path(sys.argv[1]); print('CommandLine=中文',flush=True); print('ProcessId=42',flush=True); end=time.monotonic()+4;\nwhile not m.exists() and time.monotonic()<end:time.sleep(.01)"
  if mode not in ('timeout','legacy-timeout','observe-timeout'):
   keeper=code.replace("print('CommandLine=中文',flush=True); print('ProcessId=42',flush=True); ","")
   code="import subprocess,sys; sys.stdout.reconfigure(encoding='utf-8'); subprocess.Popen([sys.executable,'-I','-B','-c',"+repr(keeper)+",sys.argv[1]],stdout=sys.stdout,stderr=sys.stderr); print('CommandLine=中文',flush=True); print('ProcessId=42',flush=True); print('parent-complete',flush=True)"
- p=subprocess.Popen([sys.executable,'-I','-B','-c',code,str(marker)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL,text=True,encoding='utf8',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+ p=subprocess.Popen([sys.executable,'-I','-B','-c',code,str(marker)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL,text=True,encoding='utf8',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),env=kw.get('env'))
  children.append(p);return p,Job()
 def old(argv,*,timeout,errors='replace',**kw):
  p,j=spawn_server(argv)
@@ -54,6 +56,7 @@ try:result=g._windows_process_listing()
 except BaseException as e:error={'type':type(e).__name__,'message':str(e)}
 elapsed=time.monotonic()-started
 state['childReturncodes']=[p.poll() for p in children]
+state['parentEnvUnchanged']=dict(os.environ)==parent_env
 if restore:restore()
 marker.write_text('closed')
 for p in children:
@@ -107,5 +110,17 @@ test('实际deadline失败只记录数值/类型/直接子进程状态，不打�
   assert.equal(failed.exceptionType, 'TimeoutExpired'); assert.equal(failed.directExitCode, null)
   assert.ok(failed.elapsedMs >= 650 && failed.elapsedMs < 1700)
   assert.ok(failed.pid > 0); assert.equal(r.error?.type, 'SystemExit')
-  for (const row of r.observation) for (const key of Object.keys(row)) assert.ok(['event','pid','elapsedMs','exceptionType','directExitCode','deadlineMs'].includes(key), key)
+  for (const row of r.observation) for (const key of Object.keys(row)) assert.ok(['event','pid','elapsedMs','exceptionType','directExitCode','deadlineMs','status','threads','cpuUserMs','cpuSystemMs'].includes(key), key)
+  const state = r.observation.find(v => v.event === 'child-state')
+  assert.ok(state, '实际活子进程必须区分suspended/CPU工作，不能继续猜测管道')
+  assert.ok(['running','suspended','stopped','unknown'].includes(state.status))
+  assert.ok(Number.isInteger(state.threads) && state.threads > 0)
+  assert.ok(Number.isFinite(state.cpuUserMs) && Number.isFinite(state.cpuSystemMs))
+})
+
+test('CIM专属PowerShell子环境不继承异版PSModulePath，其他变量和父环境不变', { timeout: 10000 }, t => {
+  const r = probe(t, 'inherited-pipe')
+  assert.equal(r.state.explicitEnv, true); assert.equal(r.state.foreignModulePath, false)
+  assert.equal(r.state.otherEnv, 'retained'); assert.equal(r.state.parentEnvUnchanged, true)
+  assert.equal(r.error, null); assert.equal(r.restored, true)
 })
