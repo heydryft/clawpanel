@@ -126,17 +126,17 @@ export function readFileExcerptSince(filePath, offset = 0, maxBytes = 8192) {
 // ---------------------------------------------------------------------------
 const HERMES_HOME = path.join(homedir(), '.hermes')
 const HERMES_DEFAULT_PORT = 8642
-const HERMES_STABLE_VERSION = '0.22.2'
-const HERMES_STABLE_TAG = 'v0.22.2'
+const HERMES_STABLE_VERSION = '0.21.5'
+const HERMES_STABLE_TAG = 'v2026.9.24'
 // 新安装器对 origin/<branch> 做祖先校验；发行 tag 和固定 commit 仍独立保留。
-const HERMES_STABLE_BRANCH = 'release/0.22.2'
-const HERMES_STABLE_COMMIT = 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
+const HERMES_STABLE_BRANCH = 'v2026.9.24'
+const HERMES_STABLE_COMMIT = 'f97608f178d1ffeca59860195ab7da295f7c8e5f'
 const HERMES_REPO_URL = 'https://github.com/NousResearch/hermes-agent.git'
 const HERMES_GIT_URL = `git+${HERMES_REPO_URL}@${HERMES_STABLE_TAG}`
 const HERMES_INSTALLER_BASE_URL = `https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_STABLE_COMMIT}/scripts`
 const HERMES_INSTALLER_SHA256 = {
-  windows: 'd7045a813ac5bbaec09ea4b65e5f77e47603ef56ae493414f72a4b3ce01de048',
-  posix: 'f4cdb0e20f1aca2c3871a76b962fd4db61510f549cf973759c753ac13349beb5',
+  windows: '0a80dfeb7434229933bac32e73140d10086dff81bd84b156e71be9abc87cddf2',
+  posix: '2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af',
 }
 const HERMES_DASHBOARD_FALLBACK_INDEX_HTML = `<!doctype html>
 <html lang="en">

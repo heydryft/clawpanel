@@ -2430,19 +2430,19 @@ pub async fn install_hermes(
     }
 }
 
-const HERMES_STABLE_VERSION: &str = "0.22.2";
-const HERMES_STABLE_TAG: &str = "v0.22.2";
-const HERMES_STABLE_BRANCH: &str = "release/0.22.2";
-const HERMES_STABLE_COMMIT: &str = "d923a5eb487a17c0a68801bba9ef0f56c81040a8";
+const HERMES_STABLE_VERSION: &str = "0.21.5";
+const HERMES_STABLE_TAG: &str = "v2026.9.24";
+const HERMES_STABLE_BRANCH: &str = "v2026.9.24";
+const HERMES_STABLE_COMMIT: &str = "f97608f178d1ffeca59860195ab7da295f7c8e5f";
 const HERMES_GIT_REPO_URL: &str = "https://github.com/NousResearch/hermes-agent.git";
 const HERMES_INSTALLER_BASE_URL: &str =
-    "https://raw.githubusercontent.com/NousResearch/hermes-agent/d923a5eb487a17c0a68801bba9ef0f56c81040a8/scripts";
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/f97608f178d1ffeca59860195ab7da295f7c8e5f/scripts";
 #[cfg(target_os = "windows")]
 const HERMES_INSTALLER_PS1_SHA256: &str =
-    "d7045a813ac5bbaec09ea4b65e5f77e47603ef56ae493414f72a4b3ce01de048";
+    "0a80dfeb7434229933bac32e73140d10086dff81bd84b156e71be9abc87cddf2";
 #[cfg(not(target_os = "windows"))]
 const HERMES_INSTALLER_SH_SHA256: &str =
-    "f4cdb0e20f1aca2c3871a76b962fd4db61510f549cf973759c753ac13349beb5";
+    "2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af";
 
 // ---------------------------------------------------------------------------
 // Hermes Dashboard compat stubs
@@ -2856,8 +2856,19 @@ fn emit_hermes_stable_version_log(app: &tauri::AppHandle) {
 }
 
 #[cfg(target_os = "windows")]
-const HERMES_INSTALLER_STAGES: &[&str] =
-    &["repository", "venv", "python-deps", "config", "complete"];
+const HERMES_INSTALLER_STAGES: &[&str] = &[
+    "uv",
+    "git",
+    "node",
+    "repository",
+    "python",
+    "venv",
+    "dependencies",
+    "node-deps",
+    "config-templates",
+    "platform-sdks",
+    "bootstrap-marker",
+];
 
 #[cfg(not(target_os = "windows"))]
 const HERMES_INSTALLER_STAGES: &[&str] =
