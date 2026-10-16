@@ -99,9 +99,9 @@ test('32767 UTF16含NUL的精确边界通过，32768在执行前报错，不截�
   assert.throws(() => prepare(original, enabled), /32767.*UTF16/)
 })
 
-test('三个固定Python脚本逐字节保持eae，未增加检查豁免/环境变量/超时或vendor改写', () => {
+test('STOP适配后的launch固定指纹，completion/metadata逐字节保持eae，无检查豁免或vendor改写', () => {
   for (const [script, expected] of [
-    [pm.HERMES_PRIVATE_LAUNCH_SCRIPT, '4364e9e27454f6acbc1f68293355e152315e14b392da2ab91c16d3541556138a'],
+    [pm.HERMES_PRIVATE_LAUNCH_SCRIPT, '260c1c5742dcd3574d32af69c7c50fb5f0f7e6fab6ed025f120a24e4cadfcc6e'],
     [pm.HERMES_PRIVATE_COMPLETION_SCRIPT, 'f091fc3e0c7a40d641bd8e674e0d3621adc0a67813b4eb6a6ba326b3f1573df2'],
     [pm.HERMES_PRIVATE_METADATA_SCRIPT, '1e819b3c44954f5b5baa55bcae501142d7b40a4b617760859cf65ec68a3ec6c1'],
   ]) assert.equal(crypto.createHash('sha256').update(script).digest('hex'), expected)

@@ -260,6 +260,83 @@ print_fast_version_info(check_updates=False)
 _hp('meta_e')
 `
 
+// 可审查身份adapter原文；固定压缩副本嵌入下方raw脚本以保持Windows CreateProcess长度预算。
+export const HERMES_PRIVATE_GATEWAY_IDENTITY_SCRIPT = String.raw`
+def install_private_gateway_identity(root, owner_home, launch_script, portable=False):
+    import math
+    import psutil
+    from gateway import status
+    from hermes_cli._launchers import resolve_store_python
+    original = status._record_matches_live_gateway_pid
+    factory = status._build_pid_record
+    require(list(inspect.signature(original).parameters) == ['record', 'pid', 'expected_home'] and
+            not inspect.signature(factory).parameters, 'gateway identity interface changed')
+    python = resolve_store_python(root, publication=True).resolve(strict=True)
+    require(root.resolve(strict=True) == root and owner_home.resolve(strict=True) == owner_home and
+            python.is_relative_to(owner_home / 'tools'), 'gateway identity escapes private installation')
+    digest = hashlib.sha256(launch_script.encode('utf-8')).hexdigest()
+    def build():
+        # 只扩展原工厂生成的当前进程record；原字段/原writer/真实锁协议均保留。
+        process = psutil.Process()
+        birth = process.create_time()
+        record = factory()
+        require(record['pid'] == process.pid and math.isfinite(birth) and birth > 0 and
+                process.create_time() == birth, 'gateway creation identity changed')
+        record['clawpanel_pm_identity'] = {'create_time': birth, 'script_sha256': digest}
+        return record
+    def matches(record, pid, *, expected_home=None):
+        if 'clawpanel_pm_identity' not in record:
+            return original(record, pid, expected_home=expected_home)
+        try:
+            process = psutil.Process(pid)
+            birth = process.create_time()
+            proof = record.get('clawpanel_pm_identity', {})
+            active = Path(expected_home or status._get_process_hermes_home())
+            name = 'default' if active == owner_home else active.name
+            if (active.resolve(strict=True) != active or
+                    (active != owner_home and (active.parent != owner_home / 'profiles' or
+                     re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name) is None))):
+                return False
+            if (type(pid) is not int or record.get('pid') != pid or record.get('kind') != status._GATEWAY_KIND or
+                    record.get('hermes_home') != str(active) or proof.get('script_sha256') != digest or
+                    type(proof.get('create_time')) is not float or proof['create_time'] != birth or
+                    not math.isfinite(birth) or birth <= 0 or
+                    record.get('start_time') != status._get_process_start_time(pid) or
+                    record.get('argv') != [str(root / 'hermes_cli/main.py'), '--profile', name, 'gateway', 'run']):
+                return False
+            argv = process.cmdline()
+            if argv[3:5] == ['-X', 'importtime']:
+                argv = argv[:3] + argv[5:]
+            if (argv[1:4] != ['-I', '-B', '-c'] or
+                    hashlib.sha256(argv[4].encode('utf-8')).hexdigest() != digest or
+                    argv[5:9] != [str(root), str(owner_home), PIN, '--portable' if portable else '--'] or
+                    Path(argv[0]) != python or Path(argv[0]).resolve(strict=True) != python or
+                    Path(process.exe()).resolve(strict=True) != python):
+                return False
+            words, selector, i = [], None, 9
+            while i < len(argv):
+                word = argv[i]
+                if word in ('-p', '--profile') or word.startswith(('-p=', '--profile=')):
+                    if selector is not None:
+                        return False
+                    if '=' in word:
+                        selector = word.split('=', 1)[1]
+                    else:
+                        i += 1
+                        selector = argv[i]
+                else:
+                    words.append(word)
+                i += 1
+            return (words == ['gateway', 'run'] and selector in (None, name) and process.is_running() and
+                    process.username() == psutil.Process().username() and psutil.Process(pid).create_time() == birth)
+        except Exception:
+            return False
+    status._build_pid_record, status._record_matches_live_gateway_pid = build, matches
+    def restore():
+        status._build_pid_record, status._record_matches_live_gateway_pid = factory, original
+    return restore
+`
+
 // 普通 CLI 的唯一受管入口；不修改上游文件，不用依赖 venv/旧 launcher 启动 CLI。
 export const HERMES_PRIVATE_LAUNCH_SCRIPT = String.raw`
 import ast
@@ -272,9 +349,6 @@ import re
 import runpy
 import subprocess
 import sys
-
-
-# 仅显式启用时输出固定阶段/PID/单调耗时；不含路径、参数、配置或错误内容。
 def _hp(name):
     if os.environ.get('CLAWPANEL_HERMES_PHASE_TIMING')!='1' or name not in 'entry src_b src_e store reexec imp_b imp_e cur_b cur_e debt1_b debt1_e act_b act_e state1_b state1_e prof_b prof_e boot_b boot_e state2_b state2_e debt2_b debt2_e policy_b policy_e main_b main_exit preflight meta_b meta_e pyjson_b pyjson_e'.split():return
     import time
@@ -283,9 +357,7 @@ def _hp(name):
     try:
         print('CLAWPANEL_HERMES_PHASE '+json.dumps(dict(schemaVersion=1,scope='launch',phase=name,pid=os.getpid(),ppid=os.getppid(),sequence=i,elapsedMs=round((t-s)/1e6,3),deltaMs=round((t-p)/1e6,3))),file=sys.stderr,flush=True)
     except (OSError,ValueError):pass
-
 _hp('entry')
-
 PIN = 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
 HASHES = {
     'hermes_cli/main.py': '88a7fc166d3bfaac082d44bbfc36c93b53c50f7508ca96e32206dc3f1edfaa82',
@@ -307,22 +379,18 @@ HASHES = {
     'hermes_constants.py': '8d55a41452b625061f1f2e2f507a7e7ffb2a396e711afcc7aee28b03a6e8fa9d',
     'pm/environments.py': 'ac5a9f09bc622a60aa616880be0906b07bec95bb8ad934924e931aa28dc8b777',
     'pm/paths.py': '8f15860b82f443a424186317dc361ea6063e0e7c3113af9b56a76f6b89e97737',
+    'gateway/status.py': '07d8e606f82b76b6d25fe918f5071cbd1615a36477be2e0276fc0225b040f6dd',
+    'gateway/status_inline_source.py': 'edb213a1a7221380cc6b7ca23bff6f9042900557c11edeb4696c166f2caaf357',
+    'hermes_state_holders.py': '709dfc7414eb5f2146fab3e19723827126b94be7e21499c9f1c55b05d323d567',
 }
-
-
 def require(condition, message):
     if not condition:
         raise RuntimeError('Hermes private preflight: ' + message)
-
-
 def reexec_selected_python(python):
     command = [str(python), *sys.orig_argv[1:]]
-    # Windows CRT不能直接承载多行-c；保留参数列表并同步传播真实退出码。
     if os.name == 'nt':
         raise SystemExit(subprocess.run(command, check=False).returncode)
     os.execv(str(python), command)
-
-
 def native_windows_amd64():
     if sys.platform != 'win32':
         return
@@ -343,16 +411,12 @@ def native_windows_amd64():
     for name in ('PROCESSOR_ARCHITEW6432', 'PROCESSOR_ARCHITECTURE'):
         require(os.environ.get(name, '').strip().lower() in ('', 'amd64', 'x86_64', 'x64'),
                 'Windows architecture contradicts native AMD64')
-
-
 def validate_runtime_state(root):
     require(pm.venv_is_current(project_root=root) is True, 'PM currency is false or unknown')
     require(not completion_pending_path(root).exists(), 'source completion debt remains; run managed completion')
     require(_tree_matches_completed_stamp(root) is True, 'source stamp is missing, adopted, dirty or stale')
     for product, output in (('tui', 'ui-tui/dist'), ('web', 'hermes_cli/web_dist')):
         require(source_product_current(root, product, root / output) is True, 'product receipt is not current: ' + product)
-
-
 def validate_no_repair_debt(root):
     from pm.environments import install_state_dir, owning_home_root
     from hermes_cli.update_lock import read_live_update
@@ -365,8 +429,6 @@ def validate_no_repair_debt(root):
     marker = Path(git_marker)
     markers.append(marker if marker.is_absolute() else root / marker)
     require(not any(marker.exists() for marker in markers), 'repair or checkout recovery debt remains')
-
-
 def validate_boot_record(record, expected=None):
     require(isinstance(record, dict) and record.get('identity') == PIN, 'active profile boot identity is missing or stale')
     results = record.get('results')
@@ -375,10 +437,7 @@ def validate_boot_record(record, expected=None):
             'active profile boot has failed, empty or unknown steps')
     if expected is not None:
         require(record.get('schemaVersion') == 1 and set(results) == set(expected), 'active profile boot step contract changed')
-
-
 def prepare_active_profile(root, home, argv):
-    # 执行固定 main 中未经改写的解析函数，不导入具有启动副作用的整个 main。
     from hermes_cli import _startup_fast
     names = {'_inside_mcp_add_args', '_looks_like_hermes_invocation', '_exit_invalid_profile_name',
              '_looks_like_option_value', '_scan_profile_flag', '_resolve_sudo_user_profile_env',
@@ -410,8 +469,6 @@ def prepare_active_profile(root, home, argv):
     name = get_active_profile_name()
     require(name != 'custom' and active == expected and Path(resolve_profile_env(name)).resolve() == active, 'active profile identity mismatch')
     return active
-
-
 def validate_windows_entrypoint(words):
     require(words[:1] and words[0] in {'gateway', 'dashboard', 'profile', 'tools', 'cron', 'sessions', 'logs', 'skills'},
             'Windows command is outside private managed entrypoints')
@@ -420,12 +477,9 @@ def validate_windows_entrypoint(words):
     if words[0] == 'profile':
         require(words[1:2] in (['list'], ['use']), 'Windows profile mutation requires separate qualification')
     if words[0] == 'skills':
-        # 仅匹配固定 Dashboard hub/profile API 实际生成的普通技能操作，不开放发布/修复或额外 flags。
         ordinary_hub = (len(words) == 4 and words[1] in {'install', 'uninstall'} and
                         bool(words[2].strip()) and not words[2].startswith('-') and words[3] == '--yes')
         require(ordinary_hub or words == ['skills', 'update'], 'Windows skills argv is outside private managed entrypoints')
-
-
 def private_boot(root):
     from hermes_cli import _launchers as launchers
     from hermes_cli import _install_repair as repair
@@ -460,14 +514,11 @@ def private_boot(root):
         launchers.expose_cli, repair.migrate_windows_bin_path = saved_expose, saved_migrate
         if maintenance is not None and 'saved_fhs' in locals():
             maintenance._ensure_fhs_path_guard = saved_fhs
-        # 原 post_update 捕获了曝光 alias；普通 CLI 前还原，真实 record 已是唯一启动凭据。
         if 'hermes_cli.post_update' in sys.modules:
             post = sys.modules['hermes_cli.post_update']
             post.expose_cli = saved_expose
             post.HOME_STEPS = tuple((name, saved_expose if name == 'expose_cli' else fn) for name, fn in post.HOME_STEPS)
             post.BOOT_HOME_STEPS = tuple(step for step in post.HOME_STEPS if step[0] != 'sync_skills')
-
-
 WINDOWS_TASK_QUERY = r"""
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -494,10 +545,7 @@ try {
     }
 } catch { @{state='unknown';hresult=(TaskHResult $_)}|ConvertTo-Json -Compress }
 """
-
-
 def windows_task_presence(task_name):
-    # 只读COM：仅GetTask本身的ERROR_FILE_NOT_FOUND表示不存在，拒绝把任意非0当missing。
     import base64
     require(isinstance(task_name, str) and re.fullmatch(r'Hermes_Gateway(?:_[a-zA-Z0-9_-]+)?', task_name),
             'private profile task name contract changed')
@@ -518,10 +566,7 @@ def windows_task_presence(task_name):
         return {'state': 'unknown', 'hresult': value.get('hresult') if isinstance(value.get('hresult'), str) else None}
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return {'state': 'unknown', 'hresult': None}
-
-
 def install_private_profile_task_policy(root, owner_home):
-    # 保护原函数入口而非cleanup的异常路径：上游cleanup会吞异常，然后继续移动/删除。
     if sys.platform != 'win32':
         return lambda: None
     import functools
@@ -575,7 +620,6 @@ def install_private_profile_task_policy(root, owner_home):
             check_profile(new_name)
         return original_rename(old_name, new_name)
     def private_cleanup(name, profile_dir):
-        # 不做系统cleanup，消除“查无任务后新建同名任务”的TOCTOU删除；不伪称已清理。
         print('ClawPanel private profile: external Windows task/Startup cleanup not performed', file=sys.stderr)
         return False
     def private_remove_windows_task():
@@ -583,7 +627,6 @@ def install_private_profile_task_policy(root, owner_home):
     replacements = [(original_delete, guarded_delete), (original_rename, guarded_rename),
                     (profiles._cleanup_gateway_service, private_cleanup), (cleanup.remove_windows_task, private_remove_windows_task)]
     try:
-        # 同时替换固定包中已经捕获的function alias；之后Dashboard延迟导入也读取受保护入口。
         for module_name, module in list(sys.modules.items()):
             if module_name == 'hermes_cli' or module_name.startswith('hermes_cli.'):
                 for name, value in list(vars(module).items()):
@@ -594,10 +637,7 @@ def install_private_profile_task_policy(root, owner_home):
         restore()
         raise
     return restore
-
-
 def install_private_runtime_policy(root, owner_home, launch_script, portable=False):
-    # Dashboard 请求和其后续子进程仍属于受管会话，不能只保护第一次 boot。
     import types
     from hermes_cli import _launchers as launchers, _install_repair as repair
     from hermes_cli import post_update as post, update_cmd_maint as maintenance, profiles
@@ -628,7 +668,6 @@ def install_private_runtime_policy(root, owner_home, launch_script, portable=Fal
     original_runtime_command = launchers.runtime_command
     def managed_runtime_command(repo_root, args=(), *, module='hermes_cli.main', code=None, python=None, home=None):
         require(Path(repo_root).resolve() == root, 'foreign runtime command target')
-        # 非 CLI 的官方工具脚本保持原协议；这里不全局拦截 Python 或系统 subprocess。
         if module != 'hermes_cli.main' or code is not None:
             return original_runtime_command(repo_root, args, module=module, code=code, python=python, home=home)
         selected = launchers.resolve_store_python(root, publication=True)
@@ -639,8 +678,6 @@ def install_private_runtime_policy(root, owner_home, launch_script, portable=Fal
         require(home is None, 'runtime child explicit home contract needs qualification')
         return [str(selected), '-I', '-B', '-c', launch_script, str(root), str(owner_home), PIN,
                 '--portable' if portable else '--', *args]
-    # 只克隆固定原 routing 函数的 globals；保留其真实 HOME/参数/环境处理。
-    # 不替换进程全局 subprocess.Popen/os.execvpe，不触碰其他工具/引擎。
     route_processes, route_os = route.__globals__['subprocess'], route.__globals__['os']
     def guarded_route_command(command):
         require(list(command[:3]) == [sys.executable, '-m', 'hermes_cli.main'], 'dashboard reexec contract changed')
@@ -650,7 +687,6 @@ def install_private_runtime_policy(root, owner_home, launch_script, portable=Fal
     def route_execvpe(executable, command, env):
         require(executable == sys.executable, 'dashboard reexec interpreter changed')
         guarded = guarded_route_command(command)
-        # 仅固定Dashboard路由的私有代理；不改变其他模块的os/subprocess。
         if os.name == 'nt':
             raise SystemExit(subprocess.run(guarded, env=env, check=False).returncode)
         return route_os.execvpe(guarded[0], guarded, env)
@@ -678,8 +714,6 @@ def install_private_runtime_policy(root, owner_home, launch_script, portable=Fal
         restore()
         raise
     return restore
-
-
 native_windows_amd64()
 require(len(sys.argv) >= 6 and sys.argv[3] == PIN and
         sys.argv[4] in ('--', '--portable', '--preflight', '--portable-preflight', '--python-json', '--portable-python-json'), 'unsupported launch contract')
@@ -718,8 +752,6 @@ if not same:
     os.environ['CLAWPANEL_HERMES_LAUNCH_REEXEC'] = PIN
     _hp('reexec')
     reexec_selected_python(python)
-
-# 仅 bootstrap 阶段使用原 tail 身份，防止在 preflight 前隐式修复。
 sys.argv = [str(root / 'hermes_cli/source_completion.py'), '--version']
 _hp('imp_b')
 import pm
@@ -762,18 +794,22 @@ print('CLAWPANEL_HERMES_PRIVATE_PREFLIGHT ' + json.dumps({'commit': PIN, 'curren
 if mode.endswith('preflight'):
     _hp('preflight')
     raise SystemExit(0)
-# 显式钉住已核验的 profile，避免 main 二次解析时 sticky 文件变化改向未维护的 HOME。
 _hp('policy_b')
 from hermes_cli.profiles import get_active_profile_name
 sys.argv = ['hermes', '--profile', get_active_profile_name(), *selected_argv]
 launch_script = sys.orig_argv[sys.orig_argv.index('-c') + 1]
 restore_policy = install_private_runtime_policy(root, home, launch_script, mode.startswith('--portable'))
 restore_profile_policy = None
+restore_identity = None
 _hp('policy_e')
 try:
     restore_profile_policy = install_private_profile_task_policy(root, home)
+    _gateway_identity_code = __import__('zlib').decompress(__import__('base64').b85decode('c-pO3-K*S06o0>e#fT3{>~8M8_5-^#Ld7aYD19iXEFt7(XLko@Cvj\x24S_pYU&MbIK\x601zSXG?USH_7km(3l>RZgz4gg|!E<INo8<1My#@2IA35jz&gcAcvNfV(!i3T(=Sd;ieyV9Qfsc8*NZ5!9&Gf>Td9HgTp9?CJX+EPp!qZY@(?n&G6(A~dsnb19qqkD7XfW6!aIqQQCbLveoBs<{YR1i-vCL=0d8@<_iY\x60?xo>DoZD#<tt6YG^qRVhoVa=uR!rE^J>VxgzGFs8X=6DCqlA_o{Il4iLaB@hlksD!iqI@5xUtj9D1q(#GOuVj3La%XSUB>k{tlKPw}?L+knn(0uni2xh8T{#cJB9-ZkYKS->QACEG1@U^s14#U\x242WU)3rmkL0Qej<Gm&i3)_u%4eIsmLyC0*aZ5G0^WNj6QzgpRzxfZIYrmYeG5x?PleoMowIxrnaGk_Mqu_LY__)AnYo9B8;v3v)*yX4e>_PTg8%tsXYUkSXW~hv*=9o%;=gZQ|)X=gJE<RfMW6EvO=H)T_}qX}aQ!*n}z##hIpR%GqA1rs=C^&-ty952?uV5%s-NkNdBAK@d*qfwlA<3>+*oJia>)c)d)PcYl6z>!;<f_m_7bEr0)EdFSTQy+=<z|MKYDPnUmwwY+uv>Ej1SKYn57<ljFYpxQ5AKRNtu8-C3tgNAM&efMa2\x6029ckK3U\x24r\x60}FW|\x60S7#9A3r?0|IJ??-&}brWS&u_APsxo!mIX%iw>_nCiN5*tR&1N#nZ3Zj5f4vB%tPIt|fAPH!4Fj(lPe0LWCQp<wyb0vN017zi<2oMqopDo\x24RdjxsgLVFvK@zjrJM^=wRLF_Pp15484q}^CA@#=x(-RI1HOy_Zp78!ODy6cw)x@?%OusXduIx6r{lq*n7t_t~hX>7<|0aBdr4;UC9M)%m*8jjsP7II4^@%ty};V?X+FC{k8tp#nE!nhU^?4zzkZNCz~RNnU4+WV0ht#YQH1d9=U#_Z40vpM;(l>!YKKzEFkX{TLWg|0!iG116BN>jV6FI0n39vr6t!M*1hu3Vjl\x60mGbahrsD%PXzLRYvvX\x60O?G?#0\x24jhC}V#Wv%uaDm>TB*zqh;ULE\x60<5YQF&\x60{)XTyk!v(3jpY?SHh>KOejAq#s}3>76@\x2414@l~1%xSLW-\x24l\x60TkBY6zRa_Itpa*cP%{+>VTV*>OPXCqVleeULO3S-fC(q8n)vp\x60YnR@=_<r)v<tuM?<<~@LG\x60a\x24ku7Cl0GjnHE+eg_bJG\x24@iW3#IPnhX)FQXca>)hk!SmR5{T>>=s!fe0HJ5&*5?g\x24Nk(1eJgaO6\x60JcR<wC6Y8~6P6Tqf&vTp&0SX%QWhas#tv+Y^RL|81\x24Gq>M&)9Gfb=4sq_WGTG(MP>}0H|b?I;!GT;7CgV8H#|K!8{0*z{~mg?YohJLx=#mfEC;7!a?1WZJBZiMISO_MXG}K%{W7BW-!PvU^thvn\x245se~awdM}^6>nbbU~hvTOEPY<IkEW;KtR<S8PMvdTxlW\x60eVrrq}|~gvNi5@Vtan=;s}G;5_R(5O1~SvYAiiKntl\x24_iww>j<\x60=eNMLEUArAHX_dKmW%&-KXpw(=AP7BnspPKC*9gR8k+giO{fUK2xYjRriWeXn15t+QZGGm1lV0M(p9?x+^E^dfH)0Xy_6m5O#Sk<H4_EKGCRh&&8;zP3^{ua(=#B~Wk%tbl><2E*NWqahAgHzXscBC>lDk6p#?#y5Qr)1sha<l~=U>jdsywTywX6mp!k%#*q90Vvx^vJX%cR<n\x246C#4WfO#EQuX4~9uOGPC@*wyy<w%!yQ7whX-\x249\x60O=O%F0!XmZJX!J52rd#vZA>(#e+(pPC{o3ZUxOYmwbhSQC2n\x241_D|HGSmHR-KZ;H}nPZhUV22fv{+;s'))
+    require(hashlib.sha256(_gateway_identity_code).hexdigest() == 'f0f9dd36f0068a3c1517b62994a16fed86b85d3d35b30f697a492fdd5dc35ef4', 'private gateway identity code changed')
+    exec(_gateway_identity_code, globals())
+    del _gateway_identity_code
+    restore_identity = install_private_gateway_identity(root, home, launch_script, mode.startswith('--portable'))
     if python_json:
-        # 只接收面板已编译的固定 helper；该通道没有暴露任意脚本 HTTP/IPC 接口。
         _hp('pyjson_b')
         exec(compile(snippet, '<clawpanel-hermes-python-json>', 'exec'), {'__name__': '__main__'})
         _hp('pyjson_e')
@@ -781,6 +817,8 @@ try:
     _hp('main_b')
     runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)
 finally:
+    if restore_identity is not None:
+        restore_identity()
     restore_policy()
     if restore_profile_policy is not None:
         restore_profile_policy()

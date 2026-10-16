@@ -9,7 +9,7 @@ import { HERMES_PRIVATE_LAUNCH_SCRIPT as script } from '../scripts/hermes-pm-run
 test('Dashboard 生命周期保留私有 policy，所有原始 aliases 在退出时还原', () => {
   assert.match(script, /def install_private_runtime_policy\(/)
   assert.match(script, /restore_policy = install_private_runtime_policy\(/)
-  assert.match(script, /finally:\n\s+restore_policy\(\)/)
+  assert.match(script, /finally:\n\s+if restore_identity is not None:\n\s+restore_identity\(\)\n\s+restore_policy\(\)/)
   assert.match(script, /profiles, '_get_wrapper_dir'/)
   assert.match(script, /launchers, 'runtime_command'/)
   assert.match(script, /dashboard, '_route_named_profile_dashboard'/)
