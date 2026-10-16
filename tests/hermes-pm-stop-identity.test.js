@@ -11,17 +11,19 @@ const python = process.env.HERMES_TEST_PYTHON || (process.platform === 'win32' ?
 const driver = new URL('./fixtures/hermes-pm-stop-identity.py', import.meta.url)
 const fixture = JSON.parse(fs.readFileSync(new URL('./fixtures/hermes-pm-stop-upstream.json', import.meta.url), 'utf8'))
 for (const group of ['native', 'negative', 'fallback']) {
-  test(`固定原生STOP契约：${group}`, () => {
+  for (const profile of ['default', 'n'.repeat(63)]) test(`固定原生STOP契约：${group}/${profile}`, () => {
     const r = spawnSync(python, ['-I', '-B', driver.pathname.replace(/^\/(?=[A-Za-z]:)/, ''), group], {
-      input: JSON.stringify({ script, fixture, identity: pm.HERMES_PRIVATE_GATEWAY_IDENTITY_SCRIPT || '' }), encoding: 'utf8', windowsHide: true, timeout: 15000,
+      input: JSON.stringify({ script, fixture, profile, identity: pm.HERMES_PRIVATE_GATEWAY_IDENTITY_SCRIPT || '' }), encoding: 'utf8', windowsHide: true, timeout: 15000,
     })
     if (process.env.HERMES_STOP_IDENTITY_EVIDENCE) {
       fs.mkdirSync(process.env.HERMES_STOP_IDENTITY_EVIDENCE, { recursive: true })
-      fs.writeFileSync(path.join(process.env.HERMES_STOP_IDENTITY_EVIDENCE, `${group}.json`), JSON.stringify({ status: r.status, stdout: r.stdout, stderr: r.stderr }, null, 2))
+      fs.writeFileSync(path.join(process.env.HERMES_STOP_IDENTITY_EVIDENCE, `${group}-${profile}.json`), JSON.stringify({ status: r.status, stdout: r.stdout, stderr: r.stderr }, null, 2))
     }
     assert.equal(r.status, 0, r.stderr || r.error?.message || r.stdout)
     const result = JSON.parse(r.stdout)
     assert.equal(result.scope, 'fixed-upstream-contract-not-Windows-qualification')
+    assert.equal(result.profile, profile)
+    assert.equal(result.nativeRecordArgv.length, 3, '原main必须已消费profile selector，原record不得人为重写')
     assert.ok(result.passed > 0)
   })
 }
@@ -54,6 +56,9 @@ if (process.env.HERMES_STOP_IDENTITY_LIVE === '1') {
     const result = JSON.parse(r.stdout)
     assert.equal(result.scope, 'fixed-native-stop-live-owned-child-not-Hermes-qualification')
     assert.equal(result.cases.length, 2)
-    for (const row of result.cases) assert.ok(row.originalRejected && row.nativeStop && row.pidExited && row.portClosed, JSON.stringify(row))
+    for (const row of result.cases) {
+      assert.ok(row.originalRejected && row.nativeStop && row.pidExited && row.portClosed, JSON.stringify(row))
+      assert.equal(row.nativeRecordArgv.length, 3)
+    }
   })
 }

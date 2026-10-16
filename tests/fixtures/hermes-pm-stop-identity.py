@@ -67,10 +67,27 @@ with tempfile.TemporaryDirectory(prefix='hermes-pm-stop-') as tmp:
     if current != home:
         current.mkdir(parents=True)
         target['command'][9:9] = ['--profile', profile]
-    native_argv = [str(root / 'hermes_cli/main.py'), '--profile', profile, 'gateway', 'run']
+    # main真实消费profile后才由原生factory写record；不能再用未消费的argv替代原函数。
+    profiles = types.ModuleType('hermes_cli.profiles')
+    profiles.resolve_profile_env = lambda name: str(home if name == 'default' else home / 'profiles' / name)
+    constants = types.ModuleType('hermes_constants')
+    constants.get_process_hermes_home = lambda: current
+    constants.display_hermes_home = str
+    parser = types.ModuleType('hermes_cli._parser')
+    assert hashlib.sha256(fixture['parser']['source'].encode()).hexdigest() == fixture['parser']['sha256']
+    exec(fixture['parser']['source'], parser.__dict__)
+    sys.modules.update({'hermes_cli.profiles': profiles, 'hermes_cli._parser': parser, 'hermes_constants': constants})
+    parser.build_top_level_parser()  # 真实parser可构建，不让隐藏的fallback替本契约兜底。
+    sys.argv = [str(root / 'hermes_cli/main.py'), '--profile', profile, 'gateway', 'run']
+    main_scope = dict(os=os, sys=sys, Path=Path, re=re, _PROFILE_NAME_RE=r'^[a-z0-9][a-z0-9_-]{0,63}$')
+    exec(fixture['main']['functions'], main_scope)
+    main_scope['_apply_profile_override']()
+    native_argv = sys.argv[:]
+    assert native_argv == [str(root / 'hermes_cli/main.py'), 'gateway', 'run']
+    assert Path(os.environ['HERMES_HOME']) == current
     status._GATEWAY_KIND = 'hermes-gateway'
     status.os = types.SimpleNamespace(getpid=lambda: 901)
-    status._record_argv = lambda: native_argv[:]
+    status.sys = sys
     status._get_process_start_time = lambda pid: round(target['birth'] * 100)
     status._get_process_hermes_home = lambda: current
     status._canonical_hermes_home = lambda p: p
@@ -148,6 +165,7 @@ with tempfile.TemporaryDirectory(prefix='hermes-pm-stop-') as tmp:
             ('duplicate-profile', lambda: target['command'].extend(['--profile', 'default', '-p', 'default'])),
             ('foreign-record-home', lambda: record.__setitem__('hermes_home', str(root))),
             ('record-argv', lambda: record['argv'].__setitem__(2, 'foreign')),
+            ('unconsumed-profile-record', lambda: record.__setitem__('argv', [str(root / 'hermes_cli/main.py'), '--profile', profile, 'gateway', 'run'])),
             ('record-pid', lambda: record.__setitem__('pid', 902)),
             ('unreadable-cmdline', lambda: target.__setitem__('command', [])),
             ('foreign-user', lambda: target.__setitem__('user', 'foreign-owner')),
@@ -211,4 +229,4 @@ with tempfile.TemporaryDirectory(prefix='hermes-pm-stop-') as tmp:
         assert status._record_matches_live_gateway_pid is original_match
         assert status._build_pid_record is original_build
         passed = 4
-    print(json.dumps(dict(scope='fixed-upstream-contract-not-Windows-qualification', group=group, passed=passed, nativeStopActions=events)))
+    print(json.dumps(dict(scope='fixed-upstream-contract-not-Windows-qualification', group=group, profile=profile, passed=passed, nativeRecordArgv=native_argv, nativeStopActions=events)))

@@ -28,14 +28,18 @@ d=json.loads(sys.stdin.buffer.readline().decode('utf-8'));f=d['fixture']
 root,home=Path(sys.argv[1]),Path(sys.argv[2]);name=d['name'];active=home if name=='default' else home/'profiles'/name
 g=types.ModuleType('gateway');g.__path__=[];s=types.ModuleType('gateway.status');g.status=s
 sys.modules.update({'gateway':g,'gateway.status':s})
-tree=ast.parse(f['status']['functions']);nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_build_pid_record']
-s.__dict__.update(os=os,sys=sys,_GATEWAY_KIND='hermes-gateway',_record_argv=lambda:list(sys.argv),_get_process_start_time=lambda pid:round(psutil.Process(pid).create_time()*100),_canonical_hermes_home=lambda x:x,_get_process_hermes_home=lambda:active)
+tree=ast.parse(f['status']['functions']);nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ('_record_argv','_build_pid_record')]
+s.__dict__.update(os=os,sys=sys,_GATEWAY_KIND='hermes-gateway',_get_process_start_time=lambda pid:round(psutil.Process(pid).create_time()*100),_canonical_hermes_home=lambda x:x,_get_process_hermes_home=lambda:active)
 exec(compile(ast.Module(body=nodes,type_ignores=[]),'<fixed-native-pid-factory>','exec'),s.__dict__)
 def match(record,pid,*,expected_home=None):return False
 s._record_matches_live_gateway_pid=match
 h=types.ModuleType('hermes_cli');h.__path__=[];l=types.ModuleType('hermes_cli._launchers');h._launchers=l
 l.resolve_store_python=lambda root,publication=True:Path(sys.executable)
 sys.modules.update({'hermes_cli':h,'hermes_cli._launchers':l})
+profiles=types.ModuleType('hermes_cli.profiles');profiles.resolve_profile_env=lambda name:str(home if name=='default' else home/'profiles'/name)
+constants=types.ModuleType('hermes_constants');constants.get_process_hermes_home=lambda:active;constants.display_hermes_home=str
+parser=types.ModuleType('hermes_cli._parser');assert hashlib.sha256(f['parser']['source'].encode()).hexdigest()==f['parser']['sha256'];exec(f['parser']['source'],parser.__dict__)
+sys.modules.update({'hermes_cli.profiles':profiles,'hermes_cli._parser':parser,'hermes_constants':constants});parser.build_top_level_parser()
 ns=dict(Path=Path,inspect=inspect,hashlib=hashlib,re=re,PIN=f['pin'])
 def require(condition,message):
  if not condition:raise RuntimeError(message)
@@ -43,6 +47,8 @@ ns['require']=require
 if d['identity']:
  exec(d['identity'],ns);ns['install_private_gateway_identity'](root,home,d['child_source'])
 sys.argv=[str(root/'hermes_cli/main.py'),'--profile',name,'gateway','run']
+main_scope=dict(os=os,sys=sys,Path=Path,re=re,_PROFILE_NAME_RE=r'^[a-z0-9][a-z0-9_-]{0,63}$');exec(f['main']['functions'],main_scope);main_scope['_apply_profile_override']()
+assert sys.argv==[str(root/'hermes_cli/main.py'),'gateway','run'] and Path(os.environ['HERMES_HOME'])==active
 record=s._build_pid_record();server=socket.socket();server.bind(('127.0.0.1',0));server.listen(1)
 print(json.dumps(dict(record=record,port=server.getsockname()[1])),flush=True)
 connection,_=server.accept()
@@ -57,12 +63,11 @@ def load_native(home, current, record):
     inline = {}; exec(fixture['inline']['source'], inline)
     gateway = types.ModuleType('gateway'); gateway.__path__ = []
     status = types.ModuleType('gateway.status'); gateway.status = status
-    status.__dict__.update(dict(Any=Any, Optional=Optional, Path=Path, shlex=shlex, **{k:inline[k] for k in ['command_line_runs_inline_source','inline_bootstrap_argv','inline_source_flag_index']}))
+    status.__dict__.update(dict(Any=Any, Optional=Optional, Path=Path, shlex=shlex, sys=sys, **{k:inline[k] for k in ['command_line_runs_inline_source','inline_bootstrap_argv','inline_source_flag_index']}))
     exec(fixture['status']['functions'], status.__dict__)
     sys.modules.update({'gateway': gateway, 'gateway.status': status})
     status._GATEWAY_KIND = 'hermes-gateway'
     status._read_process_cmdline = lambda pid: ' '.join(psutil.Process(pid).cmdline())
-    status._record_argv = lambda: []
     status._get_process_hermes_home = lambda: current
     status._host_gateway_serves_home = lambda *a: False
     status._command_line_belongs_to_profile = lambda command, expected: expected == current
@@ -101,6 +106,7 @@ with tempfile.TemporaryDirectory(prefix='hermes-owned-stop-') as tmp:
             line = child.stdout.readline()
             assert line, child.stderr.read()
             ready = json.loads(line); record, port = ready['record'], ready['port']
+            assert record['argv'] == [str(root / 'hermes_cli/main.py'), 'gateway', 'run']
             status = load_native(home, active, record)
             original = status._record_matches_live_gateway_pid
             assert original(record, child.pid, expected_home=active) is False
@@ -139,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix='hermes-owned-stop-') as tmp:
             assert stopped and child.poll() == 0
             with socket.socket() as connection: closed = connection.connect_ex(('127.0.0.1', port)) != 0
             assert closed
-            result['cases'].append(dict(profile=name, pid=child.pid, createTime=birth, originalRejected=True, nativeStop=stopped, pidExited=True, portClosed=closed, realCmdlineSha256=hashlib.sha256(subprocess.list2cmdline(args).encode()).hexdigest()))
+            result['cases'].append(dict(profile=name, pid=child.pid, createTime=birth, nativeRecordArgv=record['argv'], originalRejected=True, nativeStop=stopped, pidExited=True, portClosed=closed, realCmdlineSha256=hashlib.sha256(subprocess.list2cmdline(args).encode()).hexdigest()))
             restore()
         finally:
             if child.poll() is None:
