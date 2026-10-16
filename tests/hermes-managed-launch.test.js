@@ -28,7 +28,7 @@ test('Web 所有普通 Hermes CLI 启动统一 wrapper，不经 PATH launcher', 
   assert.doesNotMatch(web, /spawn\('hermes',/)
   assert.match(web.match(/function runHermesSilent[^]*?\n}/)?.[0] || '', /hermesLaunchSpec/)
   assert.match(web, /spawnHermes\(\['gateway', 'run'\]/)
-  assert.match(web, /spawnHermes\(\['dashboard', '--no-open'\]/)
+  assert.match(web, /spawnHermes\(\['dashboard', '--no-open', '--port', String\(port\)\]/)
 })
 
 test('Rust guardian/gateway/dashboard/profile/portable 与 silent/tokio 共用 wrapper', () => {

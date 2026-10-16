@@ -18971,7 +18971,7 @@ const handlers = {
           if (indent === 0) { inDashboard = t === 'dashboard:' || t.startsWith('dashboard:'); continue }
           if (inDashboard && t.startsWith('port:')) {
             const p = parseInt(t.replace(/^port:/, '').trim(), 10)
-            if (Number.isFinite(p) && p > 0) { port = p; break }
+            if (Number.isFinite(p) && p > 0 && p <= 65535) { port = p; break }
           }
         }
       }
@@ -18997,9 +18997,8 @@ const handlers = {
 
   async hermes_dashboard_start() {
     const port = handlers._hermesDashboardPort()
-    // 1. 已运行？
-    const cli = await handlers._hermesDashboardCliStatus(port)
-    if (cli?.running || await _tcpProbe('127.0.0.1', port, 500)) {
+    // 1. 只认本实例配置端口；CLI 全局列表包含其他 HOME/端口。
+    if (await _tcpProbe('127.0.0.1', port, 500)) {
       return { started: true, already_running: true, port }
     }
     // 2. 清残留 PID
@@ -19028,7 +19027,7 @@ const handlers = {
         if (eq > 0) envVars[t.slice(0, eq).trim()] = t.slice(eq + 1).trim()
       }
     }
-    const child = spawnHermes(['dashboard', '--no-open'], {
+    const child = spawnHermes(['dashboard', '--no-open', '--port', String(port)], {
       cwd: home,
       env: envVars,
       stdio: ['ignore', out, err],

@@ -2194,12 +2194,8 @@ fn kill_dashboard_pid() -> bool {
 #[tauri::command]
 pub async fn hermes_dashboard_start(app: tauri::AppHandle) -> Result<Value, String> {
     let port = hermes_dashboard_port();
-    // 1. 已运行？
-    if hermes_dashboard_tcp_running(port, 500)
-        || hermes_dashboard_cli_status(port)
-            .map(|(running, _)| running)
-            .unwrap_or(false)
-    {
+    // 1. 只认本实例配置端口；CLI 全局列表包含其他 HOME/端口。
+    if hermes_dashboard_tcp_running(port, 500) {
         return Ok(serde_json::json!({
             "started": true,
             "already_running": true,
@@ -2225,7 +2221,7 @@ pub async fn hermes_dashboard_start(app: tauri::AppHandle) -> Result<Value, Stri
 
     let enhanced = hermes_enhanced_path();
     let mut cmd = hermes_command()?;
-    cmd.args(["dashboard", "--no-open"])
+    cmd.args(["dashboard", "--no-open", "--port", &port.to_string()])
         .current_dir(&home)
         .stdin(std::process::Stdio::null())
         .stdout(log_file)
