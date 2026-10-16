@@ -7,7 +7,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { formatFixtureBoundsFailure } from '../scripts/hermes-cli-bounds-observation.mjs'
+import { evaluateFixtureBoundsGate, encodeFixtureIdentityEvidence, FIXTURE_IDENTITY_LIMITS } from '../scripts/hermes-cli-owned-identity.mjs'
 
 const root = path.resolve(process.env.HERMES_ASYNC_TEST_ROOT || fileURLToPath(new URL('..', import.meta.url)))
 const evidence = process.env.HERMES_BOUNDS_TEST_EVIDENCE
@@ -15,10 +15,10 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 let rawProbeSink = null
 const alive = pid => {
   const sink = rawProbeSink, startedAtMs = sink ? Date.now() : null, startedAtNs = sink ? process.hrtime.bigint().toString() : null
-  let value = false
-  try { process.kill(pid, 0); value = true; return true } catch { return false }
+  let value = false, errorCode = null
+  try { process.kill(pid, 0); value = true; return true } catch (error) { errorCode = error.code; return false }
   finally {
-    if (sink) { sink.count++; if (sink.probes.length < 8) sink.probes.push({ pid, alive: value, startedAtMs, completedAtMs: Date.now(), startedAtNs, completedAtNs: process.hrtime.bigint().toString() }) }
+    if (sink) { sink.count++; sink.probes.push({ pid, alive: value, errorCode, startedAtMs, completedAtMs: Date.now(), startedAtNs, completedAtNs: process.hrtime.bigint().toString() }) }
   }
 }
 
@@ -183,8 +183,8 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   const base = fs.realpathSync(os.tmpdir()), dir = fs.mkdtempSync(path.join(base, 'hermes-cli-bounds-'))
   const home = path.join(dir, 'h'), bin = path.join(home, '.hermes/bin'), log = path.join(dir, 'cli.jsonl')
   const readEvents = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(s => JSON.parse(s)) : []
-  let child, gateway, sampler, nativeSampler, observer, sampleInFlight, pressureChild, pressureTask, stopPressure = false, peak = 0
-  const report = { scope: 'production middleware / isolated CLI concurrency and real HTTP', root, requests: [], health: [], peak: 0, legacyPeak: 0, nativePeak: 0, rawPeakSamples: [], observations: [], observerErrors: [], pressure: [], environment: { platform: process.platform, node: process.version, executable: process.execPath }, pressureEnabled: process.env.HERMES_BOUNDS_OBSERVATION_PRESSURE === '1' }
+  let child, gateway, sampler, nativeSampler, observer, sampleInFlight, pressureChild, pressureTask, stopPressure = false, rawUnqualifiedPeak = 0
+  const report = { scope: 'production middleware / isolated CLI concurrency and real HTTP', root, requests: [], health: [], peak: 0, rawUnqualifiedPeak: 0, ownedPeak: null, legacyPeak: 0, nativePeak: 0, rawSweeps: [], rawPeakSamples: [], observations: [], observerErrors: [], pressure: [], environment: { platform: process.platform, node: process.version, executable: process.execPath }, pressureEnabled: process.env.HERMES_BOUNDS_OBSERVATION_PRESSURE === '1' }
   const expectedExecutable = path.join(bin, 'hermes.exe')
   const sample = async () => {
     const starts = readEvents().filter(e => e.event === 'start'), pids = [...new Set(starts.map(e => e.pid))]
@@ -205,7 +205,7 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
     await pressureTask
     if (child && child.exitCode === null) { const closed = new Promise(resolve => child.once('close', resolve)); child.kill(); await closed }
     if (gateway) { gateway.closeAllConnections(); await new Promise(resolve => gateway.close(resolve)) }
-    report.events = readEvents(); report.peak = peak
+    report.events = readEvents(); report.peak = rawUnqualifiedPeak; report.rawUnqualifiedPeak = rawUnqualifiedPeak
     const pids = [...new Set(report.events.map(e => e.pid))]
     if (observer) {
       try {
@@ -238,18 +238,21 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
     observer = await (await import('../scripts/hermes-cli-bounds-observation.mjs')).startWindowsFixtureProcessObserver()
     report.observerPid = observer.pid
   }
-  // 保留原25ms裸PID门禁；不被原生侧车的异步busy/采样速度合并或跳过。
+  // 保留原25ms全部历史PID kill0；不被原生侧车的异步busy/采样速度合并或跳过。
   sampler = setInterval(() => {
     const starts = readEvents().filter(e => e.event === 'start'), pids = [...new Set(starts.map(e => e.pid))]
     const startedAtMs = Date.now(), sink = { count: 0, probes: [] }
     rawProbeSink = sink
     let count
     try { count = pids.filter(alive).length } finally { rawProbeSink = null }
-    if (count > peak || (count > 2 && report.rawPeakSamples.length < 8)) {
+    const sweep = { count, startedAtMs, completedAtMs: Date.now(), probeCount: sink.count, probes: sink.probes, starts }
+    if (report.rawSweeps.length < FIXTURE_IDENTITY_LIMITS.rawSweeps) report.rawSweeps.push(sweep)
+    else report.materialOverflow = true
+    if (count > rawUnqualifiedPeak || (count > 2 && report.rawPeakSamples.length < 8)) {
       if (report.rawPeakSamples.length >= 8) report.rawPeakSamples.pop()
-      report.rawPeakSamples.push({ count, startedAtMs, completedAtMs: Date.now(), probeCount: sink.count, probes: sink.probes, starts: starts.slice(-8) })
+      report.rawPeakSamples.push(sweep)
     }
-    peak = Math.max(peak, count); report.legacyPeak = peak
+    rawUnqualifiedPeak = Math.max(rawUnqualifiedPeak, count); report.legacyPeak = rawUnqualifiedPeak
   }, 25)
   // 原生侧车独立采样；逐PID并非atomic snapshot，不能替代原门禁。
   if (observer) nativeSampler = setInterval(() => {
@@ -276,10 +279,22 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   await sampleInFlight
   assert.deepEqual(report.observerErrors, [], '身份观察失败必须显式红灯')
   // 先保存完整红灯事实，再断言；不让第一个并发失败掩盖其他观测。
-  report.events = readEvents(); report.peak = peak
+  report.events = readEvents(); report.peak = rawUnqualifiedPeak; report.rawUnqualifiedPeak = rawUnqualifiedPeak
+  // 冻结原断言位置的全部材料；后续fail/recovery和finally仍保留raw，但不冒充已经资格化。
+  report.identityGateMaterial = { events: report.events, rawSweeps: [...report.rawSweeps], nativeRows: report.observations.flatMap(o => o.processes), observerErrors: [...report.observerErrors], materialOverflow: report.materialOverflow }
+  try {
+    report.identityGate = evaluateFixtureBoundsGate(report, process.platform === 'win32')
+    console.log(encodeFixtureIdentityEvidence(report.identityGate))
+  } catch (error) {
+    const code = /^[A-Z_]{1,64}$/.test(error.code || '') ? error.code : 'EVIDENCE_INVALID'
+    report.identityGateFailure = { code }
+    console.log(JSON.stringify({ event: 'hermes-bounds-identity-failure', code, rawUnqualifiedPeak }))
+    throw error
+  }
+  const peak = report.identityGate.ownedPeak; report.ownedPeak = peak
   assert.equal(health.status, 200, JSON.stringify(health)); assert.deepEqual(health.value, healthPayload); assert.ok(health.ms < 2000, 'CLI过载期间真实health: ' + JSON.stringify(health))
-  assert.ok(peak <= 2, `实际子进程峰值 ${peak}，不应无界启动${peak > 2 ? '；诊断（不同时间采样，未归因）=' + formatFixtureBoundsFailure(report) : ''}`)
-  assert.ok(report.nativePeak <= 2, `另时刻逐PID原生观察峰值 ${report.nativePeak}；仅附加门禁，不替代原kill0门禁`)
+  assert.ok(peak <= 2, `实际所属创建身份峰值 ${peak}，原raw峰值 ${report.identityGate.rawUnqualifiedPeak}；完整证明见独立hermes-bounds-identity JSON行，非atomic`)
+  assert.ok(report.nativePeak <= 2, `另时刻逐PID原生观察峰值 ${report.nativePeak}；仅附加门禁，不替代原raw资格化门禁`)
   const busy = results.filter(r => r.status === 500 && /queue.*full/i.test(r.value.error))
   assert.equal(busy.length, 2, JSON.stringify(results)); assert.ok(busy.every(r => r.ms < 2000), '队满立即失败')
   assert.ok(report.wallMs >= 14500 && report.wallMs < 17500, '排队不能额外获得15秒执行预算')

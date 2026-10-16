@@ -55,22 +55,32 @@ test('原HTTP predicate/raw25ms/预算与断言保持；诊断不增加kill0或�
   for (const guard of ['health.ms < 2000', 'report.wallMs >= 14500 && report.wallMs < 17500', 'starts.length <= 6 && starts.length >= 4', 'e.monotonicMs - startedMonotonicMs < 15000', 'report.nativePeak <= 2']) assert.ok(current.includes(guard), guard)
 })
 
-test('原assert实际执行仍拒绝peak3，错误消息能带出有界诊断且不泄露原正文', async () => {
-  const { formatFixtureBoundsFailure } = await import('../scripts/hermes-cli-bounds-observation.mjs')
+test('原assert实际执行仍拒绝所属peak3；错误仅引用独立证据，不依赖inspect长消息', () => {
   const source = fs.readFileSync(new URL('./hermes-cli-bounds.test.js', import.meta.url), 'utf8')
   const statement = source.split('\n').find(line => line.trim().startsWith('assert.ok(peak <= 2,'))
   assert.ok(statement)
-  const execute = new Function('assert', 'peak', 'report', 'formatFixtureBoundsFailure', statement)
-  assert.throws(() => execute(assert, 3, fixture(), formatFixtureBoundsFailure), error => {
+  const execute = new Function('assert', 'peak', 'report', statement)
+  assert.throws(() => execute(assert, 3, { identityGate: { rawUnqualifiedPeak: 3 } }), error => {
     assert.equal(error.code, 'ERR_ASSERTION')
-    assert.match(error.message, /实际子进程峰值 3/)
-    assert.match(error.message, /"cause":"unresolved"/)
-    assert.match(error.message, /"samplingNotSimultaneous":true/)
-    assert.match(error.message, /"nativeBefore"/)
-    assert.match(error.message, /"nativeAfter"/)
+    assert.match(error.message, /实际所属创建身份峰值 3/)
+    assert.match(error.message, /原raw峰值 3/)
+    assert.match(error.message, /hermes-bounds-identity JSON/)
+    assert.match(error.message, /非atomic/)
     assert.doesNotMatch(error.message, /SECRET-/)
-    assert.ok(Buffer.byteLength(error.message) < 25000)
+    assert.ok(Buffer.byteLength(error.message) < 1000)
     return true
   })
-  execute(assert, 2, { peak: 2 }, () => { throw new Error('成功时不应构建失败诊断') })
+  execute(assert, 2, { identityGate: { rawUnqualifiedPeak: 3 } })
+})
+
+test('HTTP身份接线必须收集完整原raw并先独立输出，再按所属peak执行原门限', () => {
+  const source = fs.readFileSync(new URL('./hermes-cli-bounds.test.js', import.meta.url), 'utf8')
+  assert.match(source, /report\.rawSweeps\.push\(/)
+  assert.match(source, /report\.identityGate = evaluateFixtureBoundsGate\(report, process\.platform === 'win32'\)/)
+  assert.match(source, /const peak = report\.identityGate\.ownedPeak/)
+  assert.ok(source.indexOf('console.log(encodeFixtureIdentityEvidence(report.identityGate))') < source.indexOf('assert.ok(peak <= 2,'))
+  assert.match(source, /rawUnqualifiedPeak = Math\.max\(rawUnqualifiedPeak, count\)/)
+  assert.match(source, /report\.materialOverflow = true/)
+  assert.doesNotMatch(source, /sink\.probes\.length < 8/)
+  assert.doesNotMatch(source, /starts: starts\.slice\(-8\)/)
 })
