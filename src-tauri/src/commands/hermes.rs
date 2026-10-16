@@ -802,7 +802,7 @@ async fn do_restart_gateway() -> Result<(), String> {
         .try_clone()
         .map_err(|e| format!("克隆日志句柄失败: {e}"))?;
 
-    let mut cmd = std::process::Command::new(hermes_program_for_spawn()?);
+    let mut cmd = hermes_command()?;
     cmd.args(["gateway", "run"])
         .current_dir(&home)
         .stdin(std::process::Stdio::null())
@@ -906,11 +906,147 @@ fn hermes_source_dir() -> PathBuf {
 }
 
 fn hermes_source_venv_bin_dir() -> PathBuf {
-    let venv = hermes_source_dir().join("venv");
+    let venv = match hermes_pm_environment_at(&hermes_home(), &hermes_source_dir()) {
+        Ok(Some(environment)) => environment,
+        Ok(None) => hermes_source_dir().join("venv"),
+        // 无效 PM 记录不回退旧 ABI；check_hermes 会返回具体原因。
+        Err(_) => hermes_source_dir().join(".clawpanel-invalid-pm"),
+    };
     if cfg!(target_os = "windows") {
         venv.join("Scripts")
     } else {
         venv.join("bin")
+    }
+}
+
+fn hermes_pm_canonical_source(source: &Path) -> Result<String, String> {
+    let path = source
+        .canonicalize()
+        .map_err(|e| format!("Hermes PM 源目录无效: {e}"))?;
+    let value = path.to_string_lossy();
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        Ok(format!(r"\\{unc}"))
+    } else {
+        Ok(value.strip_prefix(r"\\?\").unwrap_or(&value).to_string())
+    }
+}
+
+fn hermes_pm_environment_at(home: &Path, source: &Path) -> Result<Option<PathBuf>, String> {
+    if !source.exists() {
+        return Ok(None);
+    }
+    let canonical = hermes_pm_canonical_source(source)?;
+    let key = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+    let state = home.join("installs").join(&key[..16]);
+    let facts = state.join("facts.json");
+    if !facts.exists() {
+        return Ok(None);
+    }
+    let read = || -> Result<Option<PathBuf>, String> {
+        let raw = std::fs::read_to_string(&facts).map_err(|e| e.to_string())?;
+        let data: Value =
+            serde_json::from_str(raw.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+        let value = &data["packages"]["venv"]["environment"];
+        if value.is_null() {
+            return Ok(None);
+        }
+        let selected = PathBuf::from(value.as_str().ok_or("环境路径不是字符串")?);
+        if !selected.is_absolute() {
+            return Err("环境不是绝对路径".into());
+        }
+        let selected = selected.canonicalize().map_err(|e| e.to_string())?;
+        let root = state
+            .join("environments")
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        // 根目录链接也不能将当前 checkout 的 PM 环境移出私有 HOME。
+        let owned_root = home
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join("installs")
+            .join(&key[..16])
+            .join("environments");
+        if root != owned_root {
+            return Err("环境根目录链接越界".into());
+        }
+        if selected == root
+            || !selected.starts_with(&root)
+            || !selected.join("pyvenv.cfg").is_file()
+        {
+            return Err("环境不属于当前安装".into());
+        }
+        Ok(Some(selected))
+    };
+    read().map_err(|e| format!("Hermes PM 环境记录损坏或越界，请修复当前安装: {e}"))
+}
+
+#[cfg(test)]
+mod hermes_pm_layout_tests {
+    use super::*;
+    #[test]
+    fn explicit_python_wins_over_invalid_pm_record() {
+        let home =
+            std::env::temp_dir().join(format!("clawpanel-hermes-explicit-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let source = home.join("missing-checkout");
+        let python = home.join("explicit-python");
+        std::fs::write(&python, "fixture").unwrap();
+        assert_eq!(
+            hermes_primary_venv_python_at(&home, &source, Some(python.as_os_str())).unwrap(),
+            Some(python.clone())
+        );
+        std::fs::create_dir_all(&source).unwrap();
+        let canonical = hermes_pm_canonical_source(&source).unwrap();
+        let key = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        let state = home.join("installs").join(&key[..16]);
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("facts.json"), "{broken").unwrap();
+        assert_eq!(
+            hermes_primary_venv_python_at(&home, &source, Some(python.as_os_str())).unwrap(),
+            Some(python)
+        );
+        assert!(hermes_primary_venv_python_at(&home, &source, None).is_err());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn committed_environment_is_owned_and_corruption_never_falls_back() {
+        let home = std::env::temp_dir().join(format!(
+            "clawpanel-pm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = home.join("hermes-agent");
+        std::fs::create_dir_all(&source).unwrap();
+        assert!(hermes_pm_environment_at(&home, &source).unwrap().is_none());
+        let canonical = hermes_pm_canonical_source(&source).unwrap();
+        let hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        let state = home.join("installs").join(&hash[..16]);
+        let environment = state.join("environments").join("generation-1");
+        std::fs::create_dir_all(&environment).unwrap();
+        std::fs::write(environment.join("pyvenv.cfg"), "home = private\n").unwrap();
+        let facts = state.join("facts.json");
+        std::fs::write(
+            &facts,
+            serde_json::json!({"packages":{"venv":{"environment":environment}}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            hermes_pm_environment_at(&home, &source).unwrap().unwrap(),
+            environment.canonicalize().unwrap()
+        );
+        std::fs::write(&facts, "{broken").unwrap();
+        assert!(hermes_pm_environment_at(&home, &source).is_err());
+        std::fs::write(
+            &facts,
+            serde_json::json!({"packages":{"venv":{"environment":source}}}).to_string(),
+        )
+        .unwrap();
+        assert!(hermes_pm_environment_at(&home, &source).is_err());
+        std::fs::remove_dir_all(home).unwrap();
     }
 }
 
@@ -1176,6 +1312,58 @@ fn hermes_program_for_spawn() -> Result<PathBuf, String> {
     Ok(PathBuf::from("hermes"))
 }
 
+// 便携目录和普通安装均以当前 checkout 的真实 PM 选择为准，不再启动旧 PATH launcher。
+fn hermes_launch_spec() -> Result<(PathBuf, Vec<std::ffi::OsString>), String> {
+    let home = hermes_home();
+    let root = hermes_source_dir();
+    let environment = hermes_pm_environment_at(&home, &root)?;
+    if environment.is_none() && !root.join("pm").join("environments.py").is_file() {
+        return Ok((hermes_program_for_spawn()?, Vec::new()));
+    }
+    let environment = environment.ok_or("Hermes private preflight 缺少当前 checkout 的 PM 环境")?;
+    if HERMES_STABLE_VERSION != "0.22.2"
+        || HERMES_STABLE_COMMIT != "d923a5eb487a17c0a68801bba9ef0f56c81040a8"
+    {
+        return Err("Hermes private preflight pin 未审查".into());
+    }
+    let python = if cfg!(target_os = "windows") {
+        environment.join("Scripts").join("python.exe")
+    } else {
+        environment.join("bin").join("python3")
+    };
+    let script = HERMES_PM_RUNTIME_SOURCE
+        .split_once("export const HERMES_PRIVATE_LAUNCH_SCRIPT = String.raw`")
+        .and_then(|(_, source)| source.split_once('`'))
+        .map(|(script, _)| script)
+        .ok_or("Hermes 共享 private launch 脚本缺失")?;
+    let args = vec![
+        "-I".into(),
+        "-B".into(),
+        "-c".into(),
+        script.into(),
+        root.into_os_string(),
+        home.into_os_string(),
+        HERMES_STABLE_COMMIT.into(),
+        if crate::commands::portable::portable_context().is_some() {
+            "--portable".into()
+        } else {
+            "--".into()
+        },
+    ];
+    Ok((python, args))
+}
+
+fn hermes_command() -> Result<Command, String> {
+    let (program, args) = hermes_launch_spec()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    Ok(command)
+}
+
+fn hermes_tokio_command() -> Result<tokio::process::Command, String> {
+    Ok(tokio::process::Command::from(hermes_command()?))
+}
+
 fn command_program(program: &str) -> Result<PathBuf, String> {
     if program == "hermes" {
         hermes_program_for_spawn()
@@ -1246,6 +1434,19 @@ fn hermes_enhanced_path() -> String {
     let mut extra: Vec<String> = vec![];
 
     // 官方源码安装的 venv 必须优先于旧 uv-tool 路径，迁移升级后立即生效。
+    if hermes_pm_environment_at(&hermes_home(), &hermes_source_dir()).is_err() {
+        return hermes_source_dir()
+            .join(".clawpanel-invalid-pm")
+            .to_string_lossy()
+            .to_string();
+    }
+    extra.push(
+        hermes_source_dir()
+            .join(".hermes")
+            .join("bin")
+            .to_string_lossy()
+            .to_string(),
+    );
     extra.push(hermes_source_venv_bin_dir().to_string_lossy().to_string());
     extra.push(hermes_home().join("bin").to_string_lossy().to_string());
     let managed_node = hermes_home().join("node");
@@ -1331,7 +1532,11 @@ fn hermes_enhanced_path() -> String {
 /// 执行命令并获取 stdout（静默，无窗口）
 fn run_silent(program: &str, args: &[&str]) -> Result<String, String> {
     let enhanced = hermes_enhanced_path();
-    let mut cmd = Command::new(command_program(program)?);
+    let mut cmd = if program == "hermes" {
+        hermes_command()?
+    } else {
+        Command::new(command_program(program)?)
+    };
     cmd.args(args);
     apply_hermes_runtime_env(&mut cmd, &enhanced);
     #[cfg(target_os = "windows")]
@@ -1347,7 +1552,11 @@ fn run_silent(program: &str, args: &[&str]) -> Result<String, String> {
 
 /// 在指定路径上执行命令
 fn run_at_path(program: &str, args: &[&str], path: &str) -> Result<String, String> {
-    let mut cmd = Command::new(command_program(program)?);
+    let mut cmd = if program == "hermes" {
+        hermes_command()?
+    } else {
+        Command::new(command_program(program)?)
+    };
     cmd.args(args);
     apply_hermes_runtime_env(&mut cmd, path);
     #[cfg(target_os = "windows")]
@@ -1361,7 +1570,38 @@ fn run_at_path(program: &str, args: &[&str], path: &str) -> Result<String, Strin
 }
 
 fn hermes_version_at_path(path: &str) -> Result<String, String> {
-    // 优先官方快速入口，避免状态轮询触发完整 CLI 启动。
+    if HERMES_STABLE_VERSION == "0.22.2" {
+        if let Some(environment) = hermes_pm_environment_at(&hermes_home(), &hermes_source_dir())? {
+            let python = if cfg!(target_os = "windows") {
+                environment.join("Scripts").join("python.exe")
+            } else {
+                environment.join("bin").join("python3")
+            };
+            let script = HERMES_PM_RUNTIME_SOURCE
+                .split_once("export const HERMES_PRIVATE_METADATA_SCRIPT = String.raw`")
+                .and_then(|(_, source)| source.split_once('`'))
+                .map(|(script, _)| script)
+                .ok_or("Hermes 共享 metadata 脚本缺失")?;
+            return run_at_path(
+                &python.to_string_lossy(),
+                &[
+                    "-I",
+                    "-B",
+                    "-c",
+                    script,
+                    &hermes_source_dir().to_string_lossy(),
+                    HERMES_STABLE_COMMIT,
+                    if crate::commands::portable::portable_context().is_some() {
+                        "--portable"
+                    } else {
+                        "--managed"
+                    },
+                ],
+                path,
+            );
+        }
+    }
+    // 新版 metadata 入口不运行 source completion；旧子命令只作失败回退。
     run_at_path("hermes", &["--version"], path)
         .or_else(|_| run_at_path("hermes", &["version"], path))
 }
@@ -1550,6 +1790,7 @@ fn current_platform_key() -> &'static str {
 
 #[tauri::command]
 pub fn check_hermes() -> Result<Value, String> {
+    hermes_pm_environment_at(&hermes_home(), &hermes_source_dir())?;
     let enhanced = hermes_enhanced_path();
     let mut result = serde_json::Map::new();
     let home = hermes_home();
@@ -1810,27 +2051,73 @@ fn hermes_dashboard_port() -> u16 {
     9119 // Hermes Dashboard 默认端口
 }
 
-fn hermes_dashboard_cli_status(port: u16) -> Option<(bool, String)> {
+#[cfg(test)]
+#[test]
+fn dashboard_status_probe_uses_actual_official_negative_output() {
+    for output in [
+        "No hermes dashboard or serve processes running.",
+        "No hermes dashboard processes running for this profile.",
+        "No dashboard processes running.",
+        "Dashboard is not running.",
+    ] {
+        assert_eq!(parse_hermes_dashboard_status(output), Some(false));
+    }
+    for output in [
+        "1 hermes dashboard/serve process(es) running:\nPID 123 [dashboard]",
+        "Dashboard running at http://127.0.0.1:9119",
+        "Listening on http://127.0.0.1:9119",
+    ] {
+        assert_eq!(parse_hermes_dashboard_status(output), Some(true));
+    }
+    for output in [
+        "Usage: manage running dashboards http://docs.example",
+        "http://127.0.0.1:9119",
+        "Default port: 9119",
+        "{\"running\":false}",
+    ] {
+        assert_eq!(parse_hermes_dashboard_status(output), None);
+    }
+}
+
+fn parse_hermes_dashboard_status(output: &str) -> Option<bool> {
+    let lower = output.trim().to_ascii_lowercase();
+    // 官方无进程信息也以 exit 0 返回，文案中的 running 不构成正向状态。
+    if lower.lines().any(|line| {
+        line.trim()
+            .strip_prefix("no ")
+            .map(|tail| tail.strip_prefix("hermes ").unwrap_or(tail))
+            .is_some_and(|tail| tail.starts_with("dashboard") || tail.starts_with("serve"))
+    }) || lower.contains("not running")
+        || lower.contains("stopped")
+        || lower.contains("inactive")
+    {
+        return Some(false);
+    }
+    for line in lower.lines().map(str::trim) {
+        if let Some((count, _)) = line.split_once(" hermes dashboard/serve process(es) running:") {
+            if let Ok(count) = count.parse::<u32>() {
+                return Some(count > 0);
+            }
+        }
+        if let Some(tail) = line.strip_prefix("dashboard ") {
+            let tail = tail.strip_prefix("is ").unwrap_or(tail);
+            if tail == "running" || tail.starts_with("running ") || tail.starts_with("running:") {
+                return Some(true);
+            }
+        }
+        if line.starts_with("listening on http://") || line.starts_with("listening on https://") {
+            return Some(true);
+        }
+    }
+    // 帮助文案、URL 或端口不作已运行证明，未知结果交给 TCP。
+    None
+}
+
+fn hermes_dashboard_cli_status(_port: u16) -> Option<(bool, String)> {
     let output = run_silent("hermes", &["dashboard", "--status"])
         .or_else(|_| run_silent("hermes", &["dashboard", "status"]))
         .ok()?;
-    let lower = output.to_ascii_lowercase();
-    if lower.contains("not running")
-        || lower.contains("stopped")
-        || lower.contains("inactive")
-        || lower.contains("no dashboard")
-    {
-        return Some((false, output));
-    }
-    if lower.contains("running")
-        || lower.contains("listening")
-        || lower.contains("http://")
-        || lower.contains("https://")
-        || lower.contains(&port.to_string())
-    {
-        return Some((true, output));
-    }
-    None
+    parse_hermes_dashboard_status(&output).map(|running| (running, output))
 }
 
 fn hermes_dashboard_tcp_running(port: u16, timeout_ms: u64) -> bool {
@@ -1938,7 +2225,7 @@ pub async fn hermes_dashboard_start(app: tauri::AppHandle) -> Result<Value, Stri
         .map_err(|e| format!("克隆日志句柄失败: {e}"))?;
 
     let enhanced = hermes_enhanced_path();
-    let mut cmd = std::process::Command::new(hermes_program_for_spawn()?);
+    let mut cmd = hermes_command()?;
     cmd.args(["dashboard", "--no-open"])
         .current_dir(&home)
         .stdin(std::process::Stdio::null())
@@ -2140,18 +2427,19 @@ pub async fn install_hermes(
     }
 }
 
-const HERMES_STABLE_VERSION: &str = "0.21.5";
-const HERMES_STABLE_TAG: &str = "v2026.9.24";
-const HERMES_STABLE_COMMIT: &str = "f97608f178d1ffeca59860195ab7da295f7c8e5f";
+const HERMES_STABLE_VERSION: &str = "0.22.2";
+const HERMES_STABLE_TAG: &str = "v0.22.2";
+const HERMES_STABLE_BRANCH: &str = "release/0.22.2";
+const HERMES_STABLE_COMMIT: &str = "d923a5eb487a17c0a68801bba9ef0f56c81040a8";
 const HERMES_GIT_REPO_URL: &str = "https://github.com/NousResearch/hermes-agent.git";
 const HERMES_INSTALLER_BASE_URL: &str =
-    "https://raw.githubusercontent.com/NousResearch/hermes-agent/f97608f178d1ffeca59860195ab7da295f7c8e5f/scripts";
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/d923a5eb487a17c0a68801bba9ef0f56c81040a8/scripts";
 #[cfg(target_os = "windows")]
 const HERMES_INSTALLER_PS1_SHA256: &str =
-    "0a80dfeb7434229933bac32e73140d10086dff81bd84b156e71be9abc87cddf2";
+    "d7045a813ac5bbaec09ea4b65e5f77e47603ef56ae493414f72a4b3ce01de048";
 #[cfg(not(target_os = "windows"))]
 const HERMES_INSTALLER_SH_SHA256: &str =
-    "2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af";
+    "f4cdb0e20f1aca2c3871a76b962fd4db61510f549cf973759c753ac13349beb5";
 
 // ---------------------------------------------------------------------------
 // Hermes Dashboard compat stubs
@@ -2565,29 +2853,12 @@ fn emit_hermes_stable_version_log(app: &tauri::AppHandle) {
 }
 
 #[cfg(target_os = "windows")]
-const HERMES_INSTALLER_STAGES: &[&str] = &[
-    "uv",
-    "git",
-    "node",
-    "repository",
-    "python",
-    "venv",
-    "dependencies",
-    "node-deps",
-    "config-templates",
-    "platform-sdks",
-    "bootstrap-marker",
-];
+const HERMES_INSTALLER_STAGES: &[&str] =
+    &["repository", "venv", "python-deps", "config", "complete"];
 
 #[cfg(not(target_os = "windows"))]
-const HERMES_INSTALLER_STAGES: &[&str] = &[
-    "repository",
-    "venv",
-    "python-deps",
-    "node-deps",
-    "config",
-    "complete",
-];
+const HERMES_INSTALLER_STAGES: &[&str] =
+    &["repository", "venv", "python-deps", "config", "complete"];
 
 fn hermes_installer_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -2814,10 +3085,9 @@ fn build_hermes_installer_stage_command(
             .arg("-InstallDir")
             .arg(&install_dir)
             .arg("-Branch")
-            .arg(HERMES_STABLE_TAG)
+            .arg(HERMES_STABLE_BRANCH)
             .arg("-Commit")
             .arg(HERMES_STABLE_COMMIT)
-            .arg("-ForceCommit")
             .arg("-SkipSetup")
             .arg("-SkipComputerUse")
             .arg("-NonInteractive")
@@ -2837,10 +3107,9 @@ fn build_hermes_installer_stage_command(
             .arg("--dir")
             .arg(&install_dir)
             .arg("--branch")
-            .arg(HERMES_STABLE_TAG)
+            .arg(HERMES_STABLE_BRANCH)
             .arg("--commit")
             .arg(HERMES_STABLE_COMMIT)
-            .arg("--force-commit")
             .arg("--skip-setup")
             .arg("--skip-computer-use")
             .arg("--non-interactive")
@@ -2865,7 +3134,234 @@ fn build_hermes_installer_stage_command(
     cmd
 }
 
+#[cfg(test)]
+mod hermes_managed_install_platform_tests {
+    use super::*;
+
+    #[test]
+    fn arm64_native_and_x64_emulation_are_blocked_before_bootstrap() {
+        for (process_arch, native_arch, emulated) in [
+            ("aarch64", "ARM64", ""),
+            ("x86_64", "ARM64", ""),
+            ("x86_64", "AMD64", "ARM64"),
+            ("x86", "ARM64", ""),
+        ] {
+            assert!(hermes_managed_install_platform_error(
+                "win32",
+                process_arch,
+                native_arch,
+                emulated,
+                ""
+            )
+            .unwrap()
+            .contains("ARM64"));
+        }
+        assert!(
+            hermes_managed_install_platform_error("win32", "x86_64", "AMD64", "", "").is_none()
+        );
+        assert!(hermes_managed_install_platform_error("win32", "x86_64", "", "", "").is_some());
+        assert!(
+            hermes_managed_install_platform_error("linux", "aarch64", "ARM64", "", "").is_none()
+        );
+        assert!(
+            hermes_managed_install_platform_error("darwin", "aarch64", "ARM64", "", "").is_none()
+        );
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn hermes_managed_install_platform_error(
+    platform: &str,
+    process_arch: &str,
+    native_arch: &str,
+    emulated_native_arch: &str,
+    reported_arch: &str,
+) -> Option<&'static str> {
+    if platform != "win32" {
+        return None;
+    }
+    if [
+        process_arch,
+        native_arch,
+        emulated_native_arch,
+        reported_arch,
+    ]
+    .iter()
+    .any(|value| value.eq_ignore_ascii_case("arm64") || value.eq_ignore_ascii_case("aarch64"))
+    {
+        return Some("Windows ARM64 受管安装已阻断（含 x64 模拟进程）：固定上游可能引导系统 BuildTools/管理员安装，尚无可靠禁止系统 bootstrap 的开关。");
+    }
+    if !native_arch.trim().eq_ignore_ascii_case("AMD64")
+        || !["x64", "x86_64"].contains(&process_arch)
+        || [emulated_native_arch, reported_arch].iter().any(|value| {
+            !value.trim().is_empty()
+                && !["amd64", "x64", "x86_64"].contains(&value.trim().to_ascii_lowercase().as_str())
+        })
+    {
+        return Some("Windows 原生 AMD64 架构未确认或架构信息矛盾，Hermes 受管安装已阻断。");
+    }
+    None
+}
+
+fn ensure_hermes_managed_install_platform() -> Result<(), String> {
+    if HERMES_STABLE_VERSION == "0.22.2" {
+        for (name, expected) in [
+            ("HERMES_RUNTIME_DIR", hermes_home().join("tools")),
+            ("HERMES_INSTALL_ROOT", hermes_source_dir()),
+        ] {
+            if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+                let actual = PathBuf::from(value);
+                if actual.canonicalize().unwrap_or(actual)
+                    != expected.canonicalize().unwrap_or(expected)
+                {
+                    return Err(format!("Hermes private install 拒绝外部 {name} 覆盖"));
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // 固定 HKLM 原生架构只读查询；模拟进程的编译架构不足以决定安装安全性。
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let output = Command::new(PathBuf::from(root).join("System32").join("reg.exe"))
+            .args([
+                "query",
+                r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+                "/v",
+                "PROCESSOR_ARCHITECTURE",
+                "/reg:64",
+            ])
+            .env("PATH", super::enhanced_path())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let native_arch = output
+            .ok()
+            .filter(|value| value.status.success())
+            .and_then(|value| {
+                String::from_utf8_lossy(&value.stdout)
+                    .lines()
+                    .find(|line| line.contains("PROCESSOR_ARCHITECTURE"))
+                    .and_then(|line| line.split_whitespace().last())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        let emulated = std::env::var("PROCESSOR_ARCHITEW6432").unwrap_or_default();
+        let reported = std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default();
+        if let Some(error) = hermes_managed_install_platform_error(
+            "win32",
+            std::env::consts::ARCH,
+            &native_arch,
+            &emulated,
+            &reported,
+        ) {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+// 编译时嵌入 JS 的同一份原始 Python 字面量，避免双端适配器各自漂移。
+const HERMES_PM_RUNTIME_SOURCE: &str = include_str!("../../../scripts/hermes-pm-runtime.js");
+
+fn hermes_private_completion_script() -> Result<&'static str, String> {
+    HERMES_PM_RUNTIME_SOURCE
+        .split_once("export const HERMES_PRIVATE_COMPLETION_SCRIPT = String.raw`")
+        .and_then(|(_, source)| source.split_once('`'))
+        .map(|(script, _)| script)
+        .ok_or_else(|| "Hermes private completion 共享脚本缺失".to_string())
+}
+
+async fn complete_hermes_managed_source(app: &tauri::AppHandle) -> Result<(), String> {
+    if HERMES_STABLE_VERSION != "0.22.2" {
+        return Ok(());
+    }
+    if HERMES_STABLE_COMMIT != "d923a5eb487a17c0a68801bba9ef0f56c81040a8" {
+        return Err("Hermes private completion pin 未审查".to_string());
+    }
+    let source = hermes_source_dir();
+    let environment = hermes_pm_environment_at(&hermes_home(), &source)?
+        .ok_or("Hermes private completion 缺少当前安装的 PM 环境")?;
+    let python = if cfg!(target_os = "windows") {
+        environment.join("Scripts").join("python.exe")
+    } else {
+        environment.join("bin").join("python3")
+    };
+    let mut cmd = tokio::process::Command::new(python);
+    cmd.args(["-I", "-B", "-c", hermes_private_completion_script()?])
+        .arg(&source)
+        .arg(HERMES_STABLE_COMMIT)
+        .current_dir(&source);
+    if crate::commands::portable::portable_context().is_some() {
+        cmd.arg("--portable");
+    }
+    apply_hermes_runtime_env_tokio(&mut cmd, &hermes_enhanced_path());
+    if let Some(mirror) = pypi_mirror_url() {
+        cmd.env("UV_DEFAULT_INDEX", &mirror);
+        cmd.env("PIP_INDEX_URL", mirror);
+    }
+    apply_git_mirror_env(&mut cmd);
+    super::apply_proxy_env_tokio(&mut cmd);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let _ = app.emit(
+        "hermes-install-log",
+        "▶ Hermes 私有 products completion（原始 build/maintenance/stamp）",
+    );
+    let (status, output) = run_install_command_streaming(app, cmd).await?;
+    if !status.success() {
+        return Err(format!(
+            "Hermes 私有 products completion 失败: {}",
+            sanitize_hermes_install_output(&output)
+        ));
+    }
+    let proof = output
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("CLAWPANEL_HERMES_PRIVATE_COMPLETION "))
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .ok_or("Hermes 私有 products completion 缺少可核验的完成回执")?;
+    if proof["commit"].as_str() != Some(HERMES_STABLE_COMMIT)
+        || proof["current"].as_bool() != Some(true)
+        || proof["same"].as_bool() != Some(true)
+        || proof["completed"].as_bool() != Some(true)
+    {
+        return Err("Hermes 私有 products completion 回执未通过验证".to_string());
+    }
+    let (program, mut args) = hermes_launch_spec()?;
+    let mode = if crate::commands::portable::portable_context().is_some() {
+        "--portable-preflight"
+    } else {
+        "--preflight"
+    };
+    *args.last_mut().ok_or("Hermes private preflight 参数缺失")? = mode.into();
+    let mut check = tokio::process::Command::new(program);
+    check
+        .args(args)
+        .args(["profile", "list"])
+        .current_dir(&source);
+    apply_hermes_runtime_env_tokio(&mut check, &hermes_enhanced_path());
+    #[cfg(target_os = "windows")]
+    check.creation_flags(CREATE_NO_WINDOW);
+    let checked = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        check.kill_on_drop(true).output(),
+    )
+    .await
+    .map_err(|_| "Hermes 安装后 private preflight 超时")?
+    .map_err(|error| format!("Hermes 安装后 private preflight: {error}"))?;
+    if !checked.status.success()
+        || !String::from_utf8_lossy(&checked.stderr).contains("CLAWPANEL_HERMES_PRIVATE_PREFLIGHT ")
+    {
+        return Err(format!(
+            "Hermes 安装后 private preflight 失败: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        ));
+    }
+    Ok(())
+}
+
 async fn install_hermes_managed_source(app: &tauri::AppHandle) -> Result<(), String> {
+    ensure_hermes_managed_install_platform()?;
     ensure_hermes_portable_dirs()?;
     ensure_portable_git(app).await?;
     emit_hermes_stable_version_log(app);
@@ -2917,6 +3413,7 @@ async fn install_hermes_managed_source(app: &tauri::AppHandle) -> Result<(), Str
             revision.trim()
         ));
     }
+    complete_hermes_managed_source(app).await?;
     Ok(())
 }
 
@@ -13935,20 +14432,40 @@ pub async fn hermes_read_config_full() -> Result<Value, String> {
 //   - hermes_lazy_deps_ensure(feature) — 主动预装
 // ---------------------------------------------------------------------------
 
-/// 找到 Hermes venv 的 Python 解释器路径
-///
-/// 优先级：
-/// 1. 环境变量 `HERMES_PYTHON` — 适配自定义 venv（brew / 容器 / 任何非默认布局）
-/// 2. `<HERMES_HOME>/hermes-agent/venv/{Scripts,bin}/python` — 0.20.5+ 官方源码安装
-/// 3. `~/.hermes-venv/{Scripts,bin}/python` — 旧 `uv pip install` 备选安装路径
-/// 4. `<uv tool dir>/hermes-agent/{Scripts,bin}/python` — 旧 `uv tool install` 路径
-fn hermes_venv_python() -> Option<PathBuf> {
-    // 1. HERMES_PYTHON 环境变量优先
-    if let Ok(custom) = std::env::var("HERMES_PYTHON") {
-        let p = PathBuf::from(custom);
-        if p.exists() {
-            return Some(p);
+/// 显式解释器先于自动发现；未指定时仍拒绝损坏或越界的 PM 环境记录。
+fn hermes_primary_venv_python_at(
+    home: &Path,
+    source: &Path,
+    custom: Option<&std::ffi::OsStr>,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(custom) = custom {
+        let python = PathBuf::from(custom);
+        if python.is_file() {
+            return Ok(Some(python));
         }
+    }
+    if let Some(environment) = hermes_pm_environment_at(home, source)? {
+        let python = if cfg!(windows) {
+            environment.join("Scripts").join("python.exe")
+        } else {
+            environment.join("bin").join("python")
+        };
+        if !python.is_file() {
+            return Err("Hermes PM 环境缺少 Python 解释器，请修复当前安装".into());
+        }
+        return Ok(Some(python));
+    }
+    Ok(None)
+}
+
+/// 找到 Hermes venv 的 Python 解释器路径。
+/// 优先级：显式 HERMES_PYTHON、当前 checkout 的 PM 环境、源码 venv、旧 venv、uv tool。
+fn hermes_venv_python() -> Option<PathBuf> {
+    let custom = std::env::var_os("HERMES_PYTHON");
+    match hermes_primary_venv_python_at(&hermes_home(), &hermes_source_dir(), custom.as_deref()) {
+        Ok(Some(python)) => return Some(python),
+        Err(_) => return None,
+        Ok(None) => {}
     }
     // 2. 0.20.5+ 官方 source installer venv
     let source_python = if cfg!(target_os = "windows") {
@@ -13981,7 +14498,20 @@ async fn run_venv_python_json(script: &str) -> Result<Value, String> {
     })?;
 
     let mut cmd = tokio::process::Command::new(&py);
-    cmd.arg("-c").arg(script);
+    let (_, mut prefix) = hermes_launch_spec()?;
+    if prefix.is_empty() {
+        cmd.arg("-c").arg(script);
+    } else {
+        *prefix.last_mut().ok_or("Hermes private Python 参数缺失")? =
+            if crate::commands::portable::portable_context().is_some() {
+                "--portable-python-json"
+            } else {
+                "--python-json"
+            }
+            .into();
+        cmd.args(prefix).arg(script);
+        apply_hermes_runtime_env_tokio(&mut cmd, &hermes_enhanced_path());
+    }
     cmd.env("PYTHONIOENCODING", "utf-8");
     cmd.env("PATH", super::enhanced_path());
 
@@ -14410,7 +14940,7 @@ pub async fn hermes_gateway_action(
                     .try_clone()
                     .map_err(|e| format!("克隆日志句柄失败: {e}"))?;
 
-                let mut cmd = std::process::Command::new(hermes_program_for_spawn()?);
+                let mut cmd = hermes_command()?;
                 cmd.args(["gateway", "run"])
                     .current_dir(&home)
                     .stdin(std::process::Stdio::null())
@@ -14495,7 +15025,7 @@ pub async fn hermes_gateway_action(
                 // 先精准杀掉之前我们 spawn 的进程
                 kill_gateway_pid();
 
-                let mut cmd = std::process::Command::new(hermes_program_for_spawn()?);
+                let mut cmd = hermes_command()?;
                 cmd.args(["gateway", "run"])
                     .current_dir(&home)
                     .stdin(std::process::Stdio::null())
@@ -14547,8 +15077,7 @@ pub async fn hermes_gateway_action(
                     }
                     Err(e) => {
                         // fallback: hermes gateway start
-                        let mut fallback =
-                            tokio::process::Command::new(hermes_program_for_spawn()?);
+                        let mut fallback = hermes_tokio_command()?;
                         fallback.args(["gateway", "start"]);
                         apply_hermes_runtime_env_tokio(&mut fallback, &enhanced);
                         let out = fallback
@@ -14582,7 +15111,7 @@ pub async fn hermes_gateway_action(
             let killed = kill_gateway_pid();
 
             // 2. 尝试 hermes gateway stop（作为补充）
-            let mut cmd = tokio::process::Command::new(hermes_program_for_spawn()?);
+            let mut cmd = hermes_tokio_command()?;
             cmd.args(["gateway", "stop"]);
             apply_hermes_runtime_env_tokio(&mut cmd, &enhanced);
             #[cfg(target_os = "windows")]
@@ -14609,7 +15138,7 @@ pub async fn hermes_gateway_action(
             }
         }
         "status" => {
-            let mut cmd = tokio::process::Command::new(hermes_program_for_spawn()?);
+            let mut cmd = hermes_tokio_command()?;
             cmd.args(["gateway", "status"]);
             apply_hermes_runtime_env_tokio(&mut cmd, &enhanced);
             #[cfg(target_os = "windows")]
@@ -14619,7 +15148,7 @@ pub async fn hermes_gateway_action(
             Ok(stdout)
         }
         "install" => {
-            let mut cmd = tokio::process::Command::new(hermes_program_for_spawn()?);
+            let mut cmd = hermes_tokio_command()?;
             cmd.args(["gateway", "install"]);
             apply_hermes_runtime_env_tokio(&mut cmd, &enhanced);
             #[cfg(target_os = "windows")]
@@ -14632,7 +15161,7 @@ pub async fn hermes_gateway_action(
             }
         }
         "uninstall" => {
-            let mut cmd = tokio::process::Command::new(hermes_program_for_spawn()?);
+            let mut cmd = hermes_tokio_command()?;
             cmd.args(["gateway", "uninstall"]);
             apply_hermes_runtime_env_tokio(&mut cmd, &enhanced);
             #[cfg(target_os = "windows")]
@@ -16616,6 +17145,14 @@ fn parse_hermes_profile_list_output(output: &str) -> Value {
 pub async fn hermes_profiles_list() -> Result<Value, String> {
     let output = match run_silent("hermes", &["profile", "list"]) {
         Ok(s) => s,
+        Err(error)
+            if hermes_source_dir()
+                .join("pm")
+                .join("environments.py")
+                .is_file() =>
+        {
+            return Err(error)
+        }
         Err(_) => return Ok(serde_json::json!({ "active": "default", "profiles": [] })),
     };
     Ok(parse_hermes_profile_list_output(&output))
@@ -18457,7 +18994,7 @@ pub async fn hermes_multi_gateway_start(
         .try_clone()
         .map_err(|e| format!("克隆日志句柄失败: {e}"))?;
 
-    let mut cmd = std::process::Command::new(hermes_program_for_spawn()?);
+    let mut cmd = hermes_command()?;
     cmd.args(["--profile", &profile, "gateway", "run"])
         .current_dir(&home)
         .stdin(std::process::Stdio::null())

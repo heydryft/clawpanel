@@ -6,10 +6,20 @@ const web = fs.readFileSync(new URL('../scripts/dev-api.js', import.meta.url), '
 const rust = fs.readFileSync(new URL('../src-tauri/src/commands/hermes.rs', import.meta.url), 'utf8')
 const body = web.match(/function runHermesVersionSilent\(\) \{[^]*?\n\}/)?.[0]
 
-function probe(run) {
+function probe(run, metadata = () => null) {
   assert.ok(body, '生产版本探针必须存在')
-  return new Function('runHermesSilent', `${body}\nreturn runHermesVersionSilent()`)(run)
+  return new Function('runHermesSilent', 'runHermesManagedMetadataSilent', `${body}\nreturn runHermesVersionSilent()`)(run, metadata)
 }
+
+test('受管 metadata 成功时不进入普通 CLI，旧用例默认注入 null', () => {
+  const expected = { ok: true, stdout: 'Hermes Agent v0.22.2' }
+  assert.equal(probe(() => { throw new Error('metadata 成功后不应执行普通 CLI') }, () => expected), expected)
+})
+
+test('受管 metadata 失败保持原错误，不 fallback 触发隐式维护', () => {
+  const expected = { ok: false, stderr: 'PM currency false' }
+  assert.equal(probe(() => { throw new Error('metadata 失败后不应 fallback') }, () => expected), expected)
+})
 
 test('已有 --version 的内核只调用快速入口，不先进入完整 CLI 启动', () => {
   const calls = []

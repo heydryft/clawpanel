@@ -215,6 +215,6 @@ export const KERNEL_TARGET = {
     chinese: '2026.7.1-2-zh.1',
   },
   hermes: {
-    default: '0.21.5',
+    default: '0.22.2',
   },
 }

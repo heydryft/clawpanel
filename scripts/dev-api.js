@@ -4,6 +4,7 @@
  * 使浏览器模式能真正管理 OpenClaw 实例
  */
 import fs from 'fs'
+import { resolveHermesPmEnvironment, hermesManagedInstallPlatformError, HERMES_PRIVATE_COMPLETION_SCRIPT, HERMES_PRIVATE_METADATA_SCRIPT, HERMES_PRIVATE_LAUNCH_SCRIPT } from './hermes-pm-runtime.js'
 import { sanitizeOpenCodeStorage } from './opencode-proxy.js'
 import path from 'path'
 import os from 'os'
@@ -122,15 +123,17 @@ export function readFileExcerptSince(filePath, offset = 0, maxBytes = 8192) {
 // ---------------------------------------------------------------------------
 const HERMES_HOME = path.join(homedir(), '.hermes')
 const HERMES_DEFAULT_PORT = 8642
-const HERMES_STABLE_VERSION = '0.21.5'
-const HERMES_STABLE_TAG = 'v2026.9.24'
-const HERMES_STABLE_COMMIT = 'f97608f178d1ffeca59860195ab7da295f7c8e5f'
+const HERMES_STABLE_VERSION = '0.22.2'
+const HERMES_STABLE_TAG = 'v0.22.2'
+// 新安装器对 origin/<branch> 做祖先校验；发行 tag 和固定 commit 仍独立保留。
+const HERMES_STABLE_BRANCH = 'release/0.22.2'
+const HERMES_STABLE_COMMIT = 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
 const HERMES_REPO_URL = 'https://github.com/NousResearch/hermes-agent.git'
 const HERMES_GIT_URL = `git+${HERMES_REPO_URL}@${HERMES_STABLE_TAG}`
 const HERMES_INSTALLER_BASE_URL = `https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_STABLE_COMMIT}/scripts`
 const HERMES_INSTALLER_SHA256 = {
-  windows: '0a80dfeb7434229933bac32e73140d10086dff81bd84b156e71be9abc87cddf2',
-  posix: '2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af',
+  windows: 'd7045a813ac5bbaec09ea4b65e5f77e47603ef56ae493414f72a4b3ce01de048',
+  posix: 'f4cdb0e20f1aca2c3871a76b962fd4db61510f549cf973759c753ac13349beb5',
 }
 const HERMES_DASHBOARD_FALLBACK_INDEX_HTML = `<!doctype html>
 <html lang="en">
@@ -214,7 +217,8 @@ function hermesSourceDir(home = hermesHome()) {
 }
 
 function hermesSourceVenvBinDir(home = hermesHome()) {
-  return path.join(hermesSourceDir(home), 'venv', isWindows ? 'Scripts' : 'bin')
+  const environment = resolveHermesPmEnvironment(home, hermesSourceDir(home)) || path.join(hermesSourceDir(home), 'venv')
+  return path.join(environment, isWindows ? 'Scripts' : 'bin')
 }
 
 const HERMES_PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
@@ -347,7 +351,7 @@ function hermesEnhancedPath() {
   const home = homedir()
   // 0.20.5 起上游不再支持从 Git 构建 wheel/sdist，ClawPanel 改用官方
   // source installer。把源码 venv 放在旧 uv-tool 路径前，升级迁移后立刻生效。
-  const extra = [hermesSourceVenvBinDir(), path.join(hermesHome(), 'bin'), uvBinDir()]
+  const extra = [path.join(hermesSourceDir(), '.hermes', 'bin'), hermesSourceVenvBinDir(), path.join(hermesHome(), 'bin'), uvBinDir()]
   // 新安装器把 Node 放在 Hermes Home 内，运行工具时也优先使用受管版本。
   extra.push(path.join(hermesHome(), 'node', ...(isWindows ? [] : ['bin'])))
   if (isWindows) {
@@ -432,9 +436,26 @@ function isLoopbackGatewayUrl(url) {
   }
 }
 
+function hermesLaunchSpec(args) {
+  const home = hermesHome(), root = hermesSourceDir(home)
+  // 无 PM 布局的 0.21.5 继续走原 launcher；有新布局却缺事实则明确失败。
+  const environment = resolveHermesPmEnvironment(home, root)
+  if (!environment && !fs.existsSync(path.join(root, 'pm', 'environments.py'))) return { program: 'hermes', args }
+  if (!environment) throw new Error('Hermes private preflight 缺少当前 checkout 的 PM 环境')
+  if (HERMES_STABLE_VERSION !== '0.22.2' || HERMES_STABLE_COMMIT !== 'd923a5eb487a17c0a68801bba9ef0f56c81040a8') throw new Error('Hermes private preflight pin 未审查')
+  const python = path.join(environment, isWindows ? 'Scripts' : 'bin', isWindows ? 'python.exe' : 'python3')
+  return { program: python, args: ['-I', '-B', '-c', HERMES_PRIVATE_LAUNCH_SCRIPT, root, home, HERMES_STABLE_COMMIT, '--', ...args] }
+}
+
+function spawnHermes(args, options) {
+  const spec = hermesLaunchSpec(args)
+  return spawn(spec.program, spec.args, options)
+}
+
 function runHermesSilent(program, args) {
   try {
-    const result = spawnSync(program, args, {
+    const spec = program === 'hermes' ? hermesLaunchSpec(args) : { program, args }
+    const result = spawnSync(spec.program, spec.args, {
       env: buildHermesRuntimeEnv(),
       timeout: 15000,
       windowsHide: true,
@@ -448,10 +469,37 @@ function runHermesSilent(program, args) {
   }
 }
 
-function runHermesVersionSilent() {
-  // 官方快速入口在完整 CLI 启动前返回；仅旧内核不支持时回退子命令。
-  const modern = runHermesSilent('hermes', ['--version'])
-  return modern.ok ? modern : runHermesSilent('hermes', ['version'])
+function runHermesManagedMetadataSilent() {
+  if (HERMES_STABLE_VERSION !== '0.22.2') return null
+  try {
+    const root = hermesSourceDir()
+    const environment = resolveHermesPmEnvironment(hermesHome(), root)
+    if (!environment) return null
+    const python = path.join(environment, isWindows ? 'Scripts' : 'bin', isWindows ? 'python.exe' : 'python3')
+    const result = spawnSync(python, ['-I', '-B', '-c', HERMES_PRIVATE_METADATA_SCRIPT, root, HERMES_STABLE_COMMIT], {
+      env: buildHermesRuntimeEnv(), timeout: 15000, windowsHide: true, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return result.status === 0 ? { ok: true, stdout: String(result.stdout || '').trim() } : { ok: false, stderr: String(result.stderr || result.error?.message || `exit ${result.status}`).trim() }
+  } catch (error) { return { ok: false, stderr: String(error?.message || error) } }
+}
+
+export function runHermesVersionSilent() {
+  const managed = runHermesManagedMetadataSilent()
+  if (managed !== null) return managed
+  // 新版 metadata 入口不运行 source completion；旧子命令只作失败回退。
+  const metadata = runHermesSilent('hermes', ['--version'])
+  return metadata.ok ? metadata : runHermesSilent('hermes', ['version'])
+}
+
+function parseHermesDashboardStatus(output) {
+  const lower = String(output || '').trim().toLowerCase()
+  // 官方信息命令在无进程时仍 exit 0，且文案自身也包含 running。
+  if (/^no (?:hermes )?(?:dashboard|serve)\b/m.test(lower) || /\bnot running\b|\bstopped\b|\binactive\b/.test(lower)) return false
+  const count = lower.match(/^(\d+) hermes dashboard\/serve process\(es\) running:/m)
+  if (count) return Number(count[1]) > 0
+  if (/^dashboard (?:is )?running(?:$|[ :])/m.test(lower) || /^listening on https?:\/\//m.test(lower)) return true
+  // URL、默认端口或帮助文字不是运行证明；未知输出由实际 TCP 探测兜底。
+  return null
 }
 
 function sanitizeHermesInstallOutput(text = '') {
@@ -504,14 +552,13 @@ function hermesInstallerPlan(home = hermesHome()) {
       sourcePath: 'scripts/install.ps1',
       scriptPath: path.join(cacheDir, `install-${HERMES_STABLE_TAG}.ps1`),
       program: 'powershell.exe',
-      // 0.21.5 的受管 Python 位于 checkout 内，repository 必须先于 python。
-      // 不运行全局 PATH 写入、系统软件安装或交互配置阶段。
-      stages: ['uv', 'git', 'node', 'repository', 'python', 'venv', 'dependencies', 'node-deps', 'config-templates', 'platform-sdks', 'bootstrap-marker'],
+      // 0.22.2 由固定 commit 内的 PM 管理依赖；跳过修改用户 PATH 的 products 和系统 prerequisites。
+      stages: ['repository', 'venv', 'python-deps', 'config', 'complete'],
       argsForStage: (scriptPath, stage) => [
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,
         '-HermesHome', home, '-InstallDir', installDir,
-        '-Branch', HERMES_STABLE_TAG,
-        '-Commit', HERMES_STABLE_COMMIT, '-ForceCommit',
+        '-Branch', HERMES_STABLE_BRANCH,
+        '-Commit', HERMES_STABLE_COMMIT,
         '-SkipSetup', '-SkipComputerUse', '-NonInteractive', '-Json', '-Stage', stage,
       ],
     }
@@ -522,12 +569,12 @@ function hermesInstallerPlan(home = hermesHome()) {
     sourcePath: 'scripts/install.sh',
     scriptPath: path.join(cacheDir, `install-${HERMES_STABLE_TAG}.sh`),
     program: 'bash',
-    stages: ['repository', 'venv', 'python-deps', 'node-deps', 'config', 'complete'],
+    stages: ['repository', 'venv', 'python-deps', 'config', 'complete'],
     argsForStage: (scriptPath, stage) => [
       scriptPath,
       '--hermes-home', home, '--dir', installDir,
-      '--branch', HERMES_STABLE_TAG,
-      '--commit', HERMES_STABLE_COMMIT, '--force-commit',
+      '--branch', HERMES_STABLE_BRANCH,
+      '--commit', HERMES_STABLE_COMMIT,
       '--skip-setup', '--skip-computer-use', '--non-interactive', '--json', '--stage', stage,
     ],
   }
@@ -611,7 +658,53 @@ async function normalizeHermesLineEndingOnlyChanges(sourceDir, env) {
   return restore.status === 0
 }
 
+async function completeHermesManagedSource(env) {
+  // 旧版本保留原安装协议；未来 pin 变更必须重新审查私有 completion 接口。
+  if (HERMES_STABLE_VERSION !== '0.22.2') return
+  if (HERMES_STABLE_COMMIT !== 'd923a5eb487a17c0a68801bba9ef0f56c81040a8') throw new Error('Hermes private completion pin 未审查')
+  const root = hermesSourceDir()
+  const environment = resolveHermesPmEnvironment(hermesHome(), root)
+  if (!environment) throw new Error('Hermes private completion 缺少当前安装的 PM 环境')
+  const python = path.join(environment, isWindows ? 'Scripts' : 'bin', isWindows ? 'python.exe' : 'python3')
+  const result = await runHermesInstallCommand(python, ['-I', '-B', '-c', HERMES_PRIVATE_COMPLETION_SCRIPT, root, HERMES_STABLE_COMMIT], {
+    env, cwd: root, timeout: 20 * 60 * 1000, windowsHide: true,
+  })
+  if (result.status !== 0) throw new Error(`Hermes 私有 products completion 失败: ${sanitizeHermesInstallOutput([result.stderr, result.stdout].filter(Boolean).join('\n')) || `exit ${result.status}`}`)
+  const prefix = 'CLAWPANEL_HERMES_PRIVATE_COMPLETION '
+  const receipt = String(result.stdout || '').split(/\r?\n/).findLast(line => line.startsWith(prefix))
+  let proof
+  try { proof = JSON.parse(receipt?.slice(prefix.length) || '') } catch {}
+  if (proof?.commit !== HERMES_STABLE_COMMIT || proof?.current !== true || proof?.same !== true || proof?.completed !== true) throw new Error('Hermes 私有 products completion 缺少可核验的完成回执')
+  const checked = await runHermesInstallCommand(python, ['-I', '-B', '-c', HERMES_PRIVATE_LAUNCH_SCRIPT, root, hermesHome(), HERMES_STABLE_COMMIT, '--preflight', 'profile', 'list'], {
+    env, cwd: root, timeout: 15000, windowsHide: true,
+  })
+  if (checked.status !== 0 || !String(checked.stderr || '').includes('CLAWPANEL_HERMES_PRIVATE_PREFLIGHT ')) throw new Error(`Hermes 安装后 private preflight 失败: ${sanitizeHermesInstallOutput(checked.stderr || checked.stdout || `exit ${checked.status}`)}`)
+}
+
+function assertHermesManagedInstallPlatform() {
+  if (HERMES_STABLE_VERSION === '0.22.2') {
+    for (const [name, expected] of [['HERMES_RUNTIME_DIR', path.join(hermesHome(), 'tools')], ['HERMES_INSTALL_ROOT', hermesSourceDir()]]) {
+      if (process.env[name] && path.resolve(process.env[name]).toLowerCase() !== path.resolve(expected).toLowerCase()) throw new Error(`Hermes private install 拒绝外部 ${name} 覆盖`)
+    }
+  }
+  if (process.platform !== 'win32') return
+  // 查询原生 OS 的只读注册表值，避免 x64 模拟进程被误判为原生 x64。
+  const reg = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'reg.exe')
+  const probe = spawnSync(reg, ['query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment', '/v', 'PROCESSOR_ARCHITECTURE', '/reg:64'], {
+    encoding: 'utf8', timeout: 5000, windowsHide: true,
+    env: { ...process.env, PATH: independentRuntimePath() },
+  })
+  const nativeArch = probe.status === 0 ? String(probe.stdout || '').match(/PROCESSOR_ARCHITECTURE\s+REG_SZ\s+(\S+)/i)?.[1] || '' : ''
+  const error = hermesManagedInstallPlatformError({
+    platform: process.platform, processArch: process.arch, nativeArch,
+    emulatedNativeArch: process.env.PROCESSOR_ARCHITEW6432,
+    reportedArch: process.env.PROCESSOR_ARCHITECTURE,
+  })
+  if (error) throw new Error(error)
+}
+
 export async function installHermesManagedSource(config = readPanelConfig()) {
+  assertHermesManagedInstallPlatform()
   const plan = hermesInstallerPlan()
   const env = buildHermesInstallEnv(config)
   const scriptPath = await ensureHermesInstallerScript(plan, env)
@@ -636,6 +729,7 @@ export async function installHermesManagedSource(config = readPanelConfig()) {
   if (revision.status !== 0 || String(revision.stdout || '').trim() !== HERMES_STABLE_COMMIT) {
     throw new Error(`Hermes 安装版本校验失败：期望 ${HERMES_STABLE_COMMIT}，实际 ${String(revision.stdout || '').trim() || 'unknown'}`)
   }
+  await completeHermesManagedSource(env)
   return hermesSourceDir()
 }
 
@@ -17167,7 +17261,7 @@ const handlers = {
         }
         const logPath = path.join(home, 'gateway-run.log')
         const logFd = fs.openSync(logPath, 'a')
-        const child = spawn('hermes', ['gateway', 'run'], {
+        const child = spawnHermes(['gateway', 'run'], {
           cwd: home, env: envVars, stdio: ['ignore', logFd, logFd],
           detached: true, windowsHide: true,
         })
@@ -18841,20 +18935,12 @@ const handlers = {
   },
 
   _hermesDashboardCliStatus(port) {
-    const attempts = [
-      runHermesSilent('hermes', ['dashboard', '--status']),
-      runHermesSilent('hermes', ['dashboard', 'status']),
-    ]
-    for (const result of attempts) {
+    for (const args of [['dashboard', '--status'], ['dashboard', 'status']]) {
+      const result = runHermesSilent('hermes', args)
       if (!result.ok) continue
       const output = result.stdout || ''
-      const lower = output.toLowerCase()
-      if (lower.includes('not running') || lower.includes('stopped') || lower.includes('inactive') || lower.includes('no dashboard')) {
-        return { running: false, output }
-      }
-      if (lower.includes('running') || lower.includes('listening') || lower.includes('http://') || lower.includes('https://') || lower.includes(String(port))) {
-        return { running: true, output }
-      }
+      const running = parseHermesDashboardStatus(output)
+      return running === null ? null : { running, output }
     }
     return null
   },
@@ -18886,7 +18972,7 @@ const handlers = {
       throw new Error(`创建日志文件失败: ${e.message || e}`)
     }
     // 注入 .env
-    const envVars = { ...process.env, PATH: hermesEnhancedPath() }
+    const envVars = buildHermesRuntimeEnv()
     envVars.HERMES_WEB_DIST = ensureHermesDashboardFallbackDist(home)
     const envPath = path.join(home, '.env')
     if (fs.existsSync(envPath)) {
@@ -18897,7 +18983,7 @@ const handlers = {
         if (eq > 0) envVars[t.slice(0, eq).trim()] = t.slice(eq + 1).trim()
       }
     }
-    const child = spawn('hermes', ['dashboard', '--no-open'], {
+    const child = spawnHermes(['dashboard', '--no-open'], {
       cwd: home,
       env: envVars,
       stdio: ['ignore', out, err],
@@ -19323,6 +19409,7 @@ const handlers = {
 
   hermes_profiles_list() {
     const r = runHermesSilent('hermes', ['profile', 'list'])
+    if (!r.ok && fs.existsSync(path.join(hermesSourceDir(), 'pm', 'environments.py'))) throw new Error(`Hermes private profile preflight 失败: ${r.stderr || 'unknown error'}`)
     if (!r.ok) return { active: 'default', profiles: [] }
     return parseHermesProfileListOutput(r.stdout)
   },
