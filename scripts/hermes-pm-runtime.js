@@ -240,6 +240,9 @@ HASHES = {
     'hermes_cli/web_server_gateway.py': 'fb690737befc0e7a87f96d9f2b80da4bbbfe08fae210b0c7940d098b55e9a406',
     'hermes_cli/web_routers/profiles.py': '42be93f968600f1763a069eecb35fdece9e89d92944ebc0b29f7980632fbc970',
     'hermes_cli/profiles.py': 'f65320d57dfe6bd670c139b5b2c394eb6150cf67b9536b8a82e95f0ea0180f14',
+    'hermes_cli/gateway.py': 'a6ca31202bc461a145f9e6df3b80daed2ea435599cf176ac86e9b98f118ff899',
+    'hermes_cli/gateway_windows.py': 'cc1b0b9668e2a7c28fcf79ab07c987e8d314e2b81fc48d144b151e04ec140765',
+    'hermes_cli/profiles_service_cleanup.py': 'cdef06affb95f06cb9ce57989b5defaa2362555bc201354bcc48d45d33941110',
     'hermes_cli/_launchers.py': '9cf612547558a28a7840544a44c5f5ab866ee527a05f96000aefdf51cd7fcbcd',
     'hermes_cli/_install_repair.py': '66eeac124f1519d8d343fa390a734ce03fb6fdd0deebbb60dcd2c7bd70c3721a',
     'hermes_cli/update_cmd_maint.py': '8943b8b260577cf9fec242e2ab4668004475cfd5fce5a0986c272fd6114e927f',
@@ -404,6 +407,134 @@ def private_boot(root):
             post.BOOT_HOME_STEPS = tuple(step for step in post.HOME_STEPS if step[0] != 'sync_skills')
 
 
+WINDOWS_TASK_QUERY = r"""
+$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+function TaskHResult($errorObject) {
+    $e=$errorObject.Exception
+    while($null -ne $e) {
+        if($e -is [Runtime.InteropServices.COMException]) { return ('0x{0:x8}' -f ([long]$e.HResult -band 4294967295)) }
+        $e=$e.InnerException
+    }
+    return $null
+}
+try {
+    $service=New-Object -ComObject Schedule.Service
+    $service.Connect()
+    $folder=$service.GetFolder('\')
+    try {
+        $task=$folder.GetTask($env:CLAWPANEL_HERMES_TASK_QUERY_NAME)
+        if($null -eq $task) { @{state='unknown';hresult=$null}|ConvertTo-Json -Compress }
+        else { @{state='exists';hresult=$null}|ConvertTo-Json -Compress }
+    } catch {
+        $hr=TaskHResult $_
+        if($hr -ceq '0x80070002') { @{state='missing';hresult=$hr}|ConvertTo-Json -Compress }
+        else { @{state='unknown';hresult=$hr}|ConvertTo-Json -Compress }
+    }
+} catch { @{state='unknown';hresult=(TaskHResult $_)}|ConvertTo-Json -Compress }
+"""
+
+
+def windows_task_presence(task_name):
+    # 只读COM：仅GetTask本身的ERROR_FILE_NOT_FOUND表示不存在，拒绝把任意非0当missing。
+    import base64
+    require(isinstance(task_name, str) and re.fullmatch(r'Hermes_Gateway(?:_[a-zA-Z0-9_-]+)?', task_name),
+            'private profile task name contract changed')
+    child_env = {key: value for key, value in os.environ.items() if key.lower() != 'psmodulepath'}
+    child_env['CLAWPANEL_HERMES_TASK_QUERY_NAME'] = task_name
+    powershell = Path(child_env.get('SystemRoot', 'C:\\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    try:
+        result = subprocess.run([str(powershell), '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                    base64.b64encode(WINDOWS_TASK_QUERY.encode('utf-16le')).decode('ascii')],
+                    env=child_env, capture_output=True, text=True, encoding='utf-8', timeout=10, check=False)
+        if result.returncode != 0:
+            return {'state': 'unknown', 'hresult': None}
+        value = json.loads(result.stdout.lstrip('\ufeff'))
+        if not isinstance(value, dict) or set(value) != {'state', 'hresult'}:
+            return {'state': 'unknown', 'hresult': None}
+        if value == {'state': 'missing', 'hresult': '0x80070002'} or value == {'state': 'exists', 'hresult': None}:
+            return value
+        return {'state': 'unknown', 'hresult': value.get('hresult') if isinstance(value.get('hresult'), str) else None}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {'state': 'unknown', 'hresult': None}
+
+
+def install_private_profile_task_policy(root, owner_home):
+    # 保护原函数入口而非cleanup的异常路径：上游cleanup会吞异常，然后继续移动/删除。
+    if sys.platform != 'win32':
+        return lambda: None
+    import functools
+    from hermes_cli import profiles, profiles_service_cleanup as cleanup, gateway_windows as gw
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    require(PIN == 'd923a5eb487a17c0a68801bba9ef0f56c81040a8', 'private profile task policy release changed')
+    contracts = [(profiles, 'delete_profile', ['name', 'yes']), (profiles, 'rename_profile', ['old_name', 'new_name']),
+                 (profiles, '_cleanup_gateway_service', ['name', 'profile_dir']), (profiles, '_canon_valid', ['name']),
+                 (profiles, 'get_profile_dir', ['name']), (cleanup, 'remove_windows_task', []),
+                 (gw, 'get_task_name', []), (gw, 'get_startup_entry_path', []), (gw, '_legacy_startup_entry_path', [])]
+    for module, name, parameters in contracts:
+        require(list(inspect.signature(getattr(module, name)).parameters) == parameters,
+                'private profile task signature changed: ' + name)
+    original_delete, original_rename = profiles.delete_profile, profiles.rename_profile
+    saved = []
+    def restore():
+        for module, name, original in reversed(saved):
+            setattr(module, name, original)
+    def check_profile(name):
+        canon = profiles._canon_valid(name)
+        if canon == 'default':
+            return
+        directory = profiles.get_profile_dir(canon)
+        require(directory == owner_home / 'profiles' / canon and directory.resolve() == directory,
+                'private profile directory escapes managed home')
+        token = set_hermes_home_override(str(directory))
+        try:
+            task_name = gw.get_task_name()
+            state = windows_task_presence(task_name)
+            require(state == {'state': 'missing', 'hresult': '0x80070002'},
+                    'private profile mutation blocked by external Windows task/query: ' + task_name +
+                    ' (' + str(state.get('state')) + ', ' + str(state.get('hresult')) + ')')
+            for entry in (gw.get_startup_entry_path(), gw._legacy_startup_entry_path()):
+                try:
+                    entry.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    require(False, 'private profile mutation blocked by unknown Windows Startup entry')
+                require(False, 'private profile mutation blocked by existing Windows Startup entry')
+        finally:
+            reset_hermes_home_override(token)
+    @functools.wraps(original_delete)
+    def guarded_delete(name, yes=False):
+        check_profile(name)
+        return original_delete(name, yes=yes)
+    @functools.wraps(original_rename)
+    def guarded_rename(old_name, new_name):
+        check_profile(old_name)
+        if profiles._canon_valid(old_name) != 'default':
+            check_profile(new_name)
+        return original_rename(old_name, new_name)
+    def private_cleanup(name, profile_dir):
+        # 不做系统cleanup，消除“查无任务后新建同名任务”的TOCTOU删除；不伪称已清理。
+        print('ClawPanel private profile: external Windows task/Startup cleanup not performed', file=sys.stderr)
+        return False
+    def private_remove_windows_task():
+        return False
+    replacements = [(original_delete, guarded_delete), (original_rename, guarded_rename),
+                    (profiles._cleanup_gateway_service, private_cleanup), (cleanup.remove_windows_task, private_remove_windows_task)]
+    try:
+        # 同时替换固定包中已经捕获的function alias；之后Dashboard延迟导入也读取受保护入口。
+        for module_name, module in list(sys.modules.items()):
+            if module_name == 'hermes_cli' or module_name.startswith('hermes_cli.'):
+                for name, value in list(vars(module).items()):
+                    for original, replacement in replacements:
+                        if value is original:
+                            saved.append((module, name, value)); setattr(module, name, replacement)
+    except BaseException:
+        restore()
+        raise
+    return restore
+
+
 def install_private_runtime_policy(root, owner_home, launch_script, portable=False):
     # Dashboard 请求和其后续子进程仍属于受管会话，不能只保护第一次 boot。
     import types
@@ -549,7 +680,9 @@ from hermes_cli.profiles import get_active_profile_name
 sys.argv = ['hermes', '--profile', get_active_profile_name(), *selected_argv]
 launch_script = sys.orig_argv[sys.orig_argv.index('-c') + 1]
 restore_policy = install_private_runtime_policy(root, home, launch_script, mode.startswith('--portable'))
+restore_profile_policy = None
 try:
+    restore_profile_policy = install_private_profile_task_policy(root, home)
     if python_json:
         # 只接收面板已编译的固定 helper；该通道没有暴露任意脚本 HTTP/IPC 接口。
         exec(compile(snippet, '<clawpanel-hermes-python-json>', 'exec'), {'__name__': '__main__'})
@@ -557,6 +690,8 @@ try:
     runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)
 finally:
     restore_policy()
+    if restore_profile_policy is not None:
+        restore_profile_policy()
 `
 
 /** 安装先确认原生 AMD64；普通运行还会在共享 Python 内再次调用原生 OS API。 */
