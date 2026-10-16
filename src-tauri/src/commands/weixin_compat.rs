@@ -55,6 +55,10 @@ fn plugin_parts(value: &str) -> Option<[u32; 3]> {
 const UNKNOWN_HOST_ERROR: &str =
     "未识别 OpenClaw 稳定版本，请先安装或检查内核版本，再安装微信插件。";
 
+fn unreviewed_host_error(version: &str) -> String {
+    format!("OpenClaw 稳定版本 {version} 高于已核实宿主 {}；请保留现有插件，不猜测兼容目标，不自动更新或降级。", policy()["reviewedHostMax"].as_str().unwrap())
+}
+
 fn unknown_plugin_error(version: &str) -> String {
     let policy = policy();
     let reviewed = policy["reviewedVersion"].as_str().unwrap();
@@ -82,6 +86,11 @@ pub fn compatibility(host_version: &str, plugin_version: &str) -> Value {
     if version_parts(host_version).is_none() {
         return json!({"compatible": null, "compatError": UNKNOWN_HOST_ERROR});
     }
+    if version_parts(host_version).unwrap()
+        > version_parts(policy()["reviewedHostMax"].as_str().unwrap()).unwrap()
+    {
+        return json!({"compatible": null, "compatError": unreviewed_host_error(host_version)});
+    }
     if let (Some(host), Some(plugin)) = (version_parts(host_version), plugin_parts(plugin_version))
     {
         for line in policy()["lines"].as_array().unwrap() {
@@ -89,6 +98,16 @@ pub fn compatibility(host_version: &str, plugin_version: &str) -> Value {
                 && plugin <= version_parts(line["pluginMax"].as_str().unwrap()).unwrap()
             {
                 let compatible = host_fits(host, line);
+                // 包声明的peer下限不等于此宿主组合已实际核验；保留现有包，不猜测降级。
+                if line["hostScope"] == "reviewed-only"
+                    && !compatible
+                    && host >= version_parts(line["runtimePeerMin"].as_str().unwrap()).unwrap()
+                {
+                    return json!({"compatible": null, "compatError": format!("微信插件 {plugin_version} 声明 peer >={}，但与当前宿主 {host_version} 的组合尚未纳入实际核验；请保留现有插件，不自动更新或降级。", line["runtimePeerMin"].as_str().unwrap())});
+                }
+                if !compatible && line["hostBefore"] == "2026.10.4" && host >= [2026, 10, 4] {
+                    return json!({"compatible": false, "compatError": format!("微信插件 {plugin_version} 使用的旧 Plugin SDK 在 OpenClaw 2026.10.4 已移除，当前为 {host_version}；可明确确认修复升级至已核实的 2.4.10，不应将现有插件视为健康。")});
+                }
                 let range = format!(
                     ">={}{}",
                     line["hostMin"].as_str().unwrap(),
@@ -109,6 +128,9 @@ pub fn compatibility(host_version: &str, plugin_version: &str) -> Value {
 pub fn resolve_version(host_version: &str, requested: Option<&str>) -> Result<String, String> {
     let host = version_parts(host_version).ok_or(UNKNOWN_HOST_ERROR)?;
     let policy = policy();
+    if host > version_parts(policy["reviewedHostMax"].as_str().unwrap()).unwrap() {
+        return Err(unreviewed_host_error(host_version));
+    }
     let requested = requested.filter(|v| !v.is_empty());
     let target = requested
         .or_else(|| {
