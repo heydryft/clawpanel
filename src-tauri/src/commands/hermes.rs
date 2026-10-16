@@ -3107,7 +3107,8 @@ fn build_hermes_installer_stage_command(
             command
                 .arg(wrapper_path)
                 .arg("-InstallerPath")
-                .arg(script_path);
+                .arg(script_path)
+                .arg("-ForceCommit");
         } else {
             assert!(
                 HERMES_STABLE_VERSION == "0.22.2"
