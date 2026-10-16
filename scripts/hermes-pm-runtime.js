@@ -260,9 +260,50 @@ print_fast_version_info(check_updates=False)
 _hp('meta_e')
 `
 
+// 仅供可信Windows composer显式注入；只读完整V1格式，不执行目标argv中的任何代码。
+export const HERMES_PRIVATE_SCRIPT_BYTES_DECODER = String.raw`
+def decode_clawpanel_private_script_bytes(source, pin):
+    import base64, hashlib, re, zlib
+    if type(source) is not str or pin not in ('d923a5eb487a17c0a68801bba9ef0f56c81040a8', 'f97608f178d1ffeca59860195ab7da295f7c8e5f') or '\0' in source:
+        raise ValueError('private script contract mismatch')
+    if not source.startswith('# CLAWPANEL_PRIVATE_SCRIPT'):
+        raw = source.encode('utf-8')
+        if len(raw) > 131072:
+            raise ValueError('private script source budget exceeded')
+        return raw
+    if len(source) > 30000:
+        raise ValueError('private script wire budget exceeded')
+    header = re.match(r'# CLAWPANEL_PRIVATE_SCRIPT_V1 ([a-f0-9]{40}) ([a-f0-9]{64})\n', source)
+    payload = re.search(r"_cp_b\.b64decode\('([A-Za-z0-9+/=]+)',validate=True\)", source)
+    if header is None or header[1] != pin or payload is None:
+        raise ValueError('private script envelope mismatch')
+    template = """# CLAWPANEL_PRIVATE_SCRIPT_V1 {pin} {sha}
+import base64 as _cp_b, zlib as _cp_z, hashlib as _cp_h
+_cp_d=_cp_z.decompressobj()
+_CLAWPANEL_EXECUTED_SCRIPT_BYTES=_cp_d.decompress(_cp_b.b64decode('{data}',validate=True),131073)
+if len(_CLAWPANEL_EXECUTED_SCRIPT_BYTES)>131072 or not _cp_d.eof or _cp_d.unused_data or _cp_h.sha256(_CLAWPANEL_EXECUTED_SCRIPT_BYTES).hexdigest()!='{sha}':raise SystemExit('ClawPanel private script integrity failed')
+exec(compile(_CLAWPANEL_EXECUTED_SCRIPT_BYTES,'<clawpanel-hermes-private>','exec'))
+"""
+    if source != template.format(pin=pin, sha=header[2], data=payload[1]):
+        raise ValueError('private script envelope mismatch')
+    try:
+        compressed = base64.b64decode(payload[1], validate=True)
+        if base64.b64encode(compressed).decode('ascii') != payload[1]:
+            raise ValueError('private script encoding mismatch')
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(compressed, 131073)
+        if len(raw) > 131072 or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail or hashlib.sha256(raw).hexdigest() != header[2]:
+            raise ValueError('private script integrity mismatch')
+        if '\0' in raw.decode('utf-8'):
+            raise ValueError('private script contains NUL')
+        return raw
+    except (zlib.error, base64.binascii.Error) as error:
+        raise ValueError('private script decoding failed') from error
+`
+
 // 可审查身份adapter原文；固定压缩副本嵌入下方raw脚本以保持Windows CreateProcess长度预算。
 export const HERMES_PRIVATE_GATEWAY_IDENTITY_SCRIPT = String.raw`
-def install_private_gateway_identity(root, owner_home, launch_script, portable=False):
+def install_private_gateway_identity(root, owner_home, launch_script, portable=False, *, script_bytes=None):
     import math
     import psutil
     from gateway import status
@@ -274,7 +315,12 @@ def install_private_gateway_identity(root, owner_home, launch_script, portable=F
     python = resolve_store_python(root, publication=True).resolve(strict=True)
     require(root.resolve(strict=True) == root and owner_home.resolve(strict=True) == owner_home and
             python.is_relative_to(owner_home / 'tools'), 'gateway identity escapes private installation')
-    digest = hashlib.sha256(launch_script.encode('utf-8')).hexdigest()
+    require(script_bytes is None or (callable(script_bytes) and script_bytes is globals().get('decode_clawpanel_private_script_bytes')), 'untrusted private script decoder')
+    require(script_bytes is not None or not launch_script.startswith('# CLAWPANEL_PRIVATE_SCRIPT'), 'private script decoder missing')
+    body = script_bytes(launch_script, PIN) if script_bytes else launch_script.encode('utf-8')
+    executed = globals().get('_CLAWPANEL_EXECUTED_SCRIPT_BYTES', body if not launch_script.startswith('# CLAWPANEL_PRIVATE_SCRIPT') else None)
+    require(type(body) is bytes and type(executed) is bytes and body == executed, 'private executed script mismatch')
+    digest = hashlib.sha256(body).hexdigest()
     def build():
         # 只扩展原工厂生成的当前进程record；原字段/原writer/真实锁协议均保留。
         process = psutil.Process()
@@ -308,7 +354,7 @@ def install_private_gateway_identity(root, owner_home, launch_script, portable=F
             if argv[3:5] == ['-X', 'importtime']:
                 argv = argv[:3] + argv[5:]
             if (argv[1:4] != ['-I', '-B', '-c'] or
-                    hashlib.sha256(argv[4].encode('utf-8')).hexdigest() != digest or
+                    (script_bytes(argv[4], PIN) if script_bytes else argv[4].encode('utf-8')) != body or
                     argv[5:9] != [str(root), str(owner_home), PIN, '--portable' if portable else '--'] or
                     Path(argv[0]) != python or Path(argv[0]).resolve(strict=True) != python or
                     Path(process.exe()).resolve(strict=True) != python):
@@ -804,11 +850,11 @@ restore_identity = None
 _hp('policy_e')
 try:
     restore_profile_policy = install_private_profile_task_policy(root, home)
-    _gateway_identity_code = __import__('zlib').decompress(__import__('base64').b85decode('c-pO3-K*S06o0>e#fT3{>~8M8_5-^#Ld7aYD19iXEFt7(XLko@Cvj\x24S_pYU&MbIK\x601zSXG?USH_7km(3l>RZgz4gg|!E<INo8<1My#@2IA35jz&gcAcvNfV(!i3T(=Sd;ieyV9Qfsc8*NZ5!9&Gf>Td9HgTp9?CJX+EPp!qZY@(?n&G6(A~dsnb19qqkD7XfW6!aIqQQCbLveoBs<{YR1i-vCL=0d8@<_iY\x60?xo>DoZD#<tt6YG^qRVhoVa=uR!rE^J>VxgzGFs8X=6DCqlA_o{Il4iLaB@hlksD!iqI@5xUtj9D1q(#GOuVj3La%XSUB>k{tlKPw}?L+knn(0uni2xh8T{#cJB9-ZkYKS->QACEG1@U^s14#U\x242WU)3rmkL0Qej<Gm&i3)_u%4eIsmLyC0*aZ5G0^WNj6QzgpRzxfZIYrmYeG5x?PleoMowIxrnaGk_Mqu_LY__)AnYo9B8;v3v)*yX4e>_PTg8%tsXYUkSXW~hv*=9o%;=gZQ|)X=gJE<RfMW6EvO=H)T_}qX}aQ!*n}z##hIpR%GqA1rs=C^&-ty952?uV5%s-NkNdBAK@d*qfwlA<3>+*oJia>)c)d)PcYl6z>!;<f_m_7bEr0)EdFSTQy+=<z|MKYDPnUmwwY+uv>Ej1SKYn57<ljFYpxQ5AKRNtu8-C3tgNAM&efMa2\x6029ckK3U\x24r\x60}FW|\x60S7#9A3r?0|IJ??-&}brWS&u_APsxo!mIX%iw>_nCiN5*tR&1N#nZ3Zj5f4vB%tPIt|fAPH!4Fj(lPe0LWCQp<wyb0vN017zi<2oMqopDo\x24RdjxsgLVFvK@zjrJM^=wRLF_Pp15484q}^CA@#=x(-RI1HOy_Zp78!ODy6cw)x@?%OusXduIx6r{lq*n7t_t~hX>7<|0aBdr4;UC9M)%m*8jjsP7II4^@%ty};V?X+FC{k8tp#nE!nhU^?4zzkZNCz~RNnU4+WV0ht#YQH1d9=U#_Z40vpM;(l>!YKKzEFkX{TLWg|0!iG116BN>jV6FI0n39vr6t!M*1hu3Vjl\x60mGbahrsD%PXzLRYvvX\x60O?G?#0\x24jhC}V#Wv%uaDm>TB*zqh;ULE\x60<5YQF&\x60{)XTyk!v(3jpY?SHh>KOejAq#s}3>76@\x2414@l~1%xSLW-\x24l\x60TkBY6zRa_Itpa*cP%{+>VTV*>OPXCqVleeULO3S-fC(q8n)vp\x60YnR@=_<r)v<tuM?<<~@LG\x60a\x24ku7Cl0GjnHE+eg_bJG\x24@iW3#IPnhX)FQXca>)hk!SmR5{T>>=s!fe0HJ5&*5?g\x24Nk(1eJgaO6\x60JcR<wC6Y8~6P6Tqf&vTp&0SX%QWhas#tv+Y^RL|81\x24Gq>M&)9Gfb=4sq_WGTG(MP>}0H|b?I;!GT;7CgV8H#|K!8{0*z{~mg?YohJLx=#mfEC;7!a?1WZJBZiMISO_MXG}K%{W7BW-!PvU^thvn\x245se~awdM}^6>nbbU~hvTOEPY<IkEW;KtR<S8PMvdTxlW\x60eVrrq}|~gvNi5@Vtan=;s}G;5_R(5O1~SvYAiiKntl\x24_iww>j<\x60=eNMLEUArAHX_dKmW%&-KXpw(=AP7BnspPKC*9gR8k+giO{fUK2xYjRriWeXn15t+QZGGm1lV0M(p9?x+^E^dfH)0Xy_6m5O#Sk<H4_EKGCRh&&8;zP3^{ua(=#B~Wk%tbl><2E*NWqahAgHzXscBC>lDk6p#?#y5Qr)1sha<l~=U>jdsywTywX6mp!k%#*q90Vvx^vJX%cR<n\x246C#4WfO#EQuX4~9uOGPC@*wyy<w%!yQ7whX-\x249\x60O=O%F0!XmZJX!J52rd#vZA>(#e+(pPC{o3ZUxOYmwbhSQC2n\x241_D|HGSmHR-KZ;H}nPZhUV22fv{+;s'))
-    require(hashlib.sha256(_gateway_identity_code).hexdigest() == 'f0f9dd36f0068a3c1517b62994a16fed86b85d3d35b30f697a492fdd5dc35ef4', 'private gateway identity code changed')
+    _gateway_identity_code = __import__('zlib').decompress(__import__('base64').b85decode('c-pO4TaVjB6n@\x60dF{lr=Y2w|b7tyFe+Li^as8*|Xp{=6G@;Z}bgkziWc(b9Z1Qilgs4Wt\x245R}p<BtT*%9uO~}{uoHNJn<JeXJ#DFByqb%<RKT&xnI6>CM!MKCoIWD7{@\x60z*?uT!Fo3slI0;yfCW48H%hOaeNIFg^4~FT8Hb@*6Ni+=dh_eiivXqN(FQ)Cc!Z?THR~tkf1\x24z@g^Y(U{P_MN@;KfErOh%y?n!mHW5G<BY\x60aB&GZ9{ns28trDj)#<wXdXl{^8;lI<#|cWX\x60aUWG{{BDX^>6CFij+D%GrP=VNBXupdWA=rMwq_IUphrVzyuTpRu0O7)BszVsPyhEbigC=9grgeo!z@-I(RVg_veE5\x60NAG3Gl\x24<Qn}}6ArD7XfW;nZw@JrQLYxM1KqP+917xN>8EvOa!bGVkUr8#+q6TfJsQ_fnBB\x60?pjBo<9ltjZY8PJ~NN#QC\x60;N\x60OT=^Dt2y_iLzU}@6c<puS8P3-1^vq-3iRydGxDHZyThv=PAT(z_n\x24wEAojXujEA2C=5#*5T77*>fR(lpK;Z&^fW9)%griEe<hA*7p*?TuO1gyjS)8|sR<5i&pvSQMW0ZJuWkr+d&RuICS^aGf4xzek~#!*LcSwCY2X&+*XmA\x60!gEp)h8qDjK3>@D~\x601Wm6iA->ok8!DlY=F%v\x60AIYBO7+PJ#2vAuaI*txv*-p1}\x60aOL9Vt({#N!R6Y?h~+s;2HJ|fv?qJUFv6X~jh(G+kFdTSAqo&OXBtgVf\x24J2a-+Wz*rw24DFcj_ifCiQAo7XlkzPr2mrZzsfaD8|43UrvX4HW<PC@3=}uvsw|lZ?73-ouD1kFW^j^U~(IGZm@!%q1hjGcR?hA;c1^bP#%MKyv{h7>4;UW_x}<3|~8QRvF+A>473}H8p^}gf3TuF}_Za>Ajzx-u\x60j=%Y*6N\x24J5\x60wpWeN7bpP?w&%QYN=9B3kUruk|dG_St(GQ<1l=|oQhe-DGS5FUrU4?IB&HzqUkG_38J^b\x24P\x60yWs5+<SI-IDPc#Ur!z#J^1?1k8aI0Wju{&o\x60bat?fo6~KwBqkhH)\x60O0(Ig?oMI;kHlhZVvINL9;#o%;btFkg0%{jyTS|lnGUhmd05JM20sCF4S9Pm0;SI93fHH;;wqYn=vKina2>?GTl(Esa@}uJztv{MgT{N5Aa12FGYo<jvjLJ4VS82X!NQQ}!5Mw%F?)8+@!2vX9Jvpnbabpf^IiUNb#y~xWw3e0?D{VkI^lX*3KI>N%9Kk2H\x24lCG&nVv;?yeiT%)4m*eXr6+P<<2(9jhi+v)E*2PVBUdJaxE_qV9Q+rWCq%hK(8%G;(E5U1SU4ff@#nXi&!\x60q_fms3\x60y}qD6Car@DZu3Fv!!G7m3ApK<qNfqFU^gF_Pm|Rh2;W5GDonAh?VwP43nx(Gz8i27jZ1B(B)1iY<{@bJlEBqL9=^ft#S6\x24O\x24asm<(1>r^Ssu|qAXcoa^GBtfW%s?igM_|%7ZB}vy8wX<AH!MclJI@^kJFAw*mUEZd?!E+1h@y&OcLvk?2wo*8%iUo2)xUYPYf^)~H^iM|oEXFcHF=x!jM_P|Q?yEUGRlQB6{#10^g)ND!zP&\x24j^~j}ZwuPqlGoM9sFSXjImYAvWZLeI>Aip_O|i6k&BQSRI8d@w18CSDH;-ow~LvoW^aN7m3q-nHodoCcKP#F-zv51^XB1I;UD^x@ygDUPEo_lA\x60jks8frUoUKz\x60a#DRg)9NnvIUcOHPRne9^evR\x24ydd8r\x24Z=hVTML;Ka=QDxRZNr2FJUtHa&xIsqzymUwXy{1z^@f{cv81YlD<Yt@GE~PBjB{&B?-V%-C9@mw7SYbv06v9m^h=a7hfhD7BYbD7f5=UVj4qD!#yphF~w!3K^Ww}0~tZ=Ymjp\x60@eqm_D9)3ZCep7Zs>W(Ll3ug!!ZE~FQo!VPoo41({UJLXkIh9G\x24=ViO+gS\x246T6*b<dF5D6{M^8p3rO2RbH@v7hWVPQZEFXzm;q9t;p<*!y}OhVi>qEFBPZKr{Wu!yf?Y3P=G_moj3zx7e|Rg\x24P_LsU8FB?H^GK%doU<GNv8p6BRPnH^WxOvJNdi|k*IT;nnj3GCQ;s6kx;wwYo5xbc;)+(YGgofYgNVWvXH\x24N_>b!KLtm>rh&zQz>|J;GJN!~\x60e7|#}E=x+S)!@MT_AKLVFr7>HJSFBxK>RkC3KOG;Y'))
+    require(hashlib.sha256(_gateway_identity_code).hexdigest() == '37948505b3c71a3f0396a2e0d8a1183e2a46d8acac2a1937e1b27d061ca31586', 'private gateway identity code changed')
     exec(_gateway_identity_code, globals())
     del _gateway_identity_code
-    restore_identity = install_private_gateway_identity(root, home, launch_script, mode.startswith('--portable'))
+    restore_identity = install_private_gateway_identity(root, home, launch_script, mode.startswith('--portable'), script_bytes=globals().get('decode_clawpanel_private_script_bytes'))
     if python_json:
         _hp('pyjson_b')
         exec(compile(snippet, '<clawpanel-hermes-python-json>', 'exec'), {'__name__': '__main__'})

@@ -4,6 +4,8 @@ import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { HERMES_PRIVATE_COMPLETION_SCRIPT, HERMES_PRIVATE_LAUNCH_SCRIPT, HERMES_PRIVATE_METADATA_SCRIPT } from '../scripts/hermes-pm-runtime.js'
+import { HERMES_PRIVATE_SCRIPT_BYTES_DECODER } from '../scripts/hermes-pm-runtime.js'
+import { hermesWindowsScript, decodeHermesWindowsScript } from '../scripts/hermes-windows-script-envelope.js'
 
 // 只执行实际诊断函数/顶层currency片段；不导入PM/vendor，不查询宿主HOME/注册表。
 const python = process.env.HERMES_TEST_PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
@@ -103,6 +105,10 @@ assert {'entry','src_b','src_e','store','reexec','act_b','act_e','cur_b','cur_e'
 })
 
 test('Windows完整list2cmdline含NUL：HOME96/named63/实际native固定snippet均小于32767 UTF16', () => {
+  const script = hermesWindowsScript(HERMES_PRIVATE_SCRIPT_BYTES_DECODER + HERMES_PRIVATE_LAUNCH_SCRIPT, { platform: 'win32', version: '0.22.2', pin: 'd923a5eb487a17c0a68801bba9ef0f56c81040a8' })
+  const decoded = decodeHermesWindowsScript(script).script
+  assert.ok(decoded.includes(HERMES_PRIVATE_SCRIPT_BYTES_DECODER), '显式可信decoder不可被压缩接线遗漏')
+  assert.ok(decoded.includes("restore_identity = install_private_gateway_identity("))
   const rust = fs.readFileSync(new URL('../src-tauri/src/commands/hermes.rs', import.meta.url), 'utf8')
   const snippets = []
   for (const match of rust.matchAll(/pub async fn (hermes_\w+)\(/g)) {
@@ -134,7 +140,7 @@ for name,tail in cases:
     rows.append({'case':name,'utf16WithNul':size,'remaining':32767-size})
 print(json.dumps(rows))
 `
-  const result = spawnSync(python, ['-I', '-B', '-c', code], { input: JSON.stringify({ script: HERMES_PRIVATE_LAUNCH_SCRIPT, snippets }), encoding: 'utf8', windowsHide: true, timeout: 10000 })
+  const result = spawnSync(python, ['-I', '-B', '-c', code], { input: JSON.stringify({ script, snippets }), encoding: 'utf8', windowsHide: true, timeout: 10000 })
   assert.equal(result.status, 0, result.stderr || result.error?.message)
   const rows = JSON.parse(result.stdout)
   assert.equal(rows.length, 8)

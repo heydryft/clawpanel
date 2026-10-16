@@ -17,7 +17,7 @@ from typing import Any, Optional
 payload = json.loads(sys.stdin.buffer.read().decode('utf-8'))
 script, fixture = payload['script'], payload['fixture']
 group = sys.argv[1]
-tree = ast.parse(script)
+tree = ast.parse(payload.get('launcher', script))
 nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in {'require', 'install_private_gateway_identity'}]
 scope = dict(Path=Path, os=os, sys=sys, inspect=inspect, hashlib=hashlib, re=re, json=json, PIN=fixture['pin'])
 exec(compile(ast.Module(body=nodes, type_ignores=[]), '<actual-private-identity>', 'exec'), scope)
@@ -62,8 +62,12 @@ with tempfile.TemporaryDirectory(prefix='hermes-pm-stop-') as tmp:
         def is_running(self): return target['running'] and self.birth == target['birth']
     psutil = types.ModuleType('psutil'); psutil.Process = Process
     sys.modules['psutil'] = psutil
-    current = home
-    native_argv = [str(root / 'hermes_cli/main.py'), '--profile', 'default', 'gateway', 'run']
+    profile = payload.get('profile', 'default')
+    current = home if profile == 'default' else home / 'profiles' / profile
+    if current != home:
+        current.mkdir(parents=True)
+        target['command'][9:9] = ['--profile', profile]
+    native_argv = [str(root / 'hermes_cli/main.py'), '--profile', profile, 'gateway', 'run']
     status._GATEWAY_KIND = 'hermes-gateway'
     status.os = types.SimpleNamespace(getpid=lambda: 901)
     status._record_argv = lambda: native_argv[:]
@@ -84,7 +88,13 @@ with tempfile.TemporaryDirectory(prefix='hermes-pm-stop-') as tmp:
     original_match = status._record_matches_live_gateway_pid
     original_build = status._build_pid_record
     install = scope.get('install_private_gateway_identity')
-    restore = install(root, home, script) if install else lambda: None
+    if group == 'envelope':
+        exec(payload['decoder'], scope)
+        scope['_CLAWPANEL_EXECUTED_SCRIPT_BYTES'] = script.encode('utf-8')
+        target['command'][4] = payload['envelopes'][0]
+        restore = install(root, home, payload['envelopes'][1], script_bytes=scope['decode_clawpanel_private_script_bytes'])
+    else:
+        restore = install(root, home, script) if install else lambda: None
     record = status._build_pid_record()
     caller_pid = 1901
     status._read_pid_record = status._read_gateway_lock_record = lambda p: record
@@ -164,6 +174,34 @@ with tempfile.TemporaryDirectory(prefix='hermes-pm-stop-') as tmp:
         assert all(record[k] == v for k, v in original.items())
         assert record.get('clawpanel_pm_identity', {}).get('create_time') == birth
         passed += 2
+    elif group == 'envelope':
+        assert accepted(), '不同压缩流的相同完整body应识别'
+        assert record['clawpanel_pm_identity']['script_sha256'] == hashlib.sha256(script.encode()).hexdigest()
+        target['command'][4] = script
+        assert accepted(), '同一完整raw body应保持兼容'
+        for bad in (payload['envelopes'][0] + '\nprint(1)', 'import zlib; exec(b"generic")', script + '\n# foreign'):
+            target['command'][4] = bad
+            assert not accepted(), '未验证wrapper被接纳'
+        target['command'][4] = payload['envelopes'][0]
+        target['birth'] += 0.001
+        assert not accepted(), '解包不能旁路精确CreationDate'
+        target['birth'] = birth
+        restore()
+        for bad in (None, bytearray(script.encode()), b'foreign'):
+            scope['_CLAWPANEL_EXECUTED_SCRIPT_BYTES'] = bad
+            try: install(root, home, payload['envelopes'][1], script_bytes=scope['decode_clawpanel_private_script_bytes'])
+            except RuntimeError: pass
+            else: raise AssertionError('未知/错误executed bytes未阻断')
+            assert status._record_matches_live_gateway_pid is original_match
+        scope['_CLAWPANEL_EXECUTED_SCRIPT_BYTES'] = script.encode()
+        try: install(root, home, payload['envelopes'][1])
+        except RuntimeError: pass
+        else: raise AssertionError('envelope缺少可信decoder不能回退raw')
+        try: install(root, home, payload['envelopes'][1], script_bytes=lambda source, pin: script.encode())
+        except RuntimeError: pass
+        else: raise AssertionError('陌生decoder callback被接纳')
+        assert status._record_matches_live_gateway_pid is original_match
+        passed = 11
     else:
         assert status.looks_like_gateway_command_line('python -m hermes_cli.main gateway run')
         target['command'] = ['python', '-m', 'hermes_cli.main', 'gateway', 'run']
