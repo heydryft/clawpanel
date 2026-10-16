@@ -18907,7 +18907,8 @@ const handlers = {
   async hermes_dashboard_probe() {
     const port = handlers._hermesDashboardPort()
     const cli = handlers._hermesDashboardCliStatus(port)
-    const running = cli?.running || await _tcpProbe('127.0.0.1', port, 800)
+    // 官方 CLI 会列出其他 HOME/端口，不能覆盖本实例配置端口的实际结果。
+    const running = await _tcpProbe('127.0.0.1', port, 800)
     return { running, port, status: cli?.output || null }
   },
 

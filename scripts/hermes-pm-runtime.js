@@ -25,12 +25,55 @@ HASHES = {
     'hermes_cli/venv_sync.py': '6de0d12b3de57f4425279589be5d2f39e02e2bec98ba04ef8169e1e9d2b982e9',
     'hermes_cli/source_build.py': 'ebec5fbd2a742a1832d94db466ec0f5255df2be09155622cf8af4cee5bf5c570',
     'hermes_cli/source_stamp.py': '963a62f643725816b779f15a6b2d8498b7fdb1b551eaa6a65afa4ebad96882b1',
+    'pm/runtime.py': '68d6ae47d2e0143f3cc377e462e3588abbb0e857bbc9f22442a3f66ebe54c478',
+    'pm/_uv.py': '60d4c360aee770e50e3132e82b3bec99cb3759d592cd97ab92aaca56804315ef',
 }
 
 
 def require(condition, message):
     if not condition:
         raise RuntimeError('Hermes private completion: ' + message)
+
+
+def prepare_currency_checker(root, store_python):
+    # 显式安装尾部：bootstrap Python 创建的 PM checker 不等于 store Python 的 checker。
+    # 仅用已安装的工具准备原独立 PM runtime；不让 fallback 去获取工具或改应用依赖。
+    from pm._uv import _toolchain
+    from pm.runtime import prepare_runtime
+    from pm.environments import install_state_dir
+    tools = _toolchain(realize=False)
+    require(tools is not None, 'PM checker requires the already installed pinned toolchain')
+    uv, python = tools
+    require(all(Path(tool).is_file() and Path(tool).resolve().is_relative_to(home / 'tools') for tool in tools),
+            'PM checker toolchain escapes the managed store')
+    require(os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(store_python)),
+            'PM checker Python is not the selected store Python')
+    state = install_state_dir(root).resolve()
+    require((home / 'installs').resolve() == home / 'installs' and state.is_relative_to(home / 'installs'),
+            'PM checker state escapes the managed home')
+    manager_root = state / 'pm-runtime'
+    require(manager_root.resolve() == manager_root, 'PM checker root escapes install state')
+    manager = Path(prepare_runtime(Path(uv), Path(python), manager_root, bootstrap=True)).absolute()
+    # POSIX venv 的 python 文件本身会链接到 store；检查其父目录，不能误拒合法文件链接。
+    require(manager.is_file() and manager.is_relative_to(manager_root) and
+            manager.parent.resolve().is_relative_to(manager_root), 'PM checker executable escapes install state')
+
+
+def require_pm_current(root):
+    if pm.venv_is_current(project_root=root) is True:
+        return
+    # 只在错误时输出有限布尔值/错误类型，不复制 HOME、环境变量、facts 或凭据。
+    from pm.environments import running_from_selected_environment
+    from pm.runtime import runtime_python
+    from pm.package import InstallError
+    details = {'selectedDependenciesActive': running_from_selected_environment(root),
+               'prefixIsBase': sys.prefix == sys.base_prefix}
+    try:
+        runtime_python(bootstrap=False)
+        details['checkerReady'] = True
+    except InstallError as error:
+        details.update(checkerReady=False, checkerErrorPackage=error.package)
+    require(False, 'PM currency is false or unknown; readiness=' + json.dumps(details, sort_keys=True))
 
 
 root = Path(sys.argv[1]).resolve()
@@ -62,7 +105,8 @@ sys.argv[0] = str(root / 'hermes_cli' / 'source_completion.py')
 from pm.environments import activate_dependencies
 activate_dependencies(root)
 import pm
-require(pm.venv_is_current(project_root=root) is True, 'PM currency is false or unknown')
+prepare_currency_checker(root, store_python)
+require_pm_current(root)
 require('hermes_cli.post_update' not in sys.modules, 'maintenance aliases were imported before private policy')
 from hermes_cli import _install_repair as repair
 

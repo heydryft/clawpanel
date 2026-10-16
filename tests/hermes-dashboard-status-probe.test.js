@@ -31,3 +31,13 @@ test('成功状态只调用一次；仅命令失败回退，未知成功留给 T
     else assert.equal(result.running, true)
   }
 })
+
+test('其他 HOME/端口的 CLI 正向输出不冒充本实例配置端口在线', async () => {
+  const method = source.match(/  async hermes_dashboard_probe\(\) \{[^]*?\n  \},/)?.[0]
+  assert.ok(method)
+  for (const tcp of [false, true]) {
+    const handlers = { _hermesDashboardPort: () => 9119, _hermesDashboardCliStatus: () => ({ running: true, output: '1 hermes dashboard/serve process(es) running:\n PID 123 --port 9120' }) }
+    const obj = new Function('handlers', '_tcpProbe', `return {${method}}`)(handlers, async (host, port) => { assert.equal(host, '127.0.0.1'); assert.equal(port, 9119); return tcp })
+    assert.equal((await obj.hermes_dashboard_probe()).running, tcp)
+  }
+})

@@ -2141,11 +2141,10 @@ fn hermes_dashboard_cli_stop() -> bool {
 pub async fn hermes_dashboard_probe() -> Result<Value, String> {
     let port = hermes_dashboard_port();
     let cli_status = hermes_dashboard_cli_status(port);
-    let cli_running = cli_status.as_ref().map(|(running, _)| *running);
     let cli_output = cli_status.as_ref().map(|(_, output)| output.clone());
     let running = tokio::task::spawn_blocking(move || {
-        let tcp_running = hermes_dashboard_tcp_running(port, 800);
-        tcp_running || cli_running.unwrap_or(false)
+        // CLI 列表包含其他 HOME/端口；本实例仍需真实监听。
+        hermes_dashboard_tcp_running(port, 800)
     })
     .await
     .unwrap_or(false);
