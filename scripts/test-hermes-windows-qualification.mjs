@@ -368,7 +368,15 @@ $shells=@();$paths=@($PROFILE.AllUsersAllHosts,$PROFILE.AllUsersCurrentHost,$PRO
 foreach($p in ($paths|Sort-Object -Unique)){$fingerprint=Get-ClawPanelPathFingerprint $p;$shells+=@{path=$p;exists=($fingerprint.kind -ne 'absent');sha256=$fingerprint.sha256;fingerprint=$fingerprint}}
 Write-ClawPanelHostPhase 'launchers'
 $launchers=@();$dirs=@(($env:PATH -split ';')+@("$real\\AppData\\Roaming\\npm","$real\\.local\\bin","$real\\.hermes\\bin"))|Sort-Object -Unique
-foreach($d in $dirs){if($d -and (Test-Path -LiteralPath $d)){foreach($f in (Get-ChildItem -LiteralPath $d -File -ErrorAction Stop|Where-Object {$_.Name -match '^(hermes|uv|node|npm|python|git)([.-].*|[0-9.]*\\.exe|\\.cmd|\\.ps1)?$'}|Sort-Object FullName)){$fingerprint=Get-ClawPanelPathFingerprint $f.FullName;$launchers+=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint}}}}
+$launcherPrefixes=@('hermes','uv','node','npm','python','git');$launcherDirectoryIndex=0
+function Write-ClawPanelLauncherDirectory($index,$event,$count,$bytes){if($index -le 64){[Console]::Error.WriteLine('CLAWPANEL_LAUNCHER_DIRECTORY {"index":'+$index+',"event":"'+$event+'","count":'+$count+',"bytes":'+$bytes+',"elapsedMs":'+$hostClock.ElapsedMilliseconds+'}')}}
+foreach($d in $dirs){if($d -and (Test-Path -LiteralPath $d)){
+  $launcherDirectoryIndex++;Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'begin' 0 0
+  $launcherFiles=@(@(foreach($prefix in $launcherPrefixes){Get-ChildItem -LiteralPath $d -Filter ($prefix+'*') -File -ErrorAction Stop})|Where-Object {$_.Name -match '^(hermes|uv|node|npm|python|git)([.-].*|[0-9.]*\\.exe|\\.cmd|\\.ps1)?$'}|Sort-Object FullName)
+  $launcherBytes=0L;foreach($f in $launcherFiles){$launcherBytes+=$f.Length};Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'enumerated' $launcherFiles.Count $launcherBytes
+  foreach($f in $launcherFiles){$fingerprint=Get-ClawPanelPathFingerprint $f.FullName;$launchers+=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint}}
+  Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'fingerprinted' $launcherFiles.Count $launcherBytes
+}}
 Write-ClawPanelHostPhase 'execution-policy'
 $executionPolicy=@(Get-ExecutionPolicy -List|ForEach-Object {@{scope=$_.Scope.ToString();value=$_.ExecutionPolicy.ToString()}})
 Write-ClawPanelHostPhase 'complete'

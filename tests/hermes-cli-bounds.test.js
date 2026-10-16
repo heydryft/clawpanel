@@ -13,6 +13,96 @@ const evidence = process.env.HERMES_BOUNDS_TEST_EVIDENCE
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 
+test('PID 观察传输：原2秒超时终止本观察器，迟到响应不得污染下一次或恢复成绿灯', { timeout: 7000 }, async t => {
+  const { startFixtureObserverTransport } = await import('../scripts/hermes-cli-bounds-observation.mjs')
+  assert.equal(typeof startFixtureObserverTransport, 'function')
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', `import{createInterface}from'node:readline';console.log(JSON.stringify({event:'ready',protocol:1}));createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);setTimeout(()=>console.log(JSON.stringify({id:r.id,processes:[]})),2100)})`], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, NODE_OPTIONS: '' } })
+  const closed = new Promise(resolve => child.once('close', resolve))
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill(); await closed })
+  const observer = await startFixtureObserverTransport(child)
+  const at = performance.now()
+  let failure
+  await assert.rejects(observer.snapshot([process.pid]), error => { failure = error; return /observation timeout/.test(error.message) })
+  assert.ok(performance.now() - at >= 1900, '保留原2秒而非更短失败冒充测试通过')
+  await delay(250)
+  assert.ok(child.exitCode !== null || child.signalCode !== null, '观察器失败自行停止，而非依赖测试finally清理才停止')
+  await assert.rejects(observer.snapshot([process.pid]), error => error === failure, '原超时永久保持失败，不以unexpected response替代首红或继续发请求')
+  await observer.close()
+})
+
+test('PID 原生观察：冷启动不调用运行时C#编译器，首次真实身份查询仍在原预算内', { timeout: 12000 }, async t => {
+  const { startWindowsFixtureProcessObserver } = await import('../scripts/hermes-cli-bounds-observation.mjs')
+  if (process.platform !== 'win32') { await assert.rejects(startWindowsFixtureProcessObserver(), /Windows/); return }
+  let intercepted = false, observer
+  t.after(async () => { await observer?.close() })
+  const started = performance.now()
+  observer = await startWindowsFixtureProcessObserver({ spawnProcess(executable, argv, options) {
+    intercepted = true
+    return spawn(executable, [...argv.slice(0, -1), "function Add-Type { throw 'runtime compiler invoked' };\n" + argv.at(-1)], options)
+  } })
+  assert.equal(intercepted, true, '实际PowerShell入口受编译依赖负控，而非未使用的替身')
+  const sample = await observer.snapshot([process.pid])
+  assert.equal(sample.processes[0].status, 'running')
+  assert.match(sample.processes[0].creationTimeFileTimeHex, /^[0-9a-f]{16}$/i)
+  assert.equal(path.win32.normalize(sample.processes[0].executablePath).toLowerCase(), path.win32.normalize(process.execPath).toLowerCase())
+  const absent = await observer.snapshot([2147483647])
+  assert.equal(absent.processes[0].status, 'missing')
+  assert.equal(absent.processes[0].nativeError, 87, 'Win32错误必须在原生调用内保存，不被PowerShell binder改写成203')
+  assert.ok(performance.now() - started < 9000, '原7秒启动+2秒请求预算不变')
+  if (evidence) { fs.mkdirSync(evidence, { recursive: true }); fs.writeFileSync(path.join(evidence, 'observer-cold-native-report.json'), JSON.stringify({ startupAndFirstQueryMs: performance.now() - started, sample }, null, 2)) }
+})
+
+test('PID 原生观察：同一短句柄内退出/镜像失败重新取signaled与创建退出时间；活跃失败仍拒绝', { timeout: 12000 }, async t => {
+  const { startWindowsFixtureProcessObserver, classifyFixtureIdentitySample } = await import('../scripts/hermes-cli-bounds-observation.mjs')
+  if (process.platform !== 'win32') { await assert.rejects(startWindowsFixtureProcessObserver(), /Windows/); return }
+  const base = fs.realpathSync(os.tmpdir()), dir = fs.mkdtempSync(path.join(base, 'bounds-exit-race-'))
+  const held = path.join(dir, 'held'), release = path.join(dir, 'release')
+  let observer, child
+  const report = { scope: 'one owned real Node child; real native held-handle exit and image buffer failure', samples: [] }
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) { const closed = new Promise(resolve => child.once('close', resolve)); child.kill(); await closed }
+    await observer?.close()
+    if (evidence) { fs.mkdirSync(evidence, { recursive: true }); fs.writeFileSync(path.join(evidence, 'observer-exit-race-report.json'), JSON.stringify(report, null, 2)) }
+    const rel = path.relative(base, fs.realpathSync(dir)); assert.ok(rel && !rel.startsWith('..') && !path.isAbsolute(rel)); fs.rmSync(dir, { recursive: true, force: true })
+  })
+  observer = await startWindowsFixtureProcessObserver({ spawnProcess(executable, argv, options) {
+    let script = argv.at(-1)
+    const point = '$image = New-Object System.Text.StringBuilder(32768)'
+    assert.ok(script.includes(point), '实际原生读取位置必须固定，不能无效注入')
+    script = script.replace(point, `if($processId -ne $PID){[IO.File]::WriteAllText(${JSON.stringify(held)}, 'held'); $until=[DateTime]::UtcNow.AddSeconds(1); while(-not [IO.File]::Exists(${JSON.stringify(release)}) -and [DateTime]::UtcNow -lt $until){[Threading.Thread]::Sleep(1)}};\n` + point)
+      .replace('[uint32]$length = $image.Capacity', '[uint32]$length = $(if($processId -eq $PID){$image.Capacity}else{0})')
+    return spawn(executable, [...argv.slice(0, -1), script], options)
+  } })
+  child = spawn(process.execPath, ['--eval', 'process.stdin.resume();process.stdin.once("data",()=>process.exit(0))'], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'], env: { ...process.env, NODE_OPTIONS: '' } })
+  const closed = new Promise(resolve => child.once('close', resolve))
+  const receipt = { event: 'start', pid: child.pid, at: Date.now() }
+  const pending = observer.snapshot([child.pid])
+  const until = performance.now() + 1500
+  while (!fs.existsSync(held) && performance.now() < until) await delay(5)
+  assert.ok(fs.existsSync(held), '原生句柄已取得后才让自有孩子退出')
+  child.stdin.end('exit'); await closed
+  fs.writeFileSync(release, 'released')
+  const sample = await pending; report.samples.push(sample)
+  const row = sample.processes[0]
+  assert.equal(row.status, 'exited')
+  assert.equal(row.waitResult, 0)
+  assert.ok(row.exitAtMs > 0)
+  assert.match(row.creationTimeFileTimeHex, /^[0-9a-f]{16}$/i)
+  assert.ok(row.imageQueryError > 0, '实际QueryFullProcessImageName错误仍保留，不靠已退出直接跳过错误路径')
+  assert.ok([5, 31, 122].includes(row.imageQueryError), JSON.stringify(row))
+  assert.equal(row.executablePath, null)
+  assert.equal(classifyFixtureIdentitySample({ starts: [receipt], processes: sample.processes, expectedExecutable: process.execPath }).activeCount, 0)
+  assert.throws(() => classifyFixtureIdentitySample({ starts: [receipt], processes: [{ ...row, status: 'error', waitResult: 258, nativeError: 5 }], expectedExecutable: process.execPath }), /identity.*unavailable/i)
+  // 相同的真实镜像查询失败，若自有孩子仍活跃必须红；不把AccessDenied/错误码直接视为退出。
+  child = spawn(process.execPath, ['--eval', 'process.stdin.resume()'], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'], env: { ...process.env, NODE_OPTIONS: '' } })
+  const live = await observer.snapshot([child.pid]); report.samples.push(live)
+  assert.equal(live.processes[0].status, 'error')
+  assert.equal(live.processes[0].waitResult, 258)
+  assert.ok(live.processes[0].imageQueryError > 0)
+  assert.equal(live.processes[0].imageQueryError, 122, '实际活跃进程零长度镜像缓冲区应保留ERROR_INSUFFICIENT_BUFFER')
+  assert.throws(() => classifyFixtureIdentitySample({ starts: [{ event: 'start', pid: child.pid, at: Date.now() }], processes: live.processes, expectedExecutable: process.execPath }), /identity.*unavailable/i)
+})
+
 test('PID 身份观察：复用、退出、未知和真实三活跃不得被裸PID或逻辑完成事件混淆', async () => {
   const { classifyFixtureIdentitySample } = await import('../scripts/hermes-cli-bounds-observation.mjs')
   const executable = 'C:\\fixture\\hermes.exe'
@@ -55,7 +145,8 @@ test('PID 身份观察：Windows自有真实Node孩子的创建身份和退出�
     const rel = path.relative(base, fs.realpathSync(dir)); assert.ok(rel && !rel.startsWith('..') && !path.isAbsolute(rel)); fs.rmSync(dir, { recursive: true, force: true })
   })
   observer = await startWindowsFixtureProcessObserver()
-  child = spawn(executable, ['--eval', 'setTimeout(()=>process.exit(0),700)'], { windowsHide: true, stdio: 'ignore', env: { ...process.env, NODE_OPTIONS: '', HOME: dir, USERPROFILE: dir } })
+  // 用自有stdin屏障固定活跃区间；不能让700ms定时器与CI身份查询抢退出。
+  child = spawn(executable, ['--eval', 'process.stdin.resume();process.stdin.once("data",()=>process.exit(0))'], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'], env: { ...process.env, NODE_OPTIONS: '', HOME: dir, USERPROFILE: dir } })
   const closed = new Promise(resolve => child.once('close', resolve))
   const first = await observer.snapshot([child.pid]); report.samples.push(first)
   assert.equal(first.processes[0].status, 'running')
@@ -63,12 +154,12 @@ test('PID 身份观察：Windows自有真实Node孩子的创建身份和退出�
   assert.equal(path.win32.normalize(first.processes[0].executablePath).toLowerCase(), path.win32.normalize(executable).toLowerCase())
   const second = await observer.snapshot([child.pid]); report.samples.push(second)
   assert.equal(second.processes[0].creationTimeFileTimeHex, first.processes[0].creationTimeFileTimeHex)
-  await closed
+  child.stdin.end('exit'); await closed
   const after = await observer.snapshot([child.pid]); report.samples.push(after)
   assert.ok(after.processes[0].status === 'missing' || after.processes[0].status === 'exited' || after.processes[0].creationTimeFileTimeHex !== first.processes[0].creationTimeFileTimeHex)
   // 真实三活跃负控：观察器必须看到3，不能把物理过载“修正”为2。
   for (let i = 0; i < 4; i++) {
-    const control = spawn(i === 3 ? process.execPath : executable, ['--eval', 'setTimeout(()=>process.exit(0),700)'], { windowsHide: true, stdio: 'ignore', env: { ...process.env, NODE_OPTIONS: '', HOME: dir, USERPROFILE: dir } })
+    const control = spawn(i === 3 ? process.execPath : executable, ['--eval', 'process.stdin.resume()'], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'], env: { ...process.env, NODE_OPTIONS: '', HOME: dir, USERPROFILE: dir } })
     controls.push({ process: control, closed: new Promise(resolve => control.once('close', resolve)), receipt: { event: 'start', pid: control.pid, at: Date.now(), name: 'native-control-' + i } })
   }
   const controlSample = await observer.snapshot(controls.map(row => row.process.pid)); report.samples.push(controlSample)

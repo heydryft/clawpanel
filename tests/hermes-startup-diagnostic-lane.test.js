@@ -92,11 +92,22 @@ test('二级堆栈采样显式开启，仅新 PM 候选；原 args/script 不改
 })
 
 test('实际 Python 栈采样不等待60秒、不替换 exit7，提供主线程 PID 映射', { timeout: 10000 }, async () => {
-  const { prepareStartupDiagnosticSpawn } = await load(), s = spec(), script = "import time; time.sleep(2.3); raise SystemExit(7)"
+  // 采样目标须正在执行 Python：Windows hosted 的原生 sleep 实测可能只有 <no Python frame>。
+  // 保留原2秒采样、2.3秒目标、exit7及全部预算，不用接受空栈替代主线程取证。
+  const { prepareStartupDiagnosticSpawn } = await load(), s = spec(), script = [
+    'import time',
+    'def _clawpanel_fixture_sample_target():',
+    '    end = time.monotonic() + 2.3',
+    '    while time.monotonic() < end:',
+    '        pass',
+    '_clawpanel_fixture_sample_target()',
+    'raise SystemExit(7)',
+  ].join('\n')
   s.args[3] = script; s.program = process.env.PYTHON || 'python'
   const result = prepareStartupDiagnosticSpawn(s, { ...config, pmScript: script, stackSampling: true })
   const started = performance.now(), child = spawnSync(result.program, result.args, { windowsHide: true, encoding: 'utf8', timeout: 7000, maxBuffer: 1048576 })
   assert.equal(child.status, 7, child.stderr.slice(-1500)); assert.ok(performance.now() - started < 6000)
   assert.match(child.stderr, /CLAWPANEL_STACK_SAMPLER_MAIN \d+ 0x[0-9a-f]+/)
   assert.match(child.stderr, /Timeout \(0:00:02\)/); assert.match(child.stderr, /<string>/)
+  assert.match(child.stderr, /_clawpanel_fixture_sample_target/)
 })

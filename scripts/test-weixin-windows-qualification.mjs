@@ -17,6 +17,8 @@ const hash=f=>sha(fs.readFileSync(f))
 const exactSha=v=>typeof v==='string'&&/^[a-f0-9]{40}$/.test(v)
 const validHash=v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v)
 const privateSecrets=new Set()
+const CRATE_METADATA_URL='https://crates.io/api/v1/crates/tauri-driver/2.1.0'
+const CRATE_API_HEADERS=Object.freeze({'User-Agent':'ClawPanel-Weixin-Native-Qualification/1.0 (https://github.com/qingchencloud/clawpanel)','Accept':'application/json'})
 const wait=ms=>new Promise(r=>setTimeout(r,ms))
 const read=f=>JSON.parse(fs.readFileSync(f,'utf8').replace(/^\uFEFF/,''))
 const inside=(root,file)=>{const r=path.relative(root,file);return r!==''&&r!=='..'&&!r.startsWith('..'+path.sep)&&!path.isAbsolute(r)}
@@ -156,7 +158,13 @@ function gitSnapshot(root,commit,exportTo){
 }
 function directoryHashes(root,allowEmpty=false){const out={};let bytes=0;const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){const f=path.join(d,e.name);assert.ok(!e.isSymbolicLink());if(e.isDirectory())walk(f);else{bytes+=fs.statSync(f).size;assert.ok(bytes<200*1024*1024);out[path.relative(root,f).replaceAll('\\','/')]=hash(f)}}};walk(root);assert.ok(allowEmpty||Object.keys(out).length);return out}
 async function freePort(){return await new Promise((resolve,reject)=>{const s=net.createServer();s.on('error',reject);s.listen(0,'127.0.0.1',()=>{const p=s.address().port;s.close(()=>resolve(p))})})}
-async function download(url,max,timeout=300000){const r=await fetch(url,{redirect:'error',signal:AbortSignal.timeout(timeout)});assert.equal(r.status,200,'固定源下载失败');const chunks=[];let size=0;for await(const b of r.body){size+=b.length;assert.ok(size<=max,'下载预算');chunks.push(b)}return Buffer.concat(chunks)}
+async function download(url,max,timeout=300000,{fetchImpl=fetch,headers}={}){const r=await fetchImpl(url,{headers,redirect:'error',signal:AbortSignal.timeout(timeout)});assert.equal(r.status,200,'固定源下载失败: '+url);const chunks=[];let size=0;for await(const b of r.body){size+=b.length;assert.ok(size<=max,'下载预算');chunks.push(b)}return Buffer.concat(chunks)}
+export async function readPinnedTauriDriverMetadata(fetchImpl=fetch){
+ // crates.io API 要求标识实际调用工具；不伪装浏览器，不重试/换源，不改变固定版本及摘要。
+ const crate=JSON.parse((await download(CRATE_METADATA_URL,2*1024*1024,300000,{fetchImpl,headers:CRATE_API_HEADERS})).toString('utf8'))
+ assert.equal(crate.version.crate,'tauri-driver');assert.equal(crate.version.num,'2.1.0');assert.equal(crate.version.checksum,'2f2e29bd6900fb718dfdc06f2e7a371d6087c085daaf83709847ef3e6b0c1953');assert.equal(crate.version.yanked,false)
+ return crate
+}
 
 // 注入仅观察真实 fetch 请求/克隆响应；既不改参数/来源，也不代替产品 UI 返回成功。
 const AUDIT_SCRIPT=String.raw`
@@ -253,7 +261,7 @@ async function execute(o){
   const rustup=path.join(proof.actualProfile,'.cargo/bin/rustup.exe');assert.ok(fs.statSync(rustup).isFile());await run(rustup,['toolchain','install','stable-x86_64-pc-windows-msvc','--profile','minimal','--no-self-update'],900000)
   const cargo=await run(rustup,['which','cargo','--toolchain','stable-x86_64-pc-windows-msvc']);assert.ok(inside(home,physical(cargo)));env.PATH=path.dirname(cargo)+';'+env.PATH
   receipt('rust-toolchain',{rustupSha256:hash(rustup),cargoSha256:hash(cargo),cargoVersion:await run(cargo,['--version']),rustcVersion:await run(rustup,['run','stable-x86_64-pc-windows-msvc','rustc','--version'])})
-  const crate=JSON.parse((await download('https://crates.io/api/v1/crates/tauri-driver/2.1.0',2*1024*1024)).toString('utf8'));assert.equal(crate.version.checksum,'2f2e29bd6900fb718dfdc06f2e7a371d6087c085daaf83709847ef3e6b0c1953');assert.equal(crate.version.yanked,false)
+   const crate=await readPinnedTauriDriverMetadata();receipt('tauri-driver-metadata',{url:CRATE_METADATA_URL,requestHeaders:CRATE_API_HEADERS,version:{crate:crate.version.crate,num:crate.version.num,checksum:crate.version.checksum,yanked:crate.version.yanked}})
   const driverRoot=path.join(home,'tauri-driver');await run(cargo,['install','tauri-driver','--version','2.1.0','--locked','--root',driverRoot,'--target-dir',path.join(output,'driver-target')],1200000)
   const tauri=path.join(driverRoot,'bin/tauri-driver.exe'),tauriVersion=await run(tauri,['--version']);assert.equal(tauriVersion,'tauri-driver 2.1.0')
   const runtime=JSON.parse(ps(`$guid='{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';$keys=@('HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\','HKLM:\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\','HKCU:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\','HKCU:\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\');foreach($key in $keys){$r=Get-ItemProperty -LiteralPath ($key+$guid) -ErrorAction SilentlyContinue;if($r.pv -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$'){foreach($base in @(([Environment]::GetFolderPath('ProgramFilesX86')+'\\Microsoft\\EdgeWebView\\Application'),([Environment]::GetFolderPath('ProgramFiles')+'\\Microsoft\\EdgeWebView\\Application'),(${psValue(proof.actualProfile)}+'\\AppData\\Local\\Microsoft\\EdgeWebView\\Application'))){$f=Join-Path (Join-Path $base $r.pv) 'msedgewebview2.exe';if(Test-Path -LiteralPath $f){@{version=$r.pv;binaryVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo($f).ProductVersion;path=$f;registry=($key+$guid)}|ConvertTo-Json;exit 0}}}};throw 'No matching WebView2 runtime'`));assert.equal(runtime.binaryVersion.match(/^\d+\.\d+\.\d+\.\d+/)?.[0],runtime.version)

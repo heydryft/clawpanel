@@ -101,6 +101,20 @@ test('运行时完整脚本清单包含audit/HTML；动态脚本也在native发�
  const c=new W3C('http://127.0.0.1:1');c.session='fixture';await assert.rejects(c.script('function(}'),/injected JS syntax|Unexpected/);assert.equal(c.events.length,0)
 })
 
+test('crates官方固定API真实HTTP契约：具名UA才200，固定version/hash且不重试/重定向',async()=>{
+ const {readPinnedTauriDriverMetadata}=await import('../scripts/test-weixin-windows-qualification.mjs')
+ const original={version:{crate:'tauri-driver',num:'2.1.0',checksum:'2f2e29bd6900fb718dfdc06f2e7a371d6087c085daaf83709847ef3e6b0c1953',yanked:false}},seen=[];let reply=original,mode='json'
+ const server=http.createServer((req,res)=>{seen.push({method:req.method,url:req.url,headers:req.headers});if(!req.headers['user-agent']?.includes('ClawPanel-Weixin-Native-Qualification/')||!req.headers['user-agent'].includes('https://github.com/qingchencloud/clawpanel')){res.writeHead(403).end();return}if(mode==='403'){res.writeHead(403).end();return}if(mode==='redirect'){res.writeHead(302,{location:'https://example.invalid/untrusted'}).end();return}res.setHeader('content-type','application/json');res.end(mode==='oversize'?' '.repeat(2*1024*1024+1):JSON.stringify(reply))})
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));const local='http://127.0.0.1:'+server.address().port+'/api/v1/crates/tauri-driver/2.1.0';let calls=0
+ try{
+  assert.equal((await fetch(local)).status,403,'原Node默认UA必须复现原403契约')
+  const fetchImpl=(url,options)=>{calls++;assert.equal(url,'https://crates.io/api/v1/crates/tauri-driver/2.1.0');assert.equal(options.redirect,'error');assert.equal(new Headers(options.headers).get('accept'),'application/json');return fetch(local,options)}
+  assert.deepEqual(await readPinnedTauriDriverMetadata(fetchImpl),original);assert.equal(calls,1);assert.equal(seen.at(-1).method,'GET');assert.equal(seen.at(-1).url,'/api/v1/crates/tauri-driver/2.1.0');assert.equal(seen.at(-1).headers.authorization,undefined)
+  for(const patch of [{crate:'wrong'},{num:'2.1.1'},{checksum:'0'.repeat(64)},{yanked:true},{yanked:null}]){reply={version:{...original.version,...patch}};const before=calls;await assert.rejects(readPinnedTauriDriverMetadata(fetchImpl));assert.equal(calls,before+1,'不得对坏元数据重试')}
+  for(const next of ['403','redirect','oversize']){mode=next;const before=calls;await assert.rejects(readPinnedTauriDriverMetadata(fetchImpl));assert.equal(calls,before+1,'错误/跳转/超额不得重试或回退')}
+ }finally{server.closeAllConnections();await new Promise(r=>server.close(r))}
+})
+
 test('v2原生host精确选择两份独立artifact，同一reviewToken不能混用',async()=>{
  const {expectedArtifact}=await import('../scripts/test-weixin-windows-qualification.mjs')
  const legacy=expectedArtifact('2026.5.12'),modern=expectedArtifact('2026.10.4')
