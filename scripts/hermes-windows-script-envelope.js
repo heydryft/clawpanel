@@ -1,10 +1,21 @@
 import fs from 'node:fs'
+import path from 'node:path'
 import crypto from 'node:crypto'
 import { deflateSync, inflateSync } from 'node:zlib'
 
 const pins = { '0.22.2': 'd923a5eb487a17c0a68801bba9ef0f56c81040a8', '0.21.5': 'f97608f178d1ffeca59860195ab7da295f7c8e5f' }
 const cimSource = fs.readFileSync(new URL('./hermes-windows-cim-probe.py', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
 const hash = value => crypto.createHash('sha256').update(value).digest('hex')
+
+// 无PM的受管旧venv只进入固定21.5准入；真正的global CLI保留原fallback。
+export function hermesLegacyWindowsSpec(args, { platform = process.platform, home, root } = {}) {
+  const python = path.join(root, 'venv', 'Scripts', 'python.exe')
+  if (platform !== 'win32' || !fs.existsSync(python)) return null
+  const read = file => fs.readFileSync(new URL(file, import.meta.url), 'utf8').replaceAll('\r\n', '\n')
+  const body = read('./hermes-legacy-gateway-identity.py') + '\n' + read('./hermes-legacy-windows-launch.py')
+  const pin = pins['0.21.5']
+  return { program: python, args: ['-I', '-B', '-c', hermesWindowsScript(body, { platform, version: '0.21.5', pin }), root, home, pin, 'console', '--', ...args] }
+}
 
 export const HERMES_WINDOWS_CIM_INSTALL = String.raw`    if os.name=='nt':
         for _cp_file,_cp_sha in [('hermes_cli/gateway.py','a6ca31202bc461a145f9e6df3b80daed2ea435599cf176ac86e9b98f118ff899'),('hermes_cli/_subprocess_compat.py','4d036c56de8065099f4b82a50fde9095c43dab7e851e0e3a3fe4cd5c143a212e'),('hermes_cli/local_runtime/processes.py','763c450a9fe8b7eea5684576564b1fe8ffd58d6c16fc444dfd5e3b14986efb2b')]:

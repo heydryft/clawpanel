@@ -4,7 +4,7 @@
  * 使浏览器模式能真正管理 OpenClaw 实例
  */
 import fs from 'fs'
-import { hermesWindowsScript } from './hermes-windows-script-envelope.js'
+import { hermesWindowsScript, hermesLegacyWindowsSpec } from './hermes-windows-script-envelope.js'
 import { resolveHermesPmEnvironment, hermesManagedInstallPlatformError, HERMES_PRIVATE_COMPLETION_SCRIPT, HERMES_PRIVATE_METADATA_SCRIPT, HERMES_PRIVATE_LAUNCH_SCRIPT } from './hermes-pm-runtime.js'
 import { sanitizeOpenCodeStorage } from './opencode-proxy.js'
 import path from 'path'
@@ -441,9 +441,9 @@ function isLoopbackGatewayUrl(url) {
 
 function hermesLaunchSpec(args) {
   const home = hermesHome(), root = hermesSourceDir(home)
-  // 无 PM 布局的 0.21.5 继续走原 launcher；有新布局却缺事实则明确失败。
+  // 有受管旧venv时进入固定21.5原console准入；没有该布局才保留global launcher。
   const environment = resolveHermesPmEnvironment(home, root)
-  if (!environment && !fs.existsSync(path.join(root, 'pm', 'environments.py'))) return { program: 'hermes', args }
+  if (!environment && !fs.existsSync(path.join(root, 'pm', 'environments.py'))) return hermesLegacyWindowsSpec(args, { platform: process.platform, home, root }) || { program: 'hermes', args }
   if (!environment) throw new Error('Hermes private preflight 缺少当前 checkout 的 PM 环境')
   if (HERMES_STABLE_VERSION !== '0.22.2' || HERMES_STABLE_COMMIT !== 'd923a5eb487a17c0a68801bba9ef0f56c81040a8') throw new Error('Hermes private preflight pin 未审查')
   const python = path.join(environment, isWindows ? 'Scripts' : 'bin', isWindows ? 'python.exe' : 'python3')

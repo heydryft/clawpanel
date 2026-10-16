@@ -1318,6 +1318,9 @@ fn hermes_launch_spec() -> Result<(PathBuf, Vec<std::ffi::OsString>), String> {
     let root = hermes_source_dir();
     let environment = hermes_pm_environment_at(&home, &root)?;
     if environment.is_none() && !root.join("pm").join("environments.py").is_file() {
+        if let Some(spec) = super::hermes_windows::legacy_spec(&home, &root)? {
+            return Ok(spec);
+        }
         return Ok((hermes_program_for_spawn()?, Vec::new()));
     }
     let environment = environment.ok_or("Hermes private preflight 缺少当前 checkout 的 PM 环境")?;

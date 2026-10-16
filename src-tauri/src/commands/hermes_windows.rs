@@ -4,9 +4,36 @@ use flate2::{write::ZlibEncoder, Compression};
 use flate2::{Decompress, FlushDecompress, Status};
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 const NEW_PIN: &str = "d923a5eb487a17c0a68801bba9ef0f56c81040a8";
 const OLD_PIN: &str = "f97608f178d1ffeca59860195ab7da295f7c8e5f";
+
+pub(super) fn legacy_spec(
+    home: &Path,
+    root: &Path,
+) -> Result<Option<(PathBuf, Vec<std::ffi::OsString>)>, String> {
+    let python = root.join("venv").join("Scripts").join("python.exe");
+    if !cfg!(target_os = "windows") || !python.is_file() {
+        return Ok(None);
+    }
+    let body = include_str!("../../../scripts/hermes-legacy-gateway-identity.py")
+        .replace("\r\n", "\n")
+        + "\n"
+        + &include_str!("../../../scripts/hermes-legacy-windows-launch.py").replace("\r\n", "\n");
+    let args = vec![
+        "-I".into(),
+        "-B".into(),
+        "-c".into(),
+        render(&body, "0.21.5", OLD_PIN)?.into(),
+        root.as_os_str().into(),
+        home.as_os_str().into(),
+        OLD_PIN.into(),
+        "console".into(),
+        "--".into(),
+    ];
+    Ok(Some((python, args)))
+}
 const SHARED: &str = include_str!("../../../scripts/hermes-windows-script-envelope.js");
 const CIM: &str = include_str!("../../../scripts/hermes-windows-cim-probe.py");
 fn shared(name: &str) -> Result<String, String> {
