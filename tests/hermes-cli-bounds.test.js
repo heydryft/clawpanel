@@ -32,7 +32,7 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   })
   fs.mkdirSync(path.join(home, '.openclaw'), { recursive: true }); fs.mkdirSync(bin, { recursive: true })
   const preload = path.join(dir, 'cli-preload.mjs')
-  fs.writeFileSync(preload, `import fs from 'node:fs';import path from 'node:path';const copied=/^hermes(?:\\.exe)?$/i.test(path.basename(process.execPath));if(copied||process.argv[1]?.endsWith('/hermes')){const args=process.argv.slice(copied?1:2).map((v,i)=>copied&&i===0?path.basename(v):v),name=args.at(-1);const record=event=>fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({event,name,pid:process.pid,at:Date.now()})+String.fromCharCode(10));record('start');await new Promise(r=>setTimeout(r,name.startsWith('burst-')?6200:30));if(name==='fail'){record('failure');console.error('fixture exit failure');process.exit(7)}record('write');console.log('ok');process.exit(0)}`)
+  fs.writeFileSync(preload, `import fs from 'node:fs';import path from 'node:path';const copied=/^hermes(?:\\.exe)?$/i.test(path.basename(process.execPath));if(copied||process.argv[1]?.endsWith('/hermes')){const args=process.argv.slice(copied?1:2).map((v,i)=>copied&&i===0?path.basename(v):v),name=args.at(-1);const record=event=>fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({event,name,pid:process.pid,at:Date.now(),monotonicMs:Number(process.hrtime.bigint()/1000000n)})+String.fromCharCode(10));record('start');await new Promise(r=>setTimeout(r,name.startsWith('burst-')?6200:30));if(name==='fail'){record('failure');console.error('fixture exit failure');process.exit(7)}record('write');console.log('ok');process.exit(0)}`)
   if (process.platform === 'win32') fs.copyFileSync(process.execPath, path.join(bin, 'hermes.exe'))
   else { const cli = path.join(bin, 'hermes'); fs.writeFileSync(cli, '#!' + process.execPath + '\n' + fs.readFileSync(preload, 'utf8')); fs.chmodSync(cli, 0o755) }
   const healthPayload = { status: 'ok', nonce: 'bounded-cli-real-upstream' }
@@ -43,12 +43,12 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   fs.writeFileSync(server, `import http from 'node:http';import {_initApi,_apiMiddleware} from ${JSON.stringify(pathToFileURL(path.join(root, 'scripts/dev-api.js')).href)};_initApi();http.createServer((q,r)=>{Promise.resolve(_apiMiddleware(q,r,()=>{r.statusCode=404;r.end()})).catch(e=>{r.statusCode=500;r.end(JSON.stringify({error:String(e)}))})}).listen(0,'127.0.0.1',function(){console.log('READY '+this.address().port)})`)
   child = spawn(process.execPath, [server], { env: { ...process.env, HOME: home, USERPROFILE: home, HERMES_HOME: path.join(home, '.hermes'), OPENCLAW_CONFIG_DIR: path.join(home, '.openclaw'), NODE_OPTIONS: '--import=' + pathToFileURL(preload).href, PATH: bin + path.delimiter + process.env.PATH }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
   const port = await new Promise((resolve, reject) => { let out = ''; const timer = setTimeout(() => reject(Error('HTTP startup timeout')), 10000); child.once('error', reject); child.once('exit', code => { clearTimeout(timer); reject(Error('server exited ' + code + ': ' + out)) }); child.stdout.on('data', b => { out += b; const m = out.match(/READY (\d+)/); if (m) { clearTimeout(timer); resolve(Number(m[1])) } }); child.stderr.on('data', b => { out += b }) })
-  const api = async (cmd, args = {}) => { const at = Date.now(), r = await fetch(`http://127.0.0.1:${port}/__api/${cmd}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(args), signal: AbortSignal.timeout(22000) }); return { status: r.status, value: await r.json(), ms: Date.now() - at } }
+  const api = async (cmd, args = {}) => { const at = performance.now(), r = await fetch(`http://127.0.0.1:${port}/__api/${cmd}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(args), signal: AbortSignal.timeout(22000) }); return { status: r.status, value: await r.json(), ms: performance.now() - at } }
   sampler = setInterval(() => { const pids = [...new Set(readEvents().filter(e => e.event === 'start').map(e => e.pid))]; peak = Math.max(peak, pids.filter(alive).length) }, 25)
-  const started = Date.now(), pending = Array.from({ length: 12 }, (_, i) => api('hermes_profile_use', { name: `burst-${i}` }).then(result => { const item = { name: `burst-${i}`, ...result }; report.requests.push(item); return item }))
+  const started = performance.now(), startedMonotonicMs = Number(process.hrtime.bigint()/1000000n), pending = Array.from({ length: 12 }, (_, i) => api('hermes_profile_use', { name: `burst-${i}` }).then(result => { const item = { name: `burst-${i}`, ...result }; report.requests.push(item); return item }))
   await delay(350)
   const health = await api('hermes_health_check'); report.fastHealth = health
-  const results = await Promise.all(pending); report.wallMs = Date.now() - started
+  const results = await Promise.all(pending); report.wallMs = performance.now() - started
   // 先保存完整红灯事实，再断言；不让第一个并发失败掩盖其他观测。
   report.events = readEvents(); report.peak = peak
   assert.equal(health.status, 200); assert.deepEqual(health.value, healthPayload); assert.ok(health.ms < 2000)
@@ -60,7 +60,7 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   const starts = readEvents().filter(e => e.event === 'start')
   assert.ok(starts.length <= 6 && starts.length >= 4, JSON.stringify(starts))
   assert.equal(new Set(starts.map(e => e.name)).size, starts.length, '写命令不重放')
-  assert.ok(starts.every(e => e.at - started < 15000), 'deadline后不启动过期写命令')
+  assert.ok(starts.every(e => e.monotonicMs - startedMonotonicMs < 15000), 'deadline后不启动过期写命令')
   const failed = await api('hermes_profile_use', { name: 'fail' }); report.failed = failed
   assert.equal(failed.status, 500); assert.match(failed.value.error, /fixture exit failure/)
   const recovery = await api('hermes_profile_use', { name: 'recovery' }); report.recovery = recovery
