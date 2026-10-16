@@ -30,7 +30,7 @@ test('Windows CRLF 和 UTF8 仅规范可信面板模板，Python AST 解析通�
 
 test('真实 Web/Tauri launch spec 均接入封装，保留原受管解释器和 args 边界', () => {
   const web = fs.readFileSync('scripts/dev-api.js','utf8'), rust = fs.readFileSync('src-tauri/src/commands/hermes.rs','utf8')
-  assert.match(web, /import \{ hermesWindowsScript \} from '\.\/hermes-windows-script-envelope.js'/)
+  assert.match(web, /import \{ hermesWindowsScript, hermesLegacyWindowsSpec \} from '\.\/hermes-windows-script-envelope.js'/)
   assert.match(web.match(/function hermesLaunchSpec[^]*?\n}/)?.[0] || '', /hermesWindowsScript\(HERMES_PRIVATE_LAUNCH_SCRIPT/)
   assert.match(rust.match(/fn hermes_launch_spec[^]*?\n}/)?.[0] || '', /hermes_windows::render/)
 })
