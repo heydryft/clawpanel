@@ -21,7 +21,7 @@ import { PiRuntime } from './pi-runtime.js'
 import { createDshAuth, redactDshOutput } from './deepseek-harness-auth.js'
 import { channelPluginStatusAt, channelPluginStatusFromInventory, installChannelPluginAt, redactPluginOutput } from './channel-plugin-install.js'
 import { buildWeixinCompatibilityStatus, resolveWeixinInstallVersion } from './weixin-compat.js'
-import { createWeixinConsentManager, isWeixinInstallTarget, validateWeixinRequestOrigin, verifyWeixinInstalledFiles, resolveWeixinConsentHostMode, verifyWeixinConfigReadback, inspectWeixinConsentHostSdk } from './weixin-install-consent.js'
+import { createWeixinConsentManager, isWeixinInstallTarget, validateWeixinRequestOrigin, verifyWeixinInstalledFiles, resolveWeixinConsentHostMode, verifyWeixinConfigReadback, inspectWeixinConsentHostSdk, selectWeixinConsentArtifact } from './weixin-install-consent.js'
 import * as skillhubSdk from './lib/skillhub-sdk.js'
 import { createBackgroundJobQueue } from './media-background-queue.js'
 import { normalizeModelApiType } from '../src/lib/model-presets.js'
@@ -20605,6 +20605,7 @@ const weixinDigest = value => crypto.createHash('sha256').update(value).digest('
 async function readWeixinInstallState() {
   const hostVersion = readWeixinHostVersion(), cli = resolveOpenclawCliPath()
   if (!cli) throw Object.assign(new Error('未找到实际 OpenClaw CLI'), { code: 'WEIXIN_HOST_CHANGED' })
+  const artifact = selectWeixinConsentArtifact(hostVersion)
   const pkg = findOpenclawPackageJson(cli)
   const cliIdentity = weixinDigest(JSON.stringify([fs.realpathSync.native(cli), weixinDigest(fs.readFileSync(cli)), pkg && weixinDigest(fs.readFileSync(pkg))]))
   let capabilityMode = _weixinCliContracts.get(cliIdentity)
@@ -20628,7 +20629,7 @@ async function readWeixinInstallState() {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
     previousDeclared = { channels: Array.isArray(manifest.channels) ? manifest.channels : [] }
   }
-  return { hostVersion, installed: !!(status.installed || status.builtin), installedVersion, path: status.installed || status.builtin ? status.path : null, configIdentity: weixinDigest(JSON.stringify(config)), protectedConfigSnapshot: config, cliIdentity, hostSdk: inspectWeixinConsentHostSdk(pkg ? path.dirname(pkg) : ''), capabilityMode, previousDeclared }
+  return { hostVersion, installed: !!(status.installed || status.builtin), installedVersion, path: status.installed || status.builtin ? status.path : null, configIdentity: weixinDigest(JSON.stringify(config)), protectedConfigSnapshot: config, cliIdentity, hostSdk: inspectWeixinConsentHostSdk(pkg ? path.dirname(pkg) : '', artifact), capabilityMode, previousDeclared }
 }
 function getWeixinConsentManager() {
   return _weixinConsentManager ||= createWeixinConsentManager({

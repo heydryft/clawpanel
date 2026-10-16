@@ -332,6 +332,8 @@ export default {
   weixinConsentInvalid: _('确认协议或固定包信息不完整，请更新面板后重新核对。', 'The consent protocol or pinned artifact is incomplete. Update ClawPanel and review again.', '確認協定或固定套件資訊不完整，請更新面板後重新核對。'),
   weixinConsentInstall: _('安装微信插件', 'Install Weixin plugin', '安裝微信外掛'),
   weixinConsentUpgrade: _('升级微信插件', 'Upgrade Weixin plugin', '升級微信外掛'),
+  weixinRepairUpgrade: _('修复升级插件', 'Repair and upgrade plugin', '修復升級外掛'),
+  weixinConsentRepair: _('修复升级：现有版本 {previous} 不兼容当前内核，将替换为 {version}；保留已有账号与配置。', 'Repair upgrade: installed {previous} is incompatible with this host. Replace it with {version}, preserving existing accounts and configuration.', '修復升級：現有版本 {previous} 不相容目前核心，將替換為 {version}；保留既有帳號與設定。'),
   weixinConsentHost: _('当前内核：OpenClaw {host}', 'Current host: OpenClaw {host}', '目前核心：OpenClaw {host}'),
   weixinConsentSource: _('来源：{source}', 'Source: {source}', '來源：{source}'),
   weixinConsentAdded: _('本次新增能力', 'Capabilities added this time', '本次新增能力'),

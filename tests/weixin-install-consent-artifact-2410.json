@@ -1,0 +1,19 @@
+{
+  "name": "@tencent-weixin/openclaw-weixin",
+  "version": "2.4.10",
+  "artifact": {
+    "packageName": "@tencent-weixin/openclaw-weixin",
+    "version": "2.4.10",
+    "url": "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.10.tgz",
+    "integrity": "sha512-qCN7rFtBK5BO/i5YGEJLdpC/8WQrm0dtPlQ0xNxku4RSyzGaRsiBoLVheU5hgpoOIBvfc5pUwKTktMbROLcIVg==",
+    "sha256": "69dd18af16a992edbe3700d244f9591ab52f5f58abfe976a9f1250bd8eacdbbb",
+    "fileCount": 131,
+    "unpackedSize": 696593,
+    "compressedSize": 172518,
+    "manifestSha256": "43957bcf2852862a337f7606a4c352c443e67eda16424a4cd158425768e6b1b8",
+    "sdkSubpath": "openclaw/plugin-sdk/temp-path",
+    "sourceCommit": "c6643f6f0ac03574eb126f2d69569ea4267cc3c6"
+  },
+  "tag": "v2.4.10",
+  "sdkFixSource": "https://github.com/Tencent/openclaw-weixin/pull/338"
+}

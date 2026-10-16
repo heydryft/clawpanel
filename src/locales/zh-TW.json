@@ -1563,6 +1563,8 @@
     "weixinConsentInvalid": "確認協定或固定套件資訊不完整，請更新面板後重新核對。",
     "weixinConsentInstall": "安裝微信外掛",
     "weixinConsentUpgrade": "升級微信外掛",
+    "weixinRepairUpgrade": "修復升級外掛",
+    "weixinConsentRepair": "修復升級：現有版本 {previous} 不相容目前核心，將替換為 {version}；保留既有帳號與設定。",
     "weixinConsentHost": "目前核心：OpenClaw {host}",
     "weixinConsentSource": "來源：{source}",
     "weixinConsentAdded": "本次新增能力",

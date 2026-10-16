@@ -6,13 +6,18 @@ import { buildWeixinCompatibilityStatus, resolveWeixinInstallVersion, weixinComp
 const policy = JSON.parse(fs.readFileSync(new URL('../src/lib/weixin-compat-policy.json', import.meta.url)))
 const cases = JSON.parse(fs.readFileSync(new URL('./fixtures/weixin-issue345.json', import.meta.url)))
 
-test('#345 官方已核实2.4.9，peer下限保留2026.5.12，不使用浮动latest', () => {
-  assert.equal(policy.reviewedVersion, '2.4.9')
-  assert.deepEqual(policy.lines.at(-1), { pluginMin: '2.4.5', pluginMax: '2.4.9', hostMin: '2026.5.12', hostBefore: null, target: '2.4.9', label: 'stable' })
-  assert.equal(policy.reviewedPackage.sourceCommit, '43675b66551d12d6853155a7869a50fb12a18a1e')
-  assert.equal(policy.reviewedPackage.peerOpenclaw, '>=2026.5.12')
-  assert.equal(policy.reviewedPackage.nodeEngine, '>=22.13.0')
-  assert.equal(policy.reviewedPackage.tarballSha256, '467e8047f7114e45944961fcd3eda9421843c9c65db61ea24176e252ab800ee4')
+test('#345 官方249原pin全部保留；10.4另用固定2410，不使用浮动latest', () => {
+  assert.equal(policy.reviewedVersion, '2.4.10')
+  assert.deepEqual(policy.lines.find(l=>l.target==='2.4.9'), { pluginMin: '2.4.5', pluginMax: '2.4.9', hostMin: '2026.5.12', hostBefore: '2026.10.4', target: '2.4.9', label: 'stable' })
+  const original=policy.reviewedPackages['2.4.9']
+  assert.equal(original.sourceCommit, '43675b66551d12d6853155a7869a50fb12a18a1e')
+  assert.equal(original.peerOpenclaw, '>=2026.5.12')
+  assert.equal(original.nodeEngine, '>=22.13.0')
+  assert.equal(original.tarballSha256, '467e8047f7114e45944961fcd3eda9421843c9c65db61ea24176e252ab800ee4')
+  assert.equal(policy.reviewedPackage.sourceCommit,'c6643f6f0ac03574eb126f2d69569ea4267cc3c6')
+  assert.equal(policy.reviewedPackage.tarballSha256,'69dd18af16a992edbe3700d244f9591ab52f5f58abfe976a9f1250bd8eacdbbb')
+  assert.equal(policy.reviewedPackage.peerOpenclaw,'>=2026.5.12')
+  assert.equal(policy.reviewedPackage.nodeEngine,'>=22.13.0')
 })
 
 for (const c of cases) test(`#345 精确状态 ${c.host} / ${c.plugin}`, () => {

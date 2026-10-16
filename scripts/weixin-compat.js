@@ -22,6 +22,7 @@ function hostFits(host, line) {
 }
 
 const unknownHostError = '未识别 OpenClaw 稳定版本，请先安装或检查内核版本，再安装微信插件。'
+const unreviewedHostError = version => `OpenClaw 稳定版本 ${version} 高于已核实宿主 ${policy.reviewedHostMax}；请保留现有插件，不猜测兼容目标，不自动更新或降级。`
 function unknownPluginError(version) {
   const plugin = pluginParts(version)
   const prefix = plugin && compare(plugin, pluginParts(policy.reviewedVersion)) > 0 ? '检测到更高版本微信插件' : '微信插件'
@@ -32,15 +33,19 @@ export function weixinCompatibility(hostVersion, pluginVersion) {
   const host = versionParts(hostVersion), plugin = pluginParts(pluginVersion)
   const line = plugin && policy.lines.find(l => compare(plugin, versionParts(l.pluginMin)) >= 0 && compare(plugin, versionParts(l.pluginMax)) <= 0)
   if (!host) return { compatible: null, compatError: unknownHostError }
+  if (compare(host, versionParts(policy.reviewedHostMax)) > 0) return { compatible: null, compatError: unreviewedHostError(hostVersion) }
   if (!line) return { compatible: null, compatError: unknownPluginError(pluginVersion) }
+  if (line.hostScope === 'reviewed-only' && !hostFits(host, line) && compare(host, versionParts(line.runtimePeerMin)) >= 0) return { compatible: null, compatError: `微信插件 ${pluginVersion} 声明 peer >=${line.runtimePeerMin}，但与当前宿主 ${hostVersion} 的组合尚未纳入实际核验；请保留现有插件，不自动更新或降级。` }
   const range = `>=${line.hostMin}${line.hostBefore ? ` <${line.hostBefore}` : ''}`
   const compatible = hostFits(host, line)
+  if (!compatible && line.hostBefore === '2026.10.4' && compare(host, versionParts(line.hostBefore)) >= 0) return { compatible: false, compatError: `微信插件 ${pluginVersion} 使用的旧 Plugin SDK 在 OpenClaw 2026.10.4 已移除，当前为 ${hostVersion}；可明确确认修复升级至已核实的 2.4.10，不应将现有插件视为健康。` }
   return { compatible, compatError: compatible ? '' : `微信插件 ${pluginVersion} 要求 OpenClaw ${range}，当前为 ${hostVersion}。` }
 }
 
 export function resolveWeixinInstallVersion(hostVersion, requestedVersion) {
   const host = versionParts(hostVersion)
   if (!host) throw new Error(unknownHostError)
+  if (compare(host, versionParts(policy.reviewedHostMax)) > 0) throw new Error(unreviewedHostError(hostVersion))
   const line = [...policy.lines].reverse().find(l => hostFits(host, l))
   if (!requestedVersion && !line) throw new Error(`当前 OpenClaw ${hostVersion} 低于已核实微信插件的最低要求 >=${policy.lines[0].hostMin}；请先升级内核，不会自动安装或降级插件。`)
   const version = requestedVersion || line?.target

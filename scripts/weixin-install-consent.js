@@ -1,9 +1,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import {buildWeixinCompatibilityStatus} from './weixin-compat.js'
-import {WEIXIN_ARTIFACT,reviewWeixinArchive,consentError} from './weixin-install-consent-artifact.js'
-export {WEIXIN_ARTIFACT,reviewWeixinArchive,readBoundedWeixinTar,verifyWeixinInstalledFiles} from './weixin-install-consent-artifact.js'
+import {buildWeixinCompatibilityStatus,weixinCompatibility} from './weixin-compat.js'
+import {WEIXIN_ARTIFACT,reviewWeixinArchive,consentError,selectWeixinConsentArtifact} from './weixin-install-consent-artifact.js'
+export {WEIXIN_ARTIFACT,WEIXIN_ARTIFACTS,selectWeixinConsentArtifact,reviewWeixinArchive,readBoundedWeixinTar,verifyWeixinInstalledFiles} from './weixin-install-consent-artifact.js'
 const hash=x=>crypto.createHash('sha256').update(x).digest('hex')
 const fail=(code,message)=>{throw consentError(code,message)}
 const same=(a,b)=>{const x=Buffer.from(String(a)),y=Buffer.from(String(b));return x.length===y.length&&crypto.timingSafeEqual(x,y)}
@@ -15,12 +15,12 @@ export function resolveWeixinConsentHostMode(hostVersion,installHelp) {
  return match[1]==='2026.5.12' ? native?'unknown':'legacy-reviewed' : native?'native-cli':'unknown'
 }
 
-export function inspectWeixinConsentHostSdk(packageRoot) {
- const required='openclaw/plugin-sdk/infra-runtime'
+export function inspectWeixinConsentHostSdk(packageRoot,artifact=WEIXIN_ARTIFACT) {
+ const required=artifact.sdkSubpath
  try{
   const root=fs.realpathSync.native(packageRoot),manifest=path.join(root,'package.json'),stat=fs.lstatSync(manifest)
   if(!stat.isFile()||stat.isSymbolicLink()||stat.size>1048576)return {supported:false,required}
-  const bytes=fs.readFileSync(manifest),pkg=JSON.parse(bytes),entry=pkg.exports?.['./plugin-sdk/infra-runtime'],target=typeof entry==='string'?entry:entry?.default
+  const bytes=fs.readFileSync(manifest),pkg=JSON.parse(bytes),entry=pkg.exports?.['./'+required.slice('openclaw/'.length)],target=typeof entry==='string'?entry:entry?.default
   if(!['openclaw','@qingchencloud/openclaw-zh'].includes(pkg.name)||typeof target!=='string'||!target.startsWith('./')||target.includes('\\'))return {supported:false,required}
   const file=path.resolve(root,target),relative=path.relative(root,file)
   if(!relative||relative.startsWith('..')||path.isAbsolute(relative))return {supported:false,required}
@@ -63,8 +63,8 @@ export function validateWeixinRequestOrigin(req) {
  return origin.origin
 }
 
-async function downloadArtifact() {
- const response=await fetch(WEIXIN_ARTIFACT.url,{redirect:'error',signal:AbortSignal.timeout(30000)})
+async function downloadArtifact(artifact) {
+ const response=await fetch(artifact.url,{redirect:'error',signal:AbortSignal.timeout(30000)})
  if(!response.ok||Number(response.headers.get('content-length')||0)>1048576)fail('WEIXIN_UNSAFE_ARTIFACT','下载固定微信包失败或超出配额')
  let size=0;const chunks=[]
  for await(const chunk of response.body){size+=chunk.length;if(size>1048576)fail('WEIXIN_UNSAFE_ARTIFACT','微信包超过压缩体配额');chunks.push(chunk)}
@@ -93,7 +93,7 @@ export function createWeixinConsentManager({root,readState,run,readback,download
  const audit=(r,outcome,error)=>{
   const file=path.join(base,'audit.json');let items=[]
   try{const s=fs.lstatSync(file);if(!s.isFile()||s.isSymbolicLink()||s.size>1048576)fail('WEIXIN_UNSAFE_ARTIFACT','审计记录不安全');items=JSON.parse(fs.readFileSync(file,'utf8'));if(!Array.isArray(items))throw Error()}catch(e){if(e.code!=='ENOENT')throw e}
-  items.push({operationId:r.id,operation:r.operation,at:new Date(clock()).toISOString(),hostVersion:r.state.hostVersion,artifactSha256:WEIXIN_ARTIFACT.sha256,manifestSha256:r.review.manifestSha256,reviewToken:r.review.reviewToken,scan:r.review.scan,outcome,errorCode:error?.code||null,output:r.output||null})
+  items.push({operationId:r.id,operation:r.operation,at:new Date(clock()).toISOString(),hostVersion:r.state.hostVersion,artifactVersion:r.artifact.version,artifactSha256:r.artifact.sha256,manifestSha256:r.review.manifestSha256,reviewToken:r.review.reviewToken,scan:r.review.scan,outcome,errorCode:error?.code||null,output:r.output||null})
   fs.writeFileSync(file,JSON.stringify(items.slice(-64)),{mode:0o600,flag:'w'})
  }
  const tokenRecord=(input,c)=>{
@@ -106,7 +106,7 @@ export function createWeixinConsentManager({root,readState,run,readback,download
  const stateIdentity=s=>JSON.stringify(s)
  return {
   async prepare(input,c) {
-   ctx(c);if(!input||!['install','upgrade'].includes(input.operation)||Object.keys(input).some(k=>k!=='operation'))fail('WEIXIN_CONSENT_REQUIRED','仅允许明确安装或升级固定微信249')
+   ctx(c);if(!input||!['install','upgrade'].includes(input.operation)||Object.keys(input).some(k=>k!=='operation'))fail('WEIXIN_CONSENT_REQUIRED','仅允许明确安装或升级宿主对应的固定微信包')
    init();prune()
    if(running||preparing||records.size>=64||[...records.values()].filter(r=>!r.used&&clock()<=r.expiresAt).length>=8||[...records.values()].filter(r=>!r.used&&r.session===c.sessionKey&&clock()<=r.expiresAt).length>=2||fs.readdirSync(base).filter(n=>n.startsWith('op-')).length>=8)fail('WEIXIN_BUSY','微信安装暂存/会话配额已满或已有安装进行中')
    preparing++
@@ -114,18 +114,19 @@ export function createWeixinConsentManager({root,readState,run,readback,download
    try{
     const state=await readState();ctx(c)
     const compatible=buildWeixinCompatibilityStatus(state.hostVersion,state.installedVersion)
-    if(compatible.installAllowed!==true||compatible.recommendedVersion!=='2.4.9')fail('WEIXIN_HOST_CHANGED',compatible.installError||'当前内核不适用固定微信249')
-    if(state.hostSdk?.supported!==true)fail('WEIXIN_SDK_UNSUPPORTED',`固定微信2.4.9需要 openclaw/plugin-sdk/infra-runtime；当前内核 ${state.hostVersion} 缺少已核实的SDK导出。未安装或替换插件；不自动升级插件或降级内核。`)
+    const artifact=selectWeixinConsentArtifact(state.hostVersion)
+    if(compatible.installAllowed!==true||compatible.recommendedVersion!==artifact.version)fail('WEIXIN_HOST_CHANGED',compatible.installError||'当前内核不适用此固定微信包')
+    if(state.hostSdk?.supported!==true)fail('WEIXIN_SDK_UNSUPPORTED',`固定微信${artifact.version}需要 ${artifact.sdkSubpath}；当前内核 ${state.hostVersion} 缺少已核实的SDK导出。未安装或替换插件；不自动降级内核。`)
     if(!['native-cli','legacy-reviewed'].includes(state.capabilityMode)||resolveWeixinConsentHostMode(state.hostVersion,state.capabilityMode==='native-cli'?'--accept-capabilities':'')!==state.capabilityMode)fail('WEIXIN_LEGACY_UNSUPPORTED','当前 CLI 能力确认契约尚未核实（已核实9.8、10.4和5.12）')
     if(state.capabilityMode==='legacy-reviewed'&&!/^v?2026\.5\.12(?:-\d+)?(?:-zh\.\d+)?$/.test(state.hostVersion))fail('WEIXIN_LEGACY_UNSUPPORTED','旧 CLI 仅已核实2026.5.12')
     if((input.operation==='install')===!!state.installed)fail('WEIXIN_HOST_CHANGED','安装状态已变化，请使用与实际状态相符的安装/升级操作')
-    const bytes=await download();ctx(c);const review=reviewWeixinArchive(bytes)
+    const bytes=await download(artifact);ctx(c);const review=reviewWeixinArchive(bytes,artifact)
     const id=crypto.randomUUID(),dir=path.join(base,'op-'+id);fs.mkdirSync(dir,{mode:0o700});const file=path.join(dir,'artifact.tgz');fs.writeFileSync(file,bytes,{flag:'wx',mode:0o600})
     const token=crypto.randomBytes(32).toString('base64url'),expiresAt=clock()+300000
-    r={id,dir,file,state,operation:input.operation,review,tokenHash:hash(token),session:c.sessionKey,origin:c.origin,expiresAt,used:false};records.set(id,r);audit(r,'prepared')
+    r={id,dir,file,state,artifact,operation:input.operation,review,tokenHash:hash(token),session:c.sessionKey,origin:c.origin,expiresAt,used:false};records.set(id,r);audit(r,'prepared')
     const prior=state.previousDeclared||null,added=Object.fromEntries(Object.entries(review.declared).map(([k,v])=>[k,v.filter(x=>!prior?.[k]?.includes(x))]))
     const {files,...publicReview}=review
-    return {kind:'weixin-install-consent',protocolVersion:1,operationId:id,confirmationToken:token,expiresAt:new Date(expiresAt).toISOString(),operation:r.operation,hostVersion:state.hostVersion,capabilityMode:state.capabilityMode,installedVersion:state.installedVersion,artifact:{...WEIXIN_ARTIFACT},review:{...publicReview,previousDeclared:prior,addedDeclared:added}}
+    return {kind:'weixin-install-consent',protocolVersion:1,operationId:id,confirmationToken:token,expiresAt:new Date(expiresAt).toISOString(),operation:r.operation,hostVersion:state.hostVersion,capabilityMode:state.capabilityMode,installedVersion:state.installedVersion,repairingIncompatible:!!state.installed&&compatible.compatible===false,priorCompatibility:weixinCompatibility(state.hostVersion,state.installedVersion),artifact:{...artifact},review:{...publicReview,previousDeclared:prior,addedDeclared:added}}
    }catch(e){if(r){r.used=true;discard(r)}throw e}finally{preparing--}
   },
   async cancel(input,c){const r=tokenRecord(input,c);r.used=true;audit(r,'cancelled');discard(r);return {cancelled:true}},
@@ -134,14 +135,14 @@ export function createWeixinConsentManager({root,readState,run,readback,download
    const scrub=value=>{let s=c.redact?c.redact(String(value)):String(value);if(input.confirmationToken)s=s.split(input.confirmationToken).join('[REDACTED]');return s.replace(/((?:confirmationToken|authSession(?:Token)?|sessionToken|token|password|secret|api[_-]?key)\s*["']?\s*[:=]\s*["']?)[^\s,"'};]+/gi,'$1[REDACTED]')}
    const emit=event=>onEvent(JSON.parse(scrub(JSON.stringify(event))))
    if(input.accepted!==true)fail('WEIXIN_CONSENT_REQUIRED','需要用户明确勾选并确认本次安装')
-   if(input.artifactSha256!==WEIXIN_ARTIFACT.sha256||input.reviewToken!==r.review.reviewToken||Object.keys(input).some(k=>!['operationId','confirmationToken','accepted','artifactSha256','reviewToken'].includes(k)))fail('WEIXIN_ARTIFACT_CHANGED','确认对象与准备的 artifact/声明面不匹配')
+   if(input.artifactSha256!==r.artifact.sha256||input.reviewToken!==r.review.reviewToken||Object.keys(input).some(k=>!['operationId','confirmationToken','accepted','artifactSha256','reviewToken'].includes(k)))fail('WEIXIN_ARTIFACT_CHANGED','确认对象与准备的 artifact/声明面不匹配')
    if(running||preparing)fail('WEIXIN_BUSY','已有微信安装进行中，请等待')
    running=true;r.used=true
    try{
     const current=await readState();ctx(c)
     if(stateIdentity(current)!==stateIdentity(r.state))fail('WEIXIN_HOST_CHANGED','内核/原插件/配置身份已变化，请重新准备')
     let bytes,review
-    try{physicalDir(r.dir);const stat=fs.lstatSync(r.file);if(!stat.isFile()||stat.isSymbolicLink()||path.relative(fs.realpathSync.native(r.file),r.file)!==''||stat.size!==WEIXIN_ARTIFACT.compressedSize)throw Error();bytes=fs.readFileSync(r.file);review=reviewWeixinArchive(bytes)}catch{fail('WEIXIN_ARTIFACT_CHANGED','暂存微信包/manifest/声明面已变化')}
+    try{physicalDir(r.dir);const stat=fs.lstatSync(r.file);if(!stat.isFile()||stat.isSymbolicLink()||path.relative(fs.realpathSync.native(r.file),r.file)!==''||stat.size!==r.artifact.compressedSize)throw Error();bytes=fs.readFileSync(r.file);review=reviewWeixinArchive(bytes,r.artifact)}catch{fail('WEIXIN_ARTIFACT_CHANGED','暂存微信包/manifest/声明面已变化')}
     if(review.manifestSha256!==r.review.manifestSha256||review.reviewToken!==r.review.reviewToken)fail('WEIXIN_ARTIFACT_CHANGED','声明面已变化')
     ctx(c);if(clock()>r.expiresAt)fail('WEIXIN_EXPIRED','确认已过期')
     audit(r,'accepted')
@@ -153,9 +154,9 @@ export function createWeixinConsentManager({root,readState,run,readback,download
     r.output=scrub([result.stdout,result.stderr].filter(Boolean).join('\n')).slice(-12000)
     if(result.status!==0)fail('WEIXIN_INSTALL_FAILED',`微信安装退出码 ${result.status??'unknown'}\n${r.output}`)
     const actual=await readback(review,emit,r.state)
-    if(actual.installed!==true||actual.version!=='2.4.9'||actual.enabled!==true||actual.sdkLoaded!==true||actual.configVerified!==true)fail('WEIXIN_READBACK_FAILED','CLI exit0，但插件版本/路径/SDK/config实际回读未通过')
+    if(actual.installed!==true||actual.version!==r.artifact.version||actual.enabled!==true||actual.sdkLoaded!==true||actual.configVerified!==true)fail('WEIXIN_READBACK_FAILED','CLI exit0，但插件版本/路径/SDK/config实际回读未通过')
     audit(r,'verified')
-    return {ok:true,operationId:r.id,version:'2.4.9',hostVersion:r.state.hostVersion,message:'微信插件2.4.9安装及实际SDK/配置回读通过',readback:actual,warnings:review.warnings}
+    return {ok:true,operationId:r.id,version:r.artifact.version,hostVersion:r.state.hostVersion,message:`微信插件${r.artifact.version}安装及实际SDK/配置回读通过`,readback:actual,warnings:review.warnings}
    }catch(e){const clean=consentError(typeof e.code==='string'&&/^WEIXIN_[A-Z_]+$/.test(e.code)?e.code:'WEIXIN_INSTALL_FAILED',scrub(e.message||e));audit(r,'failed',clean);throw clean}finally{discard(r);running=false}
   },
  }

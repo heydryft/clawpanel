@@ -1563,6 +1563,8 @@
     "weixinConsentInvalid": "确认协议或固定包信息不完整，请更新面板后重新核对。",
     "weixinConsentInstall": "安装微信插件",
     "weixinConsentUpgrade": "升级微信插件",
+    "weixinRepairUpgrade": "修复升级插件",
+    "weixinConsentRepair": "修复升级：现有版本 {previous} 不兼容当前内核，将替换为 {version}；保留已有账号与配置。",
     "weixinConsentHost": "当前内核：OpenClaw {host}",
     "weixinConsentSource": "来源：{source}",
     "weixinConsentAdded": "本次新增能力",

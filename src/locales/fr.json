@@ -1563,6 +1563,8 @@
     "weixinConsentInvalid": "The consent protocol or pinned artifact is incomplete. Update ClawPanel and review again.",
     "weixinConsentInstall": "Install Weixin plugin",
     "weixinConsentUpgrade": "Upgrade Weixin plugin",
+    "weixinRepairUpgrade": "Repair and upgrade plugin",
+    "weixinConsentRepair": "Repair upgrade: installed {previous} is incompatible with this host. Replace it with {version}, preserving existing accounts and configuration.",
     "weixinConsentHost": "Current host: OpenClaw {host}",
     "weixinConsentSource": "Source: {source}",
     "weixinConsentAdded": "Capabilities added this time",

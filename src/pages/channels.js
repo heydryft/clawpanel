@@ -11,7 +11,7 @@ import { showContentModal, showConfirm } from '../components/modal.js'
 import { icon } from '../lib/icons.js'
 import { CHANNEL_LABELS } from '../lib/channel-labels.js'
 import { t } from '../lib/i18n.js'
-import { renderWeixinConsentReview, renderWeixinManualConsentHint } from './channels-weixin-consent.js'
+import { renderWeixinConsentReview, renderWeixinManualConsentHint, isWeixinConsentPreparation } from './channels-weixin-consent.js'
 import { termHelpHtml, attachTermTooltips } from '../lib/term-tooltip.js'
 import { wsClient } from '../lib/ws-client.js'
 import {
@@ -2322,7 +2322,7 @@ async function openConfigDialog(pid, page, state, accountId) {
     // 不以普通 confirm/回车代替明确勾选；关闭、取消和过期都撤销本次能力。
     const reviewWeixinInstall = async () => {
       const prepared = await api.prepareWeixinInstall(weixinInstalled ? 'upgrade' : 'install')
-      if (!modal.isConnected || prepared.protocolVersion !== 1 || prepared.artifact?.version !== '2.4.9' || !prepared.review?.reviewToken) {
+      if (!modal.isConnected || !isWeixinConsentPreparation(prepared)) {
         try { await api.cancelWeixinInstall(prepared.operationId, prepared.confirmationToken) } catch {} finally { prepared.confirmationToken = null }
         if (!modal.isConnected) return null
         throw new Error(t('channels.weixinConsentInvalid'))
@@ -2387,7 +2387,7 @@ async function openConfigDialog(pid, page, state, accountId) {
         if (error) parts.push(`<br><span style="color:var(--warning)">${escapeAttr(error)}</span>`)
         statusEl.innerHTML = parts.join(' ')
         installBtn.disabled = s.installAllowed !== true
-        installBtn.textContent = installed && s.compatible === false ? t('channels.reinstallCompatible')
+        installBtn.textContent = installed && s.compatible === false ? t(s.updateAvailable ? 'channels.weixinRepairUpgrade' : 'channels.reinstallCompatible')
           : s.updateAvailable ? t('channels.upgradePlugin') : t('channels.weixinInstall')
         loginBtn.disabled = !installed || s.compatible !== true
         restartBtn.disabled = !installed || s.compatible !== true
