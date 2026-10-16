@@ -15,7 +15,10 @@ const toolingRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 function collectCandidateSourceHashes(project) {
   const files = ['scripts/serve.js', 'scripts/dev-api.js', 'scripts/pi-models.js', 'scripts/opencode.js', 'scripts/opencode-proxy.js', 'scripts/deepseek-harness.js', 'scripts/deepseek-harness-auth.js', 'scripts/deepseek-harness-proxy.js', 'src/lib/opencode-storage-bridge.js', 'src/lib/openclaw-gateway-compat.js', 'src/lib/tauri-api.js', 'src/engines/opencode/pages/workspace.js', 'src/engines/opencode/pages/dashboard.js', 'src/engines/hermes/pages/chat.js', 'package.json', 'package-lock.json', 'openclaw-version-policy.json', 'Dockerfile', '.github/maintenance/Runtime.Dockerfile']
   // 新 PM 是运行依赖，存在时必须进入快照；旧分支没有该文件时仍保留原19项。
-  for (const optional of ['scripts/hermes-pm-runtime.js', 'scripts/hermes-managed-install.ps1']) {
+  for (const optional of ['scripts/hermes-pm-runtime.js', 'scripts/hermes-managed-install.ps1',
+    'scripts/hermes-windows-cim-probe.py', 'scripts/hermes-windows-script-envelope.js',
+    'scripts/hermes-legacy-windows-launch.py', 'scripts/hermes-legacy-gateway-identity.py',
+    'scripts/weixin-install-consent.js', 'scripts/weixin-install-consent-artifact.js']) {
     try { fs.lstatSync(path.join(project, optional)); files.push(optional) } catch (error) { if (error.code !== 'ENOENT') throw error }
   }
   return Object.fromEntries(files.map(file => {

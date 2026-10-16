@@ -10,7 +10,14 @@ test('真实验收指纹包含实际发运桥与已有认证/网关依赖，预�
  const deps=source.slice(source.indexOf('report.environment.verifierDependencyHashes'),source.indexOf('report.environment.candidateSourceHashes'))
  assert.ok(deps.includes('src/lib/openclaw-gateway-compat.js'))
  // 基线不存在的 PM 不伪造指纹；候选实际发运该模块时必须读取真实文件。
- assert.match(map,/for \(const optional of \['scripts\/hermes-pm-runtime.js', 'scripts\/hermes-managed-install.ps1'\]\)/)
+ const optional = map.match(/for \(const optional of \[([^]*?)\]\)/)?.[1]
+ assert.ok(optional, '原有可选依赖循环必须存在')
+ assert.deepEqual([...optional.matchAll(/'([^']+)'/g)].map(m=>m[1]), [
+  'scripts/hermes-pm-runtime.js', 'scripts/hermes-managed-install.ps1',
+  'scripts/hermes-windows-cim-probe.py', 'scripts/hermes-windows-script-envelope.js',
+  'scripts/hermes-legacy-windows-launch.py', 'scripts/hermes-legacy-gateway-identity.py',
+  'scripts/weixin-install-consent.js', 'scripts/weixin-install-consent-artifact.js',
+ ])
  assert.match(map,/fs\.lstatSync\(path\.join\(project, optional\)\); files\.push\(optional\)/)
  assert.match(map,/if \(error\.code !== 'ENOENT'\) throw error/)
  assert.match(map,/isFile\(\) && !stat\.isSymbolicLink\(\)/)
