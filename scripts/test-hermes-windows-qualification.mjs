@@ -356,6 +356,7 @@ export function actualRunnerProof() {
 
 // 只读 reparse point 自身，不跟随/执行 AppExecLink；原始数据读取或普通文件 hash 失败均抛错。
 export function windowsPathFingerprintSource() {
+  // 逐文件诊断仅记录序号/阶段/本PS进程CPU；512是日志额度，不是扫描额度。诊断失败不改变原指纹或异常。
   return String.raw`
 if(-not ('ClawPanelReparseReader' -as [type])){Add-Type -TypeDefinition @'
 using System;
@@ -414,16 +415,36 @@ public static class ClawPanelReparseReader {
   }
 }
 '@}
-function Get-ClawPanelPathFingerprint($p){
-  try{$attributes=[IO.File]::GetAttributes($p)}catch [IO.FileNotFoundException]{return [ordered]@{kind='absent';sha256=$null}}catch [IO.DirectoryNotFoundException]{return [ordered]@{kind='absent';sha256=$null}}
-  $item=Get-Item -LiteralPath $p -Force -ErrorAction Stop
-  if(($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){
-    $r=[ClawPanelReparseReader]::Decode([ClawPanelReparseReader]::Read($p))
-    $metadata=[ordered]@{attributes=[int64]$attributes;bytes=$(if($item.PSIsContainer){$null}else{[int64]$item.Length});createdUtc=$item.CreationTimeUtc.Ticks;modifiedUtc=$item.LastWriteTimeUtc.Ticks;reparseTag=$r.ReparseTag;linkType=$r.LinkType;target=$r.Target;printName=$r.PrintName;flags=$r.Flags;version=$r.Version;strings=@($r.Strings);dataSha256=$r.DataSha256}
-    return [ordered]@{kind='reparse';sha256=$null;reparseTag=$r.ReparseTag;linkType=$r.LinkType;target=$r.Target;metadata=$metadata;metadataSha256=(Get-ClawPanelUtf8Sha256 (ConvertTo-Json -InputObject $metadata -Depth 4 -Compress))}
-  }
-  if($item.PSIsContainer){return [ordered]@{kind='directory';sha256=$null;attributes=[int64]$attributes}}
-  return [ordered]@{kind='file';sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash;bytes=[int64]$item.Length;attributes=[int64]$attributes}
+function Write-ClawPanelFingerprintStage($trace,$stage,$event,$bytes){
+  if($null -eq $trace){return}
+  try{
+    if($trace.records -ge 512){return};$trace.records++
+    $cpu=[int64]$trace.process.TotalProcessorTime.TotalMilliseconds
+    [Console]::Error.WriteLine('CLAWPANEL_LAUNCHER_FILE {"directoryIndex":'+$trace.directoryIndex+',"fileIndex":'+$trace.fileIndex+',"stage":"'+$stage+'","event":"'+$event+'","bytes":'+$bytes+',"elapsedMs":'+$trace.clock.ElapsedMilliseconds+',"cpuMs":'+$cpu+'}')
+  }catch{}
+}
+function Get-ClawPanelPathFingerprint($p,$trace=$null){
+  $stage='attributes';$traceBytes=0L
+  try{
+    Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
+    try{$attributes=[IO.File]::GetAttributes($p)}catch [IO.FileNotFoundException]{Write-ClawPanelFingerprintStage $trace $stage 'absent' $traceBytes;return [ordered]@{kind='absent';sha256=$null}}catch [IO.DirectoryNotFoundException]{Write-ClawPanelFingerprintStage $trace $stage 'absent' $traceBytes;return [ordered]@{kind='absent';sha256=$null}}
+    Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes
+    $stage='item';Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
+    $item=Get-Item -LiteralPath $p -Force -ErrorAction Stop
+    Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes
+    if(($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){
+      $stage='reparse';Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
+      $r=[ClawPanelReparseReader]::Decode([ClawPanelReparseReader]::Read($p))
+      $metadata=[ordered]@{attributes=[int64]$attributes;bytes=$(if($item.PSIsContainer){$null}else{[int64]$item.Length});createdUtc=$item.CreationTimeUtc.Ticks;modifiedUtc=$item.LastWriteTimeUtc.Ticks;reparseTag=$r.ReparseTag;linkType=$r.LinkType;target=$r.Target;printName=$r.PrintName;flags=$r.Flags;version=$r.Version;strings=@($r.Strings);dataSha256=$r.DataSha256}
+      $fingerprint=[ordered]@{kind='reparse';sha256=$null;reparseTag=$r.ReparseTag;linkType=$r.LinkType;target=$r.Target;metadata=$metadata;metadataSha256=(Get-ClawPanelUtf8Sha256 (ConvertTo-Json -InputObject $metadata -Depth 4 -Compress))}
+      Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes;return $fingerprint
+    }
+    if($item.PSIsContainer){return [ordered]@{kind='directory';sha256=$null;attributes=[int64]$attributes}}
+    $stage='filehash';$traceBytes=[int64]$item.Length;Write-ClawPanelFingerprintStage $trace $stage 'begin' $traceBytes
+    $sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash
+    Write-ClawPanelFingerprintStage $trace $stage 'end' $traceBytes
+    return [ordered]@{kind='file';sha256=$sha256;bytes=[int64]$item.Length;attributes=[int64]$attributes}
+  }catch{Write-ClawPanelFingerprintStage $trace $stage 'failed' $traceBytes;throw}
 }
 `
 }
@@ -446,12 +467,14 @@ foreach($p in ($paths|Sort-Object -Unique)){$fingerprint=Get-ClawPanelPathFinger
 Write-ClawPanelHostPhase 'launchers'
 $launchers=@();$dirs=@(($env:PATH -split ';')+@("$real\\AppData\\Roaming\\npm","$real\\.local\\bin","$real\\.hermes\\bin"))|Sort-Object -Unique
 $launcherPrefixes=@('hermes','uv','node','npm','python','git');$launcherDirectoryIndex=0
+$launcherFingerprintTrace=@{directoryIndex=0;fileIndex=0;records=0;clock=$hostClock;process=[Diagnostics.Process]::GetCurrentProcess()}
 function Write-ClawPanelLauncherDirectory($index,$event,$count,$bytes){if($index -le 64){[Console]::Error.WriteLine('CLAWPANEL_LAUNCHER_DIRECTORY {"index":'+$index+',"event":"'+$event+'","count":'+$count+',"bytes":'+$bytes+',"elapsedMs":'+$hostClock.ElapsedMilliseconds+'}')}}
 foreach($d in $dirs){if($d -and (Test-Path -LiteralPath $d)){
   $launcherDirectoryIndex++;Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'begin' 0 0
   $launcherFiles=@(@(foreach($prefix in $launcherPrefixes){Get-ChildItem -LiteralPath $d -Filter ($prefix+'*') -File -ErrorAction Stop})|Where-Object {$_.Name -match '^(hermes|uv|node|npm|python|git)([.-].*|[0-9.]*\\.exe|\\.cmd|\\.ps1)?$'}|Sort-Object FullName)
   $launcherBytes=0L;foreach($f in $launcherFiles){$launcherBytes+=$f.Length};Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'enumerated' $launcherFiles.Count $launcherBytes
-  foreach($f in $launcherFiles){$fingerprint=Get-ClawPanelPathFingerprint $f.FullName;$launchers+=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint}}
+  $launcherFingerprintTrace.directoryIndex=$launcherDirectoryIndex;$launcherFingerprintTrace.fileIndex=0
+  foreach($f in $launcherFiles){$launcherFingerprintTrace.fileIndex++;$fingerprint=Get-ClawPanelPathFingerprint $f.FullName $launcherFingerprintTrace;$launchers+=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint}}
   Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'fingerprinted' $launcherFiles.Count $launcherBytes
 }}
 Write-ClawPanelHostPhase 'execution-policy'
