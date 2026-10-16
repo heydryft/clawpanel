@@ -27,9 +27,12 @@ def install_windows_cim_probe(gateway, compat, spawn_server, platform=None):
             except Exception:
                 pass
         try:
-            # 上游只消费这两个字段。CIM仍遍历全部进程，不过滤PID/解释器/其他HOME。
-            projected = [*argv[:3], query.replace('Get-CimInstance Win32_Process |',
-                'Get-CimInstance Win32_Process -Property ProcessId,CommandLine |', 1)]
+            # PS5 CIM在实测VM消耗整核到15秒；换同一Win32_Process的本地WMI读取。
+            # 仍遍历完整进程表并输出原两字段；Core无旧cmdlet时保留CIM，不提权、不远程。
+            inventory = "& { if ($PSVersionTable.PSEdition -eq 'Desktop') { Get-WmiObject -Class Win32_Process -Property ProcessId,CommandLine } else { Get-CimInstance Win32_Process -Property ProcessId,CommandLine } }"
+            command = "[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);$ErrorActionPreference='Stop';" + query.replace(
+                'Get-CimInstance Win32_Process |', inventory + ' |', 1)
+            projected = [*argv[:3], command]
             # 与既有安装器/task presence一致：PS5不能继承启动面板的PS7模块目录。
             child_env = {key: value for key, value in os.environ.items() if key.lower() != 'psmodulepath'}
             proc, job = spawn_server(projected, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -90,7 +93,7 @@ def install_windows_cim_probe(gateway, compat, spawn_server, platform=None):
             value = original_listing()
         except Exception:
             raise SystemExit('Hermes Windows process inventory failed; operation not accepted') from None
-        if value is None:
+        if not isinstance(value, str) or not value.strip() or 'ProcessId=' not in value:
             # 原调用者会吞 Exception；未知库存必须停止，不能变成“无冲突”。
             raise SystemExit('Hermes Windows process inventory unavailable; startup/stop not accepted')
         return value
