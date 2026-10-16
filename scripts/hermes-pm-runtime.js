@@ -821,3 +821,39 @@ export function resolveHermesPmEnvironment(home, source) {
     return selected
   } catch (e) { throw new Error(`Hermes PM 环境记录损坏或越界，请修复当前安装：${e.message}`) }
 }
+
+/** 仅供可信资格工具显式调用；context 不是 VM 证明，调用方必须先 validateRunnerProof。 */
+export function prepareHermesPmImporttimeDiagnostic(spec, { optIn = '', context = '' } = {}) {
+  // 不读取进程环境，不接入普通产品启动入口；非精确字符串 1 保持默认关闭。
+  if (optIn !== '1') return null
+  if (context !== 'qualification-vm-only') throw new Error('Hermes diagnostic requires qualification-vm-only context')
+  const invalid = () => { throw new Error('Hermes diagnostic command contract mismatch') }
+  if (!spec || typeof spec.program !== 'string' || !spec.program || spec.program.includes('\0') ||
+      !Array.isArray(spec.args) || spec.args.some(v => typeof v !== 'string' || v.includes('\0'))) invalid()
+  const a = spec.args
+  if (a[0] !== '-I' || a[1] !== '-B' || a[2] !== '-c' || a[3] !== HERMES_PRIVATE_LAUNCH_SCRIPT ||
+      !a[4] || !a[5] || a[6] !== 'd923a5eb487a17c0a68801bba9ef0f56c81040a8' ||
+      !['--', '--portable'].includes(a[7])) invalid()
+  const words = a.slice(8)
+  const gateway = words.length === 2 && words[0] === 'gateway' && words[1] === 'run'
+  const named = words.length === 4 && words[0] === '--profile' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(words[1]) &&
+    words[2] === 'gateway' && words[3] === 'run'
+  if (!gateway && !named) invalid()
+  const args = [a[0], a[1], '-X', 'importtime', ...a.slice(2)]
+  // 与 Python subprocess.list2cmdline 一致计数，包含程序名、分隔空格、转义和终止 NUL。
+  function quote(value) {
+    const quoted = !value || /[ \t]/.test(value)
+    let output = quoted ? '"' : '', slashes = 0
+    for (const char of value) {
+      if (char === '\\') { slashes++; continue }
+      if (char === '"') output += '\\'.repeat(slashes * 2 + 1) + '"'
+      else output += '\\'.repeat(slashes) + char
+      slashes = 0
+    }
+    return output + '\\'.repeat(slashes * (quoted ? 2 : 1)) + (quoted ? '"' : '')
+  }
+  const windowsCommandLineUtf16WithNul = [spec.program, ...args].map(quote).join(' ').length + 1
+  if (windowsCommandLineUtf16WithNul > 32767) throw new Error('Hermes diagnostic exceeds 32767 UTF16 command-line limit')
+  return { spec: { ...spec, args }, windowsCommandLineUtf16WithNul,
+    scope: 'diagnostic-only-not-acceptance', qualificationPass: false }
+}
