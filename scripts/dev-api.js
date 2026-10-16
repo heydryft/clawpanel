@@ -4,6 +4,7 @@
  * 使浏览器模式能真正管理 OpenClaw 实例
  */
 import fs from 'fs'
+import { hermesWindowsScript } from './hermes-windows-script-envelope.js'
 import { resolveHermesPmEnvironment, hermesManagedInstallPlatformError, HERMES_PRIVATE_COMPLETION_SCRIPT, HERMES_PRIVATE_METADATA_SCRIPT, HERMES_PRIVATE_LAUNCH_SCRIPT } from './hermes-pm-runtime.js'
 import { sanitizeOpenCodeStorage } from './opencode-proxy.js'
 import path from 'path'
@@ -444,7 +445,7 @@ function hermesLaunchSpec(args) {
   if (!environment) throw new Error('Hermes private preflight 缺少当前 checkout 的 PM 环境')
   if (HERMES_STABLE_VERSION !== '0.22.2' || HERMES_STABLE_COMMIT !== 'd923a5eb487a17c0a68801bba9ef0f56c81040a8') throw new Error('Hermes private preflight pin 未审查')
   const python = path.join(environment, isWindows ? 'Scripts' : 'bin', isWindows ? 'python.exe' : 'python3')
-  return { program: python, args: ['-I', '-B', '-c', HERMES_PRIVATE_LAUNCH_SCRIPT, root, home, HERMES_STABLE_COMMIT, '--', ...args] }
+  return { program: python, args: ['-I', '-B', '-c', hermesWindowsScript(HERMES_PRIVATE_LAUNCH_SCRIPT, { platform: process.platform, version: HERMES_STABLE_VERSION, pin: HERMES_STABLE_COMMIT }), root, home, HERMES_STABLE_COMMIT, '--', ...args] }
 }
 
 function spawnHermes(args, options) {

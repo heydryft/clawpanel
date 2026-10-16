@@ -1336,6 +1336,11 @@ fn hermes_launch_spec() -> Result<(PathBuf, Vec<std::ffi::OsString>), String> {
         .and_then(|(_, source)| source.split_once('`'))
         .map(|(script, _)| script)
         .ok_or("Hermes 共享 private launch 脚本缺失")?;
+    let script = if cfg!(target_os = "windows") {
+        super::hermes_windows::render(script, HERMES_STABLE_VERSION, HERMES_STABLE_COMMIT)?
+    } else {
+        script.to_string()
+    };
     let args = vec![
         "-I".into(),
         "-B".into(),
