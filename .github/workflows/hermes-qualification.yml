@@ -421,6 +421,12 @@ jobs:
             files[name]=hashlib.sha256(blob).hexdigest()
           pathlib.Path(os.environ['EVIDENCE'],'source-sha256.json').write_text(json.dumps({'sha':sha,'files':files},indent=2))
           PY
+          # 仅普通用户私有字体，不更新/安装系统包，不修改父进程fontconfig环境。
+          python3 - <<'PY'
+          import runpy,pathlib,os
+          helpers=runpy.run_path('tooling/scripts/hermes-qualification-browser.py')
+          helpers['prepare_private_fonts'](pathlib.Path(os.environ['EVIDENCE']),pathlib.Path(os.environ['RUNNER_TEMP'])/('hermes-font-private-'+os.environ['VARIANT']))
+          PY
           docker build --file tooling/.github/maintenance/Runtime.Dockerfile --tag hermes-qualification-trusted tooling
           sha256sum tooling/.github/maintenance/Runtime.Dockerfile tooling/scripts/maintenance-runtime-smoke.mjs tooling/scripts/hermes-qualification-bootstrap.mjs tooling/scripts/hermes-qualification-browser.py tooling/scripts/hermes-qualification-provider.mjs > "$EVIDENCE/tooling-sha256.txt"
           python3 -m venv "$RUNNER_TEMP/hermes-browser-venv"
@@ -467,7 +473,7 @@ jobs:
           set -euo pipefail
           port=$(cat "$EVIDENCE/host-port.txt")
           for round in 1 2; do
-            "$RUNNER_TEMP/hermes-browser-venv/bin/python" tooling/scripts/hermes-qualification-browser.py --base-url "http://127.0.0.1:$port" --output "$EVIDENCE/browser-round$round" --hold 210
+            "$RUNNER_TEMP/hermes-browser-venv/bin/python" tooling/scripts/hermes-qualification-browser.py --base-url "http://127.0.0.1:$port" --output "$EVIDENCE/browser-round$round" --hold 210 --font-environment "$EVIDENCE"
           done
       - name: 生产 STOP/PID/端口与原始日志（失败也保留）
         if: always()

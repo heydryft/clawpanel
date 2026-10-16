@@ -7,12 +7,13 @@ import net from 'node:net'
 import crypto from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
-import { actualRunnerProof, validateRunnerProof, hostSnapshot, assertHostUnchanged, isolationEnv, assertSameSource, qualificationStatus, validatePrivateCompletion } from './test-hermes-windows-qualification.mjs'
+import { actualRunnerProof, validateRunnerProof, hostSnapshot, assertHostUnchanged, isolationEnv, assertSameSource, qualificationStatus, validatePrivateCompletion, loadQualificationChromium } from './test-hermes-windows-qualification.mjs'
 import { gitSourceManifest, assertSeedIdentity } from './test-hermes-compat-build.mjs'
 import { assertNativeComplete, assertNativeCompatibilitySeed, assertNativeCompatibilityPins, readNativeCompatibilityBinding, assertNativeHealth, assertNativeListeners, assertNativeStopped, runNativeCleanup, createNativeProvider } from './test-hermes-tauri-qualification.mjs'
 
 const OLD = { version: '0.21.5', commit: 'f97608f178d1ffeca59860195ab7da295f7c8e5f' }
 const STATUS = 'passed-web-old-runtime-compatibility', SCOPE = 'new-app-old-runtime-web'
+const PLAYWRIGHT_VERSION = '1.60.0'
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const digest = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const read = file => JSON.parse(fs.readFileSync(physical(file), 'utf8').replace(/^\uFEFF/, ''))
@@ -24,7 +25,7 @@ function physical(file) {
   for (let p = resolved;; p = path.dirname(p)) { if (fs.existsSync(p)) assert.ok(!fs.lstatSync(p).isSymbolicLink(), '拒绝链接祖先'); if (p === path.dirname(p)) break }
   return resolved
 }
-export const webCompatibilityPlan = () => ({ scope: SCOPE, localExecution: false, installsKernel: false, copiesVenv: false, nativeQualification: false, actualBrowser: 'seed HOME playwright 1.58.2 / Chromium', runtime: OLD, installerCalls: 'blocked before request handler' })
+export const webCompatibilityPlan = () => ({ scope: SCOPE, localExecution: false, installsKernel: false, copiesVenv: false, nativeQualification: false, actualBrowser: 'seed HOME playwright 1.60.0 / Chromium headless-shell', runtime: OLD, installerCalls: 'blocked before request handler' })
 export function webCompatibilityArgs(argv) {
   const values = new Set(['--root', '--sha', '--seed-sha', '--web-output', '--build-output', '--output']), o = {}
   for (let i = 0; i < argv.length; i++) {
@@ -44,7 +45,7 @@ export function installerGuardSource(log) {
 
 export function assertWebCompatibilityComplete(r) {
   assert.equal(r.status, STATUS); assert.equal(r.scope, SCOPE); assert.match(r.candidateSha, /^[a-f0-9]{40}$/); assert.match(r.seedSha, /^[a-f0-9]{40}$/); assert.notEqual(r.candidateSha, r.seedSha)
-  assert.equal(r.runtimeVersion, OLD.version); assert.equal(r.actualChromium, true); assert.ok(r.browserVersion); assert.equal(r.playwrightVersion, '1.58.2')
+  assert.equal(r.runtimeVersion, OLD.version); assert.equal(r.actualChromium, true); assert.ok(r.browserVersion); assert.equal(r.playwrightVersion, PLAYWRIGHT_VERSION)
   assert.deepEqual(r.blockedInstallerCommands, []); assert.deepEqual(r.pageErrors, []); assert.ok(!r.error && !r.providerError && !r.cleanupError)
   assert.deepEqual(r.runtimeChecks.map(x => x.phase), ['before-ui', 'after-model-one', 'after-model-two', 'after-cleanup'])
   for (const c of r.runtimeChecks) { assert.equal(c.installed, true); assert.equal(c.version, OLD.version); assert.equal(c.commit, OLD.commit) }
@@ -59,7 +60,7 @@ export function assertWebCompatibilityComplete(r) {
   assert.ok(r.offline?.reconnected); assert.equal(r.offline.before, 2); assert.equal(r.offline.after, r.offline.before)
   for (const name of ['historyPreserved', 'memoryPreserved', 'hostUnchanged', 'sourceUnchanged', 'binaryUnchanged', 'distUnchanged', 'ownedProcessesExited']) assert.equal(r[name], true, name)
   assertNativeStopped(r.cleanup); assert.ok(Array.isArray(r.ownedPorts) && r.ownedPorts.length >= 3); assert.ok(r.cleanup.ports.every(p => r.ownedPorts.includes(p)), '最终端口 canary 漏掉 runtime'); assert.deepEqual(r.finalOpenPorts, [])
-  for (const name of ['sourceManifestSha256', 'applicationSha256', 'seedWebReportSha256', 'seedNativeReportSha256', 'buildReportSha256']) assert.match(r[name] || '', /^[a-f0-9]{64}$/, name)
+  for (const name of ['sourceManifestSha256', 'applicationSha256', 'seedWebReportSha256', 'seedNativeReportSha256', 'buildReportSha256', 'browserExecutableSha256', 'playwrightEntrySha256', 'playwrightPackageSha256', 'coreEntrySha256', 'corePackageSha256', 'coreBundleSha256', 'browserManifestSha256']) assert.match(r[name] || '', /^[a-f0-9]{64}$/, name)
   const artifact = a => { assert.ok(a && a.file && a.bytes > 0); assert.match(a.sha256, /^[a-f0-9]{64}$/) }
   artifact(r.artifacts?.trace); assert.ok(r.artifacts?.screenshots?.length >= 1); r.artifacts.screenshots.forEach(artifact)
 }
@@ -72,6 +73,32 @@ function treeHashes(root) {
 export function assertWebFileCanaries(files) {
   assert.ok(Object.keys(files).length)
   for (const [file, expected] of Object.entries(files)) { physical(file); assert.match(expected, /^[a-f0-9]{64}$/); assert.equal(hash(file), expected, '证据/工具二进制字节漂移: ' + file) }
+}
+export function resolveWebCompatibilityBrowser({ home, env }) {
+  // 仅复用种子私有包；子进程先带固定cache再导入官方registry，不触发安装或查找全局cache。
+  assert.ok(path.isAbsolute(home)); physical(home)
+  const cache = physical(path.join(home, '.browsers')), modules = physical(path.join(home, 'browser-tools/node_modules'))
+  assert.deepEqual(Object.keys(env).filter(k => k.toUpperCase() === 'PLAYWRIGHT_BROWSERS_PATH'), ['PLAYWRIGHT_BROWSERS_PATH'])
+  assert.equal(env.PLAYWRIGHT_BROWSERS_PATH, cache, '只接受原私有HOME cache'); assert.ok(fs.statSync(cache).isDirectory())
+  const paths = {
+    playwrightEntrySha256: path.join(home, 'browser-tools/node_modules/playwright/index.mjs'),
+    playwrightPackageSha256: path.join(modules, 'playwright/package.json'),
+    coreEntrySha256: path.join(modules, 'playwright-core/index.mjs'),
+    corePackageSha256: path.join(modules, 'playwright-core/package.json'),
+    coreBundleSha256: path.join(modules, 'playwright-core/lib/coreBundle.js'),
+    browserManifestSha256: path.join(modules, 'playwright-core/browsers.json'),
+  }
+  for (const file of Object.values(paths)) { physical(file); assert.ok(fs.statSync(file).isFile()) }
+  for (const file of [paths.playwrightPackageSha256, paths.corePackageSha256]) assert.equal(read(file).version, PLAYWRIGHT_VERSION, 'seed browser package/core pin不符')
+  assert.equal(read(paths.browserManifestSha256).browsers.filter(b => b.name === 'chromium-headless-shell').length, 1)
+  const reportHashes = Object.fromEntries(Object.entries(paths).map(([name, file]) => [name, hash(file)]))
+  const code = `import coreBundle from ${JSON.stringify(pathToFileURL(paths.coreBundleSha256).href)};const e=coreBundle.registry.registry.findExecutable('chromium-headless-shell');if(e?.name!=='chromium-headless-shell')throw Error('missing headless shell');console.log(e.executablePath())`
+  const resolved = spawnSync(process.execPath, ['--input-type=module', '-e', code], { env, windowsHide: true, encoding: 'utf8', timeout: 30000 })
+  assert.equal(resolved.status, 0, resolved.stderr); const executable = resolved.stdout.trim(); assert.ok(path.isAbsolute(executable), 'browser路径必须绝对')
+  const browserExe = physical(executable); assert.ok(browserExe !== cache && inside(cache, browserExe), 'headless shell越出私有cache'); assert.ok(fs.statSync(browserExe).isFile())
+  paths.browserExecutableSha256 = browserExe; reportHashes.browserExecutableSha256 = hash(browserExe)
+  const files = Object.fromEntries(Object.entries(paths).map(([name, file]) => [file, reportHashes[name]])); assertWebFileCanaries(files)
+  return { browserExe, playwrightEntry: paths.playwrightEntrySha256, playwrightVersion: PLAYWRIGHT_VERSION, reportHashes, files }
 }
 export async function closeCompatibilityBrowser(browser, snapshot) {
   if (browser) { try { snapshot() } finally { await browser.close() } }
@@ -194,11 +221,10 @@ export async function executeWebCompatibility(o) {
     env = isolationEnv({ home, temp: path.join(output, 'tmp'), realProfile: proof.actualProfile }); fs.mkdirSync(env.TEMP)
     const panel = read(path.join(home, '.openclaw/clawpanel.json')); assert.equal(panel.ignoreRisk, true); assert.equal(panel.engineMode, 'hermes'); assert.deepEqual(panel.enabledEngines, ['hermes'])
     gitHead(); assert.deepEqual(snapshot().processes, [], '旧 HOME 仍有进程，本验收不抢占/杀掉种子')
-    const playwrightEntry = physical(path.join(home, 'browser-tools/node_modules/playwright/index.mjs')), packageFile = path.join(path.dirname(playwrightEntry), 'package.json')
-    assert.equal(read(packageFile).version, '1.58.2'); report.playwrightVersion = '1.58.2'
-    const resolved = spawnSync(process.execPath, ['--input-type=module', '-e', `import {chromium} from ${JSON.stringify(pathToFileURL(playwrightEntry).href)};console.log(chromium.executablePath())`], { env, windowsHide: true, encoding: 'utf8', timeout: 30000 })
-    assert.equal(resolved.status, 0, resolved.stderr); const browserExe = physical(resolved.stdout.trim()); assert.ok(inside(physical(path.join(home, '.browsers')), browserExe)); report.browserExecutableSha256 = hash(browserExe); report.playwrightEntrySha256 = hash(playwrightEntry)
-    for (const f of [browserExe, playwrightEntry, packageFile]) canaries[f] = hash(f)
+    const selectedBrowser = resolveWebCompatibilityBrowser({ home, env }), { playwrightEntry, browserExe } = selectedBrowser
+    assert.equal(prior.browserTooling.playwrightVersion, PLAYWRIGHT_VERSION); assert.equal(prior.browserTooling.coreVersion, PLAYWRIGHT_VERSION)
+    assert.equal(prior.browserTooling.browserManifestSha256, selectedBrowser.reportHashes.browserManifestSha256, '旧种子browser manifest漂移')
+    Object.assign(report, selectedBrowser.reportHashes, { playwrightVersion: selectedBrowser.playwrightVersion }); Object.assign(canaries, selectedBrowser.files)
     write('input-canaries.json', canaries)
     provider = await createNativeProvider({ report, save }); await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve)); providerPort = provider.address().port; ports.add(providerPort)
     webPort = await freePort(); ports.add(webPort); gatewayPort = await freePort(); ports.add(gatewayPort); runtimePorts.add(gatewayPort)
@@ -213,7 +239,7 @@ export async function executeWebCompatibility(o) {
     await api('hermes_profile_use', { name: 'default' }); await api('hermes_env_set', { key: 'API_SERVER_HOST', value: '127.0.0.1' }); await api('hermes_env_set', { key: 'API_SERVER_PORT', value: String(gatewayPort) }); await api('hermes_set_gateway_url', { url: `http://127.0.0.1:${gatewayPort}` })
     const dash = await api('hermes_dashboard_probe'); dashboardPort = dash.port; assert.ok(Number.isInteger(dashboardPort) && dashboardPort > 0); assert.ok(!ports.has(dashboardPort)); ports.add(dashboardPort); runtimePorts.add(dashboardPort)
     if (await reachable(dashboardPort)) captureRuntime(dashboardPort)
-    const { chromium } = await import(pathToFileURL(playwrightEntry).href); browser = await chromium.launch({ headless: true, executablePath: browserExe, env }); report.actualChromium = true; report.browserVersion = browser.version()
+    const chromium = await loadQualificationChromium({ home, cacheDirectory: env.PLAYWRIGHT_BROWSERS_PATH, moduleFile: playwrightEntry }); browser = await chromium.launch({ headless: true, executablePath: browserExe, env }); report.actualChromium = true; report.browserVersion = browser.version()
     context = await browser.newContext({ locale: 'zh-CN' }); await context.tracing.start({ screenshots: true, snapshots: true, sources: true }); context.on('page', p => p.on('pageerror', e => { report.pageErrors.push(String(e)); save() }))
     page = await context.newPage(); const screenshots = []
     for (const [i, model] of ['native-one', 'native-two'].entries()) {

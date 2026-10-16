@@ -271,3 +271,69 @@ test('exec观察：ENOENT syscall包含program时同样脱敏，原Error字段�
   await f.children[0].closed
   assert.equal(originalError.code,'ENOENT');assert.ok(originalError.syscall.includes(secret));assert.ok(!JSON.stringify(f.events).includes(secret))
 })
+
+function assertStreamTiming(rows, stream, bytes) {
+  for (const row of rows.slice(1)) {
+    const timing = row.streamTiming?.[stream]
+    assert.ok(timing, stream + '缺首末块UTC/bytecount')
+    assert.equal(timing.bytes, bytes)
+    if (!bytes) { assert.equal(timing.firstChunkUtc, null); assert.equal(timing.lastChunkUtc, null) }
+    else {
+      assert.match(timing.firstChunkUtc, /^\d{4}-\d\d-\d\dT.*Z$/); assert.match(timing.lastChunkUtc, /^\d{4}-\d\d-\d\dT.*Z$/)
+      assert.ok(timing.firstChunkUtc >= rows[0].utc && timing.firstChunkUtc <= timing.lastChunkUtc && timing.lastChunkUtc <= row.utc)
+    }
+  }
+}
+
+test('stream timing first red E2E：真实UTF8逐字节双流，只增首末UTC与实际bytecount，结果不变', async t => {
+  const { createHermesExecFileObserver } = await load(), f = fixture(t, 'timing-utf8')
+  const stdout = '中文🦞分片', stderr = '错误🧪保留'
+  const source = `for(const [stream,text]of [[process.stdout,${JSON.stringify(stdout)}],[process.stderr,${JSON.stringify(stderr)}]])for(const byte of Buffer.from(text)){stream.write(Buffer.from([byte]));await new Promise(r=>setTimeout(r,5))}`
+  const actual = await f.run(createHermesExecFileObserver(execFile, { write: row => f.events.push(row) }), [f.source(source)], f.options({ encoding: 'buffer' }))
+  await f.children[0].closed
+  assert.equal(actual.error, null); assert.equal(actual.stdout.toString(), stdout); assert.equal(actual.stderr.toString(), stderr)
+  assert.equal(actual.child.stdout.readableEncoding, null); assert.equal(actual.child.stderr.readableEncoding, null)
+  const rows = lifecycle(f.events, actual.child.pid)
+  assertStreamTiming(rows, 'stdout', Buffer.byteLength(stdout)); assertStreamTiming(rows, 'stderr', Buffer.byteLength(stderr))
+  assert.ok(rows[1].streamTiming.stdout.firstChunkUtc < rows[1].streamTiming.stdout.lastChunkUtc)
+  assert.deepEqual(rows[1].streamTiming, rows[2].streamTiming)
+  assert.deepEqual(Object.keys(rows[1].streamTiming).sort(), ['stderr', 'stdout'])
+  assert.deepEqual(Object.keys(rows[1].streamTiming.stdout).sort(), ['bytes', 'firstChunkUtc', 'lastChunkUtc'])
+})
+
+test('stream timing E2E：真实空流与exit7保留null边界、error与两流，观察失败仍不改应用', async t => {
+  const { createHermesExecFileObserver } = await load(), f = fixture(t, 'timing-empty-exit7')
+  for (const code of [0, 7]) {
+    const actual = await f.run(createHermesExecFileObserver(execFile, { write: row => f.events.push(row) }), [f.source(`process.exitCode=${code}`)])
+    await f.children.at(-1).closed
+    assert.equal(actual.error?.code ?? 0, code); assert.equal(actual.stdout, ''); assert.equal(actual.stderr, '')
+    const rows = lifecycle(f.events, actual.child.pid); assertStreamTiming(rows, 'stdout', 0); assertStreamTiming(rows, 'stderr', 0)
+    assert.deepEqual(rows[1].error, fields(actual.error)); assert.equal(rows[2].code, code)
+  }
+})
+
+test('stream timing E2E：真实own Node先exit，应用暂缓读取使pipe迟close，最后块不丢', async t => {
+  const { createHermesExecFileObserver } = await load(), f = fixture(t, 'timing-late-close')
+  const source = "process.stdout.write('early 首流');process.stderr.write('late 尾流');process.exitCode=7"
+  let exitSeen = false, tailAfterExit = false
+  const actualPromise = f.run(createHermesExecFileObserver(execFile, { write: row => f.events.push(row) }), [f.source(source)])
+  const child = f.children[0].child
+  // 应用而非观察器控制读取；真实exit与close分离，不造ChildProcess事件。
+  child.stdout.pause(); child.stderr.pause()
+  child.once('exit', () => { exitSeen = true; setTimeout(() => { child.stdout.resume(); child.stderr.resume() }, 100); assert.equal(f.events.some(e => e.event === 'execFile-close'), false) })
+  child.stderr.on('data', () => { if (exitSeen) tailAfterExit = true })
+  const actual = await actualPromise; await f.children[0].closed
+  assert.equal(tailAfterExit, true); assert.equal(actual.error.code, 7); assert.equal(actual.stdout, 'early 首流'); assert.equal(actual.stderr, 'late 尾流')
+  const rows = lifecycle(f.events, child.pid)
+  assertStreamTiming(rows, 'stdout', Buffer.byteLength(actual.stdout)); assertStreamTiming(rows, 'stderr', Buffer.byteLength(actual.stderr))
+  assert.equal(rows[2].stderr, actual.stderr); assert.deepEqual(rows[1].streamTiming, rows[2].streamTiming)
+})
+
+test('stream timing E2E：原1MiB文本上限不变，总bytes覆盖超限实际流；写入副本不污染close', async t => {
+  const { createHermesExecFileObserver } = await load(), f = fixture(t, 'timing-limit')
+  const observed = createHermesExecFileObserver(execFile, { write: row => { f.events.push(structuredClone(row)); if (row.streamTiming) row.streamTiming.stdout.bytes = -999 } })
+  const actual = await f.run(observed, [f.source(`process.stdout.write('x'.repeat(${limit + 65536}));process.stderr.write('tail')`)], f.options({ maxBuffer: 4 * limit }))
+  await f.children[0].closed; assert.equal(actual.error, null); assert.equal(actual.stdout.length, limit + 65536)
+  const rows = lifecycle(f.events, actual.child.pid); assertStreamTiming(rows, 'stdout', limit + 65536); assertStreamTiming(rows, 'stderr', 4)
+  assert.equal(Buffer.byteLength(rows[1].stdout), limit); assert.equal(rows[1].stdoutTruncated, true); assert.deepEqual(rows[1].streamTiming, rows[2].streamTiming)
+})

@@ -54,8 +54,9 @@ public static class OwnedHashControl {
 }
 '@`
 
-function fixture(count = 1) {
-  const parent = fs.realpathSync(os.tmpdir()), dir = fs.mkdtempSync(path.join(parent, 'cp-host-io-')), real = path.join(dir, 'private'), dirs = [], links = []
+function fixture(count = 1, root = os.tmpdir()) {
+  // native展开8.3别名，与PowerShell provider的FullName一致；只规范自有fixture输入。
+  const parent = fs.realpathSync.native(root), dir = fs.mkdtempSync(path.join(parent, 'cp-host-io-')), real = path.join(dir, 'private'), dirs = [], links = []
   fs.mkdirSync(real)
   for (let i = 0; i < count; i++) {
     const d = path.join(dir, 'paths', String(i).padStart(3, '0')); fs.mkdirSync(d, { recursive: true }); dirs.push(d)
@@ -63,7 +64,7 @@ function fixture(count = 1) {
   }
   return { dir, real, dirs, links, dispose() {
     for (const link of links) { if (fs.existsSync(link) && fs.lstatSync(link).isSymbolicLink()) fs.unlinkSync(link) }
-    assert.equal(path.dirname(fs.realpathSync(dir)), parent); fs.rmSync(dir, { recursive: true, force: true })
+    assert.equal(path.dirname(fs.realpathSync.native(dir)), parent); fs.rmSync(dir, { recursive: true, force: true })
   } }
 }
 
@@ -173,4 +174,54 @@ test('70真实PATH目录完整覆盖、日志限额不截断；初始typed repar
     const rp = j.launchers.find(x => x.path.toLowerCase() === link.toLowerCase()); assert.equal(rp.fingerprint.kind, 'reparse'); assert.equal(rp.sha256, null)
     assert.equal(j.launchers.filter(x => path.basename(path.dirname(x.path)) === '069').length, 2)
   } finally { f.dispose() }
+})
+
+test('真实8.3父路径输入须与provider FullName同口径；mtime/link控制与typed reparse不丢目标', windows, async t => {
+  // 只创建本测试自有目录；GetShortPathName只读，不启用8.3、不改系统或用户配置。
+  const parent = fs.realpathSync.native(path.join(process.env.LOCALAPPDATA, 'Temp'))
+  const root = fs.mkdtempSync(path.join(parent, 'clawpanel io alias '))
+  try {
+    const input = Buffer.from(root).toString('base64')
+    const code = `$ErrorActionPreference='Stop';[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);Add-Type -TypeDefinition 'using System.Text;using System.Runtime.InteropServices;public static class OwnedShortPath{[DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]public static extern uint GetShortPathName(string p,StringBuilder b,uint n);}';$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${input}'));$b=New-Object Text.StringBuilder 32768;$n=[OwnedShortPath]::GetShortPathName($p,$b,32768);if(!$n -or $n -ge 32768){throw 'owned short path query failed'};[Console]::Write($b.ToString())`
+    const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.toLowerCase() !== 'psmodulepath'))
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')], { env, encoding: 'utf8', windowsHide: true, timeout: 30000, maxBuffer: 16 * 1024 * 1024 })
+    assert.equal(r.status, 0, r.stderr)
+    const short = r.stdout, canonical = fs.realpathSync.native(short)
+    assert.notEqual(short.toLowerCase(), canonical.toLowerCase(), '必须是真实8.3别名，不用fake路径或skip替代此边界')
+    assert.equal(canonical, root)
+    const observed = { short, legacy: fs.realpathSync(short), native: canonical, providerPaths: [] }
+    for (const mode of ['none', 'mutate', 'swap', 'postswap', 'reparse']) {
+      await t.test(mode, () => {
+        const f = fixture(1, short)
+        try {
+          const target = path.join(f.dir, 'owned-target.bin'); fs.writeFileSync(target, 'owned-target')
+          let link
+          if (mode === 'swap' || mode === 'postswap' || mode === 'reparse') {
+            link = path.join(f.dir, mode === 'reparse' ? 'paths/000/hermes-link.exe' : 'prepared-link.tmp')
+            fs.symlinkSync(target, link, 'file'); f.links.push(link)
+            if (mode !== 'reparse') f.links.push(path.join(f.dirs[0], 'node-c.exe'))
+          }
+          const before = mode === 'reparse' ? `$link=Join-Path $v.dirs[0] 'hermes-link.exe';[IO.File]::SetAttributes($link,([IO.File]::GetAttributes($link) -band (-bnot ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System))))` : ''
+          const j = run(f, 'short-alias-' + mode, { mode, compare: mode === 'none' || mode === 'reparse', before })
+          if (mode === 'none' || mode === 'reparse') {
+            assert.equal(j.failed, false, JSON.stringify(j)); assert.deepEqual(j.launchers, j.old)
+            for (const row of j.launchers) {
+              observed.providerPaths.push(row.path)
+              assert.equal(path.dirname(row.path), f.dirs[0], JSON.stringify({ ...observed, inputDirectory: f.dirs[0], providerPath: row.path }))
+            }
+            if (mode === 'reparse') {
+              const row = j.launchers.find(x => x.path.toLowerCase() === link.toLowerCase())
+              assert.ok(row, JSON.stringify({ link, rows: j.launchers })); assert.equal(row.fingerprint.kind, 'reparse'); assert.equal(row.sha256, null)
+            }
+          } else {
+            assert.equal(j.swapped, true, JSON.stringify(j)); assert.equal(j.failed, true, JSON.stringify(j)); assert.equal(j.launchers, undefined)
+          }
+        } finally { f.dispose() }
+      })
+    }
+    fs.writeFileSync(path.join(out, 'short-alias-contract.json'), JSON.stringify(observed, null, 2))
+    t.diagnostic(JSON.stringify(observed))
+  } finally {
+    assert.equal(path.dirname(fs.realpathSync.native(root)), parent); fs.rmSync(root, { recursive: true, force: true })
+  }
 })

@@ -21,7 +21,7 @@ test('独立 Web scope；没有本机执行、安装、复制venv或native full�
 function complete() {
   const prompt = (i, model) => ({ nonce: 'native-acceptance-' + `${i}`.repeat(8) + '-0000-4000-8000-000000000000', model, reply: '完整 Unicode 🦀中文；' + i, sessionId: 'session-' + i, clickedSend: true, complete: true, refreshed: true })
   const prompts = [prompt(1, 'native-one'), prompt(2, 'native-two'), prompt(3, 'native-two')]
-  return { status: 'passed-web-old-runtime-compatibility', scope: 'new-app-old-runtime-web', candidateSha: newSha, seedSha: oldSha, runtimeVersion: '0.21.5', actualChromium: true, browserVersion: 'fixture-Chromium', playwrightVersion: '1.58.2', prompts, provider: prompts.map(p => ({ nonce: p.nonce, model: p.model, title: false, authenticated: true })), runtimeChecks: ['before-ui', 'after-model-one', 'after-model-two', 'after-cleanup'].map(phase => ({ phase, installed: true, version: '0.21.5', commit })), blockedInstallerCommands: [], offline: { before: 2, after: 2, reconnected: true }, historyPreserved: true, memoryPreserved: true, hostUnchanged: true, sourceUnchanged: true, binaryUnchanged: true, distUnchanged: true, pageErrors: [], cleanup: { productionStop: true, pidsExited: true, portsClosed: true, identities: [{ pid: 401, creationDate: '2026-10-16T01:00:00.000Z' }], ports: [18791], present: [], listeners: [], reachablePorts: [] }, ownedPorts: [18791, 1420, 21420], finalOpenPorts: [], ownedProcessesExited: true, artifacts: { trace: { file: 'trace.zip', sha256: digest, bytes: 123 }, screenshots: [{ file: 'chat.png', sha256: digest, bytes: 123 }] }, sourceManifestSha256: digest, applicationSha256: digest, seedWebReportSha256: digest, seedNativeReportSha256: digest, buildReportSha256: digest }
+  return { status: 'passed-web-old-runtime-compatibility', scope: 'new-app-old-runtime-web', candidateSha: newSha, seedSha: oldSha, runtimeVersion: '0.21.5', actualChromium: true, browserVersion: 'fixture-Chromium', playwrightVersion: '1.60.0', prompts, provider: prompts.map(p => ({ nonce: p.nonce, model: p.model, title: false, authenticated: true })), runtimeChecks: ['before-ui', 'after-model-one', 'after-model-two', 'after-cleanup'].map(phase => ({ phase, installed: true, version: '0.21.5', commit })), blockedInstallerCommands: [], offline: { before: 2, after: 2, reconnected: true }, historyPreserved: true, memoryPreserved: true, hostUnchanged: true, sourceUnchanged: true, binaryUnchanged: true, distUnchanged: true, pageErrors: [], cleanup: { productionStop: true, pidsExited: true, portsClosed: true, identities: [{ pid: 401, creationDate: '2026-10-16T01:00:00.000Z' }], ports: [18791], present: [], listeners: [], reachablePorts: [] }, ownedPorts: [18791, 1420, 21420], finalOpenPorts: [], ownedProcessesExited: true, artifacts: { trace: { file: 'trace.zip', sha256: digest, bytes: 123 }, screenshots: [{ file: 'chat.png', sha256: digest, bytes: 123 }] }, sourceManifestSha256: digest, applicationSha256: digest, seedWebReportSha256: digest, seedNativeReportSha256: digest, buildReportSha256: digest, browserExecutableSha256: digest, playwrightEntrySha256: digest, playwrightPackageSha256: digest, coreEntrySha256: digest, corePackageSha256: digest, coreBundleSha256: digest, browserManifestSha256: digest }
 }
 
 test('Web 独立完整回执门禁接收全部证据；不以 Provider 的 native 名称视为native验收', async () => {
@@ -82,7 +82,9 @@ test('本机 execute 在读取输入/HOME/hostSnapshot和启动候选前拒绝',
 
 test('复用精确已安装 browser-tools，不增依赖、不改 pin；新serve与完整种子/rawmanifest校验先行', async () => {
   await load(); const text = fs.readFileSync(entry, 'utf8')
-  assert.match(text, /browser-tools\/node_modules\/playwright\/index\.mjs/); assert.match(text, /1\.58\.2/)
+  assert.match(text, /browser-tools\/node_modules\/playwright\/index\.mjs/); assert.match(text, /1\.60\.0/)
+  assert.match(text, /coreBundle\.registry\.registry\.findExecutable\('chromium-headless-shell'\)/)
+  assert.match(text, /await loadQualificationChromium\(/); assert.match(text, /chromium\.launch\(\{ headless: true, executablePath: browserExe, env \}\)/)
   assert.match(text, /assertNativeComplete\(/); assert.match(text, /gitSourceManifest\(/); assert.match(text, /readNativeCompatibilityBinding\(/)
   assert.match(text, /scripts\/serve\.js/); assert.doesNotMatch(text, /npm.*install|pip.*install|copiesVenv:\s*true/)
   assert.ok(text.indexOf('validateRunnerProof(proof)') < text.indexOf('hostSnapshot(proof)'))
@@ -111,4 +113,47 @@ test('CIM读取失败也关闭 owned Chromium，并保持原失败', async () =>
   const m = await load(); let closed = false
   await assert.rejects(m.closeCompatibilityBrowser({ close: async () => { closed = true } }, () => { throw Error('CIM-read-failed') }), /CIM-read-failed/)
   assert.equal(closed, true)
+})
+
+// 新失败清单：旧/浮动PW或core、headed路径、非私有cache、缺exe/模块、链接、七项字节漂移；不安装/启动browser。
+test('完整回执精确1.60.0且七项browser输入hash缺失均保持红灯', async () => {
+  const m = await load()
+  for (const version of ['1.58.2', '1.60.1', undefined]) { const r = complete(); r.playwrightVersion = version; assert.throws(() => m.assertWebCompatibilityComplete(r)) }
+  for (const field of ['browserExecutableSha256', 'playwrightEntrySha256', 'playwrightPackageSha256', 'coreEntrySha256', 'corePackageSha256', 'coreBundleSha256', 'browserManifestSha256']) { const r = complete(); delete r[field]; assert.throws(() => m.assertWebCompatibilityComplete(r), assert.AssertionError, field) }
+})
+
+function browserFixture(t) {
+  const parent = fs.realpathSync.native(os.tmpdir()), home = fs.mkdtempSync(path.join(parent, 'hermes-web-pw160-'))
+  t.after(() => { assert.equal(path.dirname(fs.realpathSync.native(home)), parent); fs.rmSync(home, { recursive: true, force: true }) })
+  const modules = path.join(home, 'browser-tools/node_modules'), pw = path.join(modules, 'playwright'), core = path.join(modules, 'playwright-core'), cache = path.join(home, '.browsers'), exe = path.join(cache, 'chromium_headless_shell-fixture', 'chrome-headless-shell.exe')
+  for (const d of [pw, path.join(core, 'lib'), path.dirname(exe)]) fs.mkdirSync(d, { recursive: true })
+  fs.writeFileSync(path.join(pw, 'index.mjs'), '// 自有惰性module字节canary，禁止browser启动')
+  fs.writeFileSync(path.join(pw, 'package.json'), JSON.stringify({ name: 'playwright', version: '1.60.0' }))
+  fs.writeFileSync(path.join(core, 'package.json'), JSON.stringify({ name: 'playwright-core', version: '1.60.0' }))
+  fs.writeFileSync(path.join(core, 'index.mjs'), '// 自有core module字节canary')
+  fs.writeFileSync(path.join(core, 'browsers.json'), JSON.stringify({ browsers: [{ name: 'chromium-headless-shell', revision: 'fixture' }] }))
+  fs.writeFileSync(path.join(core, 'lib/coreBundle.js'), `const path=require('path');module.exports={registry:{registry:{findExecutable(name){if(name!=='chromium-headless-shell')throw Error('headed path forbidden');return {name,executablePath:()=>process.env.OWNED_BROWSER_OUTSIDE||path.join(process.env.PLAYWRIGHT_BROWSERS_PATH,'chromium_headless_shell-fixture','chrome-headless-shell.exe')}}}}}`)
+  fs.writeFileSync(exe, 'owned inert bytes, not an executable or installation marker')
+  return { home, cache, pw, core, exe, env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: cache } }
+}
+
+test('真实私有child只解析headless-shell；七文件前后canary逐项拒绝漂移且不改父env', async t => {
+  const m = await load(); assert.equal(typeof m.resolveWebCompatibilityBrowser, 'function')
+  const envDigest = () => crypto.createHash('sha256').update(JSON.stringify(Object.entries(process.env).sort())).digest('hex')
+  const f = browserFixture(t), parentEnv = envDigest(), r = m.resolveWebCompatibilityBrowser(f)
+  assert.equal(r.browserExe, f.exe); assert.equal(r.playwrightEntry, path.join(f.pw, 'index.mjs')); assert.equal(r.playwrightVersion, '1.60.0'); assert.equal(Object.keys(r.files).length, 7)
+  assert.equal(envDigest(), parentEnv, '只比较实际环境内容，避免特殊env原型和明文环境diff')
+  for (const file of Object.keys(r.files)) { const original = fs.readFileSync(file); fs.appendFileSync(file, 'drift'); assert.throws(() => m.assertWebFileCanaries(r.files)); fs.writeFileSync(file, original) }
+  assert.doesNotThrow(() => m.assertWebFileCanaries(r.files))
+})
+
+test('旧package/core、错误cache、cache外路径、缺binary和链接祖先均拒绝，不查全局或回退headed', async t => {
+  const m = await load(); assert.equal(typeof m.resolveWebCompatibilityBrowser, 'function')
+  const f = browserFixture(t)
+  for (const file of [path.join(f.pw, 'package.json'), path.join(f.core, 'package.json')]) { const original = fs.readFileSync(file); fs.writeFileSync(file, JSON.stringify({ version: '1.58.2' })); assert.throws(() => m.resolveWebCompatibilityBrowser(f)); fs.writeFileSync(file, original) }
+  assert.throws(() => m.resolveWebCompatibilityBrowser({ ...f, env: { ...f.env, PLAYWRIGHT_BROWSERS_PATH: f.home } }))
+  assert.throws(() => m.resolveWebCompatibilityBrowser({ ...f, env: { ...f.env, OWNED_BROWSER_OUTSIDE: path.join(f.home, 'outside/chrome.exe') } }))
+  fs.unlinkSync(f.exe); assert.throws(() => m.resolveWebCompatibilityBrowser(f)); fs.writeFileSync(f.exe, 'owned inert bytes')
+  const moved = path.join(f.home, 'moved-cache'); fs.renameSync(f.cache, moved); fs.symlinkSync(moved, f.cache, process.platform === 'win32' ? 'junction' : 'dir')
+  try { assert.throws(() => m.resolveWebCompatibilityBrowser(f)) } finally { fs.unlinkSync(f.cache); fs.renameSync(moved, f.cache) }
 })

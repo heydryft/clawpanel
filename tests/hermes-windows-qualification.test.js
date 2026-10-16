@@ -4,6 +4,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import http from 'node:http'
+import { createHermesExecFileObserver } from '../scripts/hermes-exec-observation.mjs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import YAML from 'yaml'
 
@@ -100,10 +103,92 @@ test('单次生产 install/update/reinstall 保持900秒，Provider chat/title�
 test('API/mock 不能冒充用户 UI，native missing 不能冒充完整资格', async () => {
   const { qualificationStatus } = await load()
   const stages = ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve'].map(name => ({ name, status: 'passed' }))
-  const report = { stages, hostUnchanged: true, browser: { actualChromium: true, screenshots: ['a.png'], trace: 'trace.zip', pageErrors: [], completeReply: true, historyAfterReload: true }, nativeTauri: { status: 'not-run' } }
+  const report = { stages, hostUnchanged: true, browser: { actualChromium: true, screenshots: ['a.png'], trace: 'trace.zip', pageErrors: [], completeReply: true, historyAfterReload: true }, nativeTauri: { status: 'not-run' }, gatewayStatusReadback: statusProof() }
   assert.equal(qualificationStatus(report), 'passed-web-native-missing')
   assert.equal(qualificationStatus({ ...report, nativeTauri: { status: 'passed' } }), 'passed-web-native-missing', '外部自述不升级 native 证据')
   for (const bad of [{ ...report, hostUnchanged: false }, { ...report, stages: stages.slice(1) }, { ...report, browser: { ...report.browser, actualChromium: false } }, { ...report, browser: { ...report.browser, pageErrors: ['error'] } }, { ...report, browser: { ...report.browser, historyAfterReload: false } }]) assert.equal(qualificationStatus(bad), 'failed')
+})
+
+// R24 原件的最小白名单投影；不是本机重跑 Hermes/VM 的成绩。
+function statusProof(value = 'Gateway is running (PID: 8100)') {
+  return { schemaVersion: 1, status: 'passed', requestFailed: false,
+    api: { cmd: 'hermes_gateway_action', status: 200, result: value },
+    exec: [
+      { event: 'execFile-start', callId: 5, pid: 8680, utc: '2026-10-16T22:36:18.419Z', command: ['gateway', 'status'] },
+      { event: 'execFile-result', callId: 5, pid: 8680, utc: '2026-10-16T22:36:33.415Z', source: 'callback', error: null, code: null, signal: null, killed: false, stdout: value, stdoutTruncated: false },
+      { event: 'execFile-close', callId: 5, pid: 8680, utc: '2026-10-16T22:36:33.416Z', error: null, code: 0, signal: null, killed: false },
+    ] }
+}
+function completedWebFixture(gatewayStatusReadback) {
+  return { stages: ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve'].map(name => ({ name, status: 'passed' })), hostUnchanged: true,
+    browser: { actualChromium: true, screenshots: ['a.png'], trace: 'trace.zip', pageErrors: [], completeReply: true, historyAfterReload: true }, gatewayStatusReadback }
+}
+
+test('status漏判first red：R24真实200 unknown与SIGTERM，即使其他UI/生命周期全有效仍FAILED', async () => {
+  const { qualificationStatus } = await load(), proof = statusProof('unknown')
+  proof.exec[1] = { ...proof.exec[1], error: { name: 'Error', code: null, signal: 'SIGTERM', killed: true }, signal: 'SIGTERM', killed: true, stdout: '✓ Gateway is running (PID: 8100)\r\n  (Running manually, not as a system service)\r\n\r\nTo install as a Windows Scheduled Task (auto-start on login):\r\n  hermes gateway install\r\n' }
+  proof.exec[2] = { ...proof.exec[2], code: null, signal: 'SIGTERM', killed: true }
+  assert.equal(qualificationStatus(completedWebFixture(proof)), 'failed')
+  assert.equal(qualificationStatus({ ...completedWebFixture(proof), nativeTauri: { status: 'passed', qualificationComplete: true } }), 'failed')
+  assert.equal(qualificationStatus(completedWebFixture(undefined)), 'failed', '缺少独立status不能借health通过')
+})
+
+test('status回读边界：HTTP/空值/unknown/exec错误/缺失/身份与双向输出证据不完整均红', async () => {
+  const { assertGatewayStatusReadback, qualificationStatus } = await load()
+  assert.doesNotThrow(() => assertGatewayStatusReadback(statusProof()))
+  assert.equal(qualificationStatus(completedWebFixture(statusProof())), 'passed-web-native-missing')
+  const invalid = [undefined, {}, { ...statusProof(), status: 'failed' }, { ...statusProof(), requestFailed: true }]
+  for (const value of ['', '  ', 'unknown', ' UNKNOWN\n', null, false, {}, 'Gateway is not running']) invalid.push(statusProof(value))
+  for (const code of [0, 199, 300, 401, 500]) { const p = statusProof(); p.api.status = code; invalid.push(p) }
+  for (const change of [r => { r.exec = [] }, r => { r.exec.pop() }, r => { r.exec[2].code = 7 }, r => { r.exec[1].error = { code: 7 } }, r => { r.exec[1].killed = true }, r => { r.exec[2].signal = 'SIGTERM' }, r => { r.exec[2].pid++ }, r => { r.exec[1].stdout = 'different output' }, r => { r.exec[1].stdoutTruncated = true }, r => { r.exec[0].command = ['profile', 'list'] }, r => { r.exec.push({ ...r.exec[2] }) }, r => { r.exec[1].source = 'close-no-callback' }]) { const p = statusProof(); change(p); invalid.push(p) }
+  for (const p of invalid) { assert.throws(() => assertGatewayStatusReadback(p)); assert.equal(qualificationStatus(completedWebFixture(p)), 'failed'); assert.equal(qualificationStatus({ ...completedWebFixture(p), diagnostic: { enabled: true } }), 'failed') }
+  assert.equal(qualificationStatus({ ...completedWebFixture(statusProof()), diagnostic: { enabled: true } }), 'diagnostic-only-not-qualification')
+})
+
+test('status只读接线E2E：单次真实HTTP与own Node exec，失败继续收集但最终红', async t => {
+  const { collectGatewayStatusReadback, qualificationStatus } = await load()
+  const base = fs.realpathSync(os.tmpdir()), dir = fs.mkdtempSync(path.join(base, 'hermes-status-readback-')), children = [], events = [], receipts = [], runs = []
+  let mode = 'success', requests = 0
+  const server = http.createServer((req, res) => {
+    requests++
+    const stdout = mode === 'empty' ? '' : 'Gateway is running (PID: 8100)'
+    const child = createHermesExecFileObserver(execFile, { write: row => events.push(row) })(process.execPath,
+      ['-e', `process.stdout.write(${JSON.stringify(stdout)});process.exitCode=${mode === 'exec7' ? 7 : 0}`, 'gateway', 'status'],
+      { cwd: dir, env: { ...process.env, NODE_OPTIONS: '', HOME: dir, USERPROFILE: dir }, windowsHide: true, timeout: 15000 },
+      (error, out) => { res.writeHead(mode === 'http500' ? 500 : 200, { 'content-type': 'application/json' }); res.end(JSON.stringify(mode === 'unknown' || error ? 'unknown' : out.trim())) })
+    child.stdin.end(); children.push({ child, closed: new Promise(resolve => child.once('close', resolve)) })
+  })
+  t.after(async () => {
+    await Promise.all(children.map(row => row.closed)); server.closeAllConnections(); await new Promise(resolve => server.close(resolve))
+    if (process.env.HERMES_STATUS_TEST_EVIDENCE) { fs.mkdirSync(process.env.HERMES_STATUS_TEST_EVIDENCE, { recursive: true }); fs.writeFileSync(path.join(process.env.HERMES_STATUS_TEST_EVIDENCE, 'status-http-own-child.json'), JSON.stringify({ scope: 'real localhost HTTP/own Node, simulated downstream markers; not Hermes VM/UI qualification', node: process.version, platform: process.platform, requests, runs, ownedChildren: children.map(({ child }) => ({ pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode })) }, null, 2)) }
+    assert.ok(path.relative(base, dir) && !path.relative(base, dir).startsWith('..')); fs.rmSync(dir, { recursive: true })
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  for (mode of ['success', 'unknown', 'empty', 'exec7', 'http500']) {
+    const before = requests, cursor = events.length
+    const proof = await collectGatewayStatusReadback({ apiReceipts: receipts, readExecEvents: () => events.slice(cursor), request: async () => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/__api/hermes_gateway_action`, { method: 'POST', body: JSON.stringify({ action: 'status' }) })
+      const result = await response.json(); receipts.push({ cmd: 'hermes_gateway_action', status: response.status, result })
+      assert.ok(response.ok && !result?.error)
+      return result
+    } })
+    assert.equal(requests - before, 1, 'status禁止重试/重放')
+    const downstream = ['UI evidence collection', 'update-stop collection', 'reinstall collection']
+    assert.equal(proof.status, mode === 'success' ? 'passed' : 'failed')
+    assert.equal(qualificationStatus(completedWebFixture(proof)), mode === 'success' ? 'passed-web-native-missing' : 'failed')
+    assert.equal(downstream.length, 3); runs.push({ mode, proof, downstream })
+  }
+  const failed = await collectGatewayStatusReadback({ apiReceipts: [], readExecEvents: () => { throw Error('audit unavailable') }, request: async () => { throw Error('transport failed') } })
+  assert.equal(failed.status, 'failed'); assert.equal(qualificationStatus(completedWebFixture(failed)), 'failed')
+})
+
+test('status接线：原一次status在UI之前独立记录；不扩CLI/安装/浏览器预算、不阻断后续收集', () => {
+  const source = fs.readFileSync(script, 'utf8')
+  assert.equal([...source.matchAll(/api\('hermes_gateway_action', \{ action: 'status' \}\)/g)].length, 1)
+  assert.ok(source.includes('r.gatewayStatusReadback = await collectGatewayStatusReadback'))
+  assert.ok(source.indexOf('r.gatewayStatusReadback = await collectGatewayStatusReadback') < source.indexOf('browser = await chromium.launch'))
+  assert.ok(source.includes("write('gateway-status-readback.json', r.gatewayStatusReadback)"))
+  assert.ok(!source.includes('assertGatewayStatusReadback(r.gatewayStatusReadback);'))
 })
 
 test('手工资格 workflow 不绕过 Daily main guard，不写权限/凭据，不运行候选工具', () => {

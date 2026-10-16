@@ -10,7 +10,7 @@ const source = fs.readFileSync(new URL('../scripts/test-hermes-windows-qualifica
 test('Windows Web使用固定Playwright默认headless shell，只安装实际使用的Chromium构建', () => {
   assert.equal(source.match(/'playwright@(\d+\.\d+\.\d+)'/)?.[1], '1.60.0', '固定含官方40747修复的精确版本，不降Node或替换宿主浏览器')
   assert.ok(/\[path\.join\(home, 'browser-tools\/node_modules\/playwright\/cli\.js'\), 'install', '--only-shell', 'chromium'\], \{ timeout: 600000, browserDiagnostics: true \}/.test(source), '固定600秒，额外日志不放宽或替代安装完成')
-  assert.match(source, /browser = await chromium\.launch\(\{ headless: true \}\)/)
+  assert.match(source, /browser = await chromium\.launch\(\{ headless: true, env \}\)/)
   assert.doesNotMatch(source, /chromium\.launch\([^\n]*(?:channel|executablePath)/)
   assert.match(source, /PLAYWRIGHT_BROWSERS_PATH: path\.join\(home,/)
   assert.match(source, /context\.tracing\.start\(\{ screenshots: true, snapshots: true, sources: true \}\)/)

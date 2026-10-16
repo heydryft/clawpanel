@@ -150,6 +150,7 @@ export function assertNativeComplete(r){
  assert.deepEqual(r.artifact,expectedArtifact(r.hostVersion),'报告artifact与精确host不符')
  for(const binding of [r.source,r.tooling]){assert.ok(Object.keys(binding.before).length);for(const v of Object.values(binding.before))assert.ok(validHash(v.sha256)&&exactSha(v.gitBlob));assert.deepEqual(binding.after,binding.before,'源码/tooling哈希漂移')}
  assert.equal(r.tooling.sha,r.runner.toolingSha);assert.ok(validHash(r.build.exeSha256));assert.ok(Object.keys(r.build.dist).length&&Object.values(r.build.dist).every(validHash))
+ assert.equal(debugPath(r.webviewDebugger.runtimePath),debugPath(r.drivers.edge.runtime.path));assert.equal(debugPath(r.webviewDebugger.metadata.userDataFolder),debugPath(r.sessionLaunch.envUserDataFolder));assertWebviewDebugger(r.webviewDebugger);assertWebviewDebuggerClosed(r.webviewDebugger,r.cleanup.webviewDebugger?.observation);assert.ok(r.cleanup.ports.includes(r.webviewDebugger.port));assert.ok(!r.debuggerGap,'存在未闭合debugger边界缺口');
  assertTauriDriverEvidence(r.drivers.tauri,r.drivers.edge,r.build.application);assert.match(r.drivers.edge.version,/^\d+\.\d+\.\d+\.\d+$/);assert.equal(r.drivers.edge.version,r.drivers.edge.runtimeVersion);assert.ok(validHash(r.drivers.edge.sha256))
  assert.deepEqual(r.cases.map(x=>x.id).sort(),[...REQUIRED_CASES].sort())
  for(const c of r.cases){assert.equal(c.status,'passed',c.id);assert.equal(c.evidenceKind,'actual-native');assert.ok(c.receipts?.length&&c.receipts.every(validHash),c.id+'缺真实回执')}
@@ -254,11 +255,67 @@ export class W3C{
 }
 async function until(fn,timeout=120000){const end=Date.now()+timeout;do{const v=await fn();if(v)return v;await wait(300)}while(Date.now()<end);throw Error('bounded wait timeout')}
 function physical(p){p=path.resolve(p);for(let q=p;;q=path.dirname(q)){if(fs.existsSync(q)){assert.ok(!fs.lstatSync(q).isSymbolicLink(),'路径链接');const real=fs.realpathSync.native(q);assert.equal(real.toLowerCase(),q.toLowerCase(),'非physical路径');}if(path.dirname(q)===q)break}return p}
+
+// 调试开关仅限driver及其子进程；不继承其它debugger覆盖，不写宿主环境。
+export function nativeDriverChildEnv(env) {
+  return { ...Object.fromEntries(Object.entries(env).filter(([k]) => !/^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k))), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=0 --remote-debugging-address=127.0.0.1' }
+}
+const debugPath = value => (path.win32.isAbsolute(value) ? path.win32 : path).normalize(value).toLowerCase()
+const debugIdentity = p => `${p.pid}:${p.creationDate}`
+const debugArgs = (text, key) => [...(text || '').matchAll(new RegExp('(?:^|\\s)--' + key + '=(?:"([^"]+)"|([^\\s"]+))(?=\\s|$)', 'g'))].map(m => m[1] || m[2])
+export function assertWebviewDebugger(e) {
+  assert.ok(e && Array.isArray(e.observation?.processes) && Array.isArray(e.observation.listeners), 'DevTools缺实际CIM/TCP观察')
+  const rows = Object.entries(e.metadata?.files || {}).filter(([, row]) => row.exists)
+  assert.ok(rows.length, 'DevToolsActivePort缺失')
+  for (const [name, row] of rows) { assert.ok(['DevToolsActivePort', 'EBWebView/DevToolsActivePort'].includes(name)); assert.ok(row.size <= 4096 && row.contentRead && row.validEndpoint && /^[a-f0-9]{64}$/.test(row.sha256), 'DevTools文件超限/格式错误'); assert.ok(Number.isInteger(row.port) && row.port > 0 && row.port < 65536, 'DevTools端口无效') }
+  const unique = [...new Set(rows.map(([, row]) => row.port))]; assert.equal(unique.length, 1, 'DevTools文件端口歧义'); assert.equal(e.port, unique[0], 'DevTools端口未绑定文件')
+  const paths = path.win32.isAbsolute(e.metadata.userDataFolder) ? path.win32 : path
+  const allowed = rows.map(([name]) => debugPath(paths.dirname(paths.join(e.metadata.userDataFolder, name))))
+  const owners = e.observation.processes.filter(p => p.exe && debugPath(p.exe) === debugPath(e.runtimePath) && debugArgs(p.commandLine, 'user-data-dir').length === 1 && allowed.includes(debugPath(debugArgs(p.commandLine, 'user-data-dir')[0])) && !/(?:^|\s)--type=/.test(p.commandLine || ''))
+  assert.equal(owners.length, 1, 'DevTools缺唯一精确runtime/privateUDD browser进程')
+  const owner = owners[0]; assert.ok(Number.isInteger(owner.pid) && owner.pid > 0 && Number.isFinite(Date.parse(owner.creationDate)), 'DevTools缺PID/CreationDate')
+  assert.deepEqual(debugArgs(owner.commandLine, 'remote-debugging-port'), ['0'], 'DevTools实际命令未开启随机端口')
+  assert.deepEqual(debugArgs(owner.commandLine, 'remote-debugging-address'), ['127.0.0.1'], 'DevTools实际命令未限制回环')
+  const listeners = e.observation.listeners.filter(p => p.port === e.port); assert.ok(listeners.length, 'DevTools缺实际监听端口')
+  for (const p of listeners) { assert.ok(['127.0.0.1', '::1'].includes(p.localAddress), 'DevTools监听非loopback'); assert.equal(p.pid, owner.pid, 'DevTools监听错PID'); assert.equal(p.creationDate, owner.creationDate, 'DevTools监听错CreationDate'); assert.equal(debugPath(p.exe), debugPath(e.runtimePath), 'DevTools监听错runtime') }
+  assert.ok(e.ports?.includes(e.port) && e.identities?.some(p => debugIdentity(p) === debugIdentity(owner) && debugPath(p.exe) === debugPath(e.runtimePath)), 'DevTools未纳入清理端口/身份');
+  if (e.expected) { assert.equal(debugIdentity(owner), debugIdentity(e.expected), 'DevTools身份改变/PID复用'); assert.equal(e.port, e.expected.port, 'DevTools端口改变') }
+  return owner
+}
+export function captureWebviewDebugger({ home, userDataFolder, runtimePath, snapshot, ports, identities, expected }) {
+  const e = { capturedAt: new Date().toISOString(), runtimePath, expected: expected?.process ? { ...expected.process, port: expected.port } : null }
+  try {
+    e.metadata = webviewProfileMetadata({ home, userDataFolder })
+    for (const row of Object.values(e.metadata.files)) if (Number.isInteger(row.port) && row.port > 0 && row.port < 65536) ports.add(row.port)
+    e.ports = [...ports]; e.observation = snapshot([...ports], [...identities.values()])
+    // 仅保存由本次CIM实际观察、属于精确runtime和私有UDD的身份；错owner绝不成为taskkill目标。
+    for (const p of e.observation.processes) if (p.exe && debugPath(p.exe) === debugPath(runtimePath) && debugArgs(p.commandLine, 'user-data-dir').some(v => [userDataFolder, path.join(userDataFolder, 'EBWebView')].some(dir => debugPath(dir) === debugPath(v))) && Number.isInteger(p.pid) && p.pid > 0 && Number.isFinite(Date.parse(p.creationDate))) identities.set(debugIdentity(p), p)
+    for (const p of e.observation.listeners) if (identities.has(debugIdentity(p))) ports.add(p.port)
+    e.ports = [...ports]; e.identities = [...identities.values()]
+    e.port = Object.values(e.metadata.files).find(row => row.port)?.port
+    e.process = assertWebviewDebugger(e); e.status = 'verified-private-webview-debugger'; return e
+  } catch (error) { e.gap = String(error.message); e.identities = [...identities.values()]; e.ports = [...ports]; error.debuggerEvidence = e; throw error }
+}
+export function assertWebviewDebuggerClosed(e, after) {
+  assert.ok(e?.identities?.length && e.ports?.length, 'DevTools清理缺非空身份/端口')
+  for (const key of ['processes', 'present', 'listeners']) assert.ok(Array.isArray(after?.[key]), 'DevTools清理缺实际回读')
+  assert.equal(after.processes.length, 0, 'DevTools私有进程仍存活');
+  assert.ok(e.identities.every(p => Number.isInteger(p.pid) && p.pid > 0 && Number.isFinite(Date.parse(p.creationDate))), 'DevTools清理身份无效');
+  assert.ok(e.ports.every(p => Number.isInteger(p) && p > 0 && p < 65536), 'DevTools清理端口无效');
+  const keys = new Set(e.identities.map(debugIdentity))
+  assert.ok(![...after.processes, ...after.present].some(p => keys.has(debugIdentity(p))), 'DevTools原身份仍存活')
+  assert.ok(!after.listeners.some(p => e.ports.includes(p.port)), 'DevTools监听端口未关闭')
+}
+export function webviewDebuggerObservationSource({ userDataFolder, ports, tracked = [] }) {
+  assert.ok(ports.every(p => Number.isInteger(p) && p > 0 && p < 65536)); assert.ok(tracked.every(p => Number.isInteger(p.pid) && p.pid > 0))
+  return `$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$u=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(userDataFolder).toString('base64')}'));$ports=@(${ports.join(',')});$ids=@(${tracked.map(p => p.pid).join(',')});$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$owned=@($all|Where-Object {$_.ProcessId -ne $PID -and $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -and $_.CommandLine.IndexOf($u,[StringComparison]::OrdinalIgnoreCase) -ge 0});function Row($p){if(!$p -or !$p.CreationDate){throw 'missing debugger CIM identity'};@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath;commandLine=$(if($owned.ProcessId -contains $p.ProcessId){$p.CommandLine}else{$null})}};$listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq 'Listen' -and ($ports -contains [int]$_.LocalPort -or $owned.ProcessId -contains [int]$_.OwningProcess)}|ForEach-Object {$c=$_;$p=$all|Where-Object {$_.ProcessId -eq $c.OwningProcess}|Select-Object -First 1;$r=Row $p;$r.port=[int]$c.LocalPort;$r.localAddress=$c.LocalAddress;$r});@{processes=@($owned|ForEach-Object {Row $_});present=@($all|Where-Object {$ids -contains [int]$_.ProcessId}|ForEach-Object {Row $_});listeners=$listeners}|ConvertTo-Json -Depth 6 -Compress`
+}
+
 export function webviewProfileMetadata({home,userDataFolder}){
  const root=physical(home),folder=physical(userDataFolder);assert.ok(inside(root,folder),'profile越出私有HOME');const result={scope:'read-only explicit UDD metadata; not native launch proof',capturedAt:new Date().toISOString(),userDataFolder:folder,folder:{exists:false},files:{}}
  try{assert.ok(fs.lstatSync(folder).isDirectory(),'profile不是目录');result.folder={exists:true}}catch(e){if(e.code!=='ENOENT')throw e}
  for(const name of ['DevToolsActivePort','EBWebView/DevToolsActivePort']){const file=physical(path.join(folder,name));try{const stat=fs.lstatSync(file),row={exists:true,size:stat.size,mtimeMs:stat.mtimeMs,contentRead:false};assert.ok(stat.isFile()&&!stat.isSymbolicLink(),'DevTools文件类型');result.files[name]=row
-   if(stat.size<=4096){const fd=fs.openSync(file,'r'),buffer=Buffer.alloc(4097);let n;try{n=fs.readSync(fd,buffer,0,buffer.length,0)}finally{fs.closeSync(fd)}if(n<=4096){const bytes=buffer.subarray(0,n),first=bytes.toString('utf8').split(/\r?\n/)[0],port=/^\d+$/.test(first)?Number(first):0;Object.assign(row,{contentRead:true,sha256:sha(bytes),port:port>0&&port<=65535?port:null})}}
+   if(stat.size<=4096){const fd=fs.openSync(file,'r'),buffer=Buffer.alloc(4096);let n,stable;try{n=fs.readSync(fd,buffer,0,buffer.length,0);stable=n===stat.size&&fs.fstatSync(fd).size===n}finally{fs.closeSync(fd)}if(n<=4096&&stable){const bytes=buffer.subarray(0,n),first=bytes.toString('utf8').split(/\r?\n/)[0],port=/^\d+$/.test(first)?Number(first):0;Object.assign(row,{contentRead:true,validEndpoint:/^[1-9]\d{0,4}\r?\n\/devtools\/browser\/[A-Za-z0-9._-]+\r?\n?$/.test(bytes.toString('utf8')),sha256:sha(bytes),port:port>0&&port<=65535?port:null})}}
   }catch(e){if(e.code!=='ENOENT')throw e;result.files[name]={exists:false}}
  }
  return result
@@ -307,7 +364,7 @@ function ps(code){
 const psValue=s=>`[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(s).toString('base64')}'))`
 export function processObservationSource(root,ports,tracked=[],controllerPid=process.pid){
  assert.ok(Number.isInteger(controllerPid)&&controllerPid>0&&ports.every(p=>Number.isInteger(p)&&p>0&&p<65536)&&tracked.every(p=>Number.isInteger(p.pid)&&p.pid>0))
- return `$h=${psValue(root)};$ports=@(${ports.join(',')});$ids=@(${tracked.map(x=>x.pid).join(',')});$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$owned=@($all|Where-Object {$_.ProcessId -ne $PID -and $_.ProcessId -ne ${controllerPid} -and (($_.ExecutablePath -and $_.ExecutablePath.StartsWith($h+'\\',[StringComparison]::OrdinalIgnoreCase)) -or ($_.CommandLine -and $_.CommandLine.IndexOf($h+'\\',[StringComparison]::OrdinalIgnoreCase) -ge 0))});function Row($p){if(!$p.CreationDate){throw 'Missing CreationDate'};@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath;commandLine=$(if($owned.ProcessId -contains $p.ProcessId){$p.CommandLine}else{$null})}};$listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq 'Listen' -and $ports -contains [int]$_.LocalPort}|ForEach-Object {@{port=[int]$_.LocalPort;pid=[int]$_.OwningProcess}});@{processes=@($owned|ForEach-Object {Row $_});present=@($all|Where-Object {$ids -contains [int]$_.ProcessId}|ForEach-Object {Row $_});listeners=$listeners}|ConvertTo-Json -Compress -Depth 5`
+ return `$h=${psValue(root)};$ports=@(${ports.join(',')});$ids=@(${tracked.map(x=>x.pid).join(',')});$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$owned=@($all|Where-Object {$_.ProcessId -ne $PID -and $_.ProcessId -ne ${controllerPid} -and (($_.ExecutablePath -and $_.ExecutablePath.StartsWith($h+'\\',[StringComparison]::OrdinalIgnoreCase)) -or ($_.CommandLine -and $_.CommandLine.IndexOf($h+'\\',[StringComparison]::OrdinalIgnoreCase) -ge 0))});function Row($p){if(!$p -or !$p.CreationDate){throw 'Missing CreationDate'};@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath;commandLine=$(if($owned.ProcessId -contains $p.ProcessId){$p.CommandLine}else{$null})}};$listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq 'Listen' -and ($ports -contains [int]$_.LocalPort -or $owned.ProcessId -contains [int]$_.OwningProcess)}|ForEach-Object {$c=$_;$p=$all|Where-Object {$_.ProcessId -eq $c.OwningProcess}|Select-Object -First 1;$r=Row $p;$r.port=[int]$c.LocalPort;$r.localAddress=$c.LocalAddress;$r});@{processes=@($owned|ForEach-Object {Row $_});present=@($all|Where-Object {$ids -contains [int]$_.ProcessId}|ForEach-Object {Row $_});listeners=$listeners}|ConvertTo-Json -Compress -Depth 6`
 }
 function processSnapshot(root,ports,tracked=[]){
  const out=ps(processObservationSource(root,ports,tracked))
@@ -342,6 +399,11 @@ async function execute(o){
  receipt('isolation-env',{...env,policy:'no inherited credentials; no registry/global launcher writes'})
  const npm=path.join(path.dirname(process.execPath),'node_modules/npm/bin/npm-cli.js');assert.ok(fs.statSync(npm).isFile())
  const pending=new Set(),identities=new Map(),ports=new Set(),driverLogs={stdout:[],stderr:[]},driverLogBytes={stdout:0,stderr:0};let client,driver,server,invokeKey,driverOverflow=false
+ function recordDebugger(stage){
+  try{const evidence=captureWebviewDebugger({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,runtimePath:report.drivers.edge.runtime.path,snapshot:(wanted,tracked)=>processSnapshot(output,wanted,tracked),ports,identities,expected:report.webviewDebugger});report.webviewDebugger||=evidence;(report.debuggerAttempts||=[]).push({stage,evidence});receipt(stage,evidence);save();return evidence}
+  catch(e){report.debuggerGap=String(e.message);(report.debuggerAttempts||=[]).push({stage,evidence:e.debuggerEvidence||null,gap:report.debuggerGap});receipt(stage,{gap:report.debuggerGap,evidence:e.debuggerEvidence||null});save();throw e}
+ }
+
  async function run(program,args,timeout=120000,cwd=root){
   const index=report.commands.length,item={program,args,timeout,cwd,startedAt:new Date().toISOString(),ok:false};report.commands.push(item);save()
   const stdout=[],stderr=[];let size=0
@@ -397,11 +459,12 @@ async function execute(o){
   const panel=path.join(home,'.openclaw');fs.mkdirSync(panel,{recursive:true});const configFile=path.join(panel,'openclaw.json'),panelFile=path.join(panel,'clawpanel.json');fs.writeFileSync(configFile,JSON.stringify({gateway:{mode:'local'},channels:{},plugins:{entries:{}}}));const panelConfig={ignoreRisk:true,openclawDir:panel,nodePath:path.dirname(process.execPath),openclawCliPath:selected.cli,openclawSearchPaths:[selected.cli],engineMode:'openclaw',enabledEngines:['openclaw'],engineSetupChoice:'explicit',autoStartGateway:false};fs.writeFileSync(panelFile,JSON.stringify(panelConfig))
   env.NPM_CONFIG_PREFIX=path.dirname(selected.cli);env.PATH=path.dirname(selected.cli)+';'+env.PATH
   const driverPort=await freePort(),nativePort=await freePort();ports.add(driverPort);ports.add(nativePort)
-  driver=spawn(tauri,['--port',String(driverPort),'--native-port',String(nativePort),'--native-driver',edge],{cwd:root,env,windowsHide:true,stdio:['ignore','pipe','pipe']});assert.ok(driver.pid);pending.add(driver.pid)
+  driver=spawn(tauri,['--port',String(driverPort),'--native-port',String(nativePort),'--native-driver',edge],{cwd:root,env: nativeDriverChildEnv(env),windowsHide:true,stdio:['ignore','pipe','pipe']});assert.ok(driver.pid);pending.add(driver.pid)
   for(const [stream,key] of [[driver.stdout,'stdout'],[driver.stderr,'stderr']])stream.on('data',b=>{driverLogBytes[key]+=b.length;if(driverLogBytes[key]>16*1024*1024){driverOverflow=true;driver.kill()}else driverLogs[key].push(b)})
   await until(async()=>{try{return (await fetch(`http://127.0.0.1:${driverPort}/status`,{signal:AbortSignal.timeout(1000)})).ok}catch{return false}},30000)
   client=new W3C(`http://127.0.0.1:${driverPort}`);const launch={application,envUserDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,before:webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER})};report.sessionLaunch=launch;save()
-  try{await client.create(application,env.WEBVIEW2_USER_DATA_FOLDER)}finally{launch.requestedCapabilities=client.requestedCapabilities||null;launch.sessionCreated=!!client.session;try{launch.after=webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER})}catch(e){launch.metadataError=String(e)}receipt('session-launch',launch);save()}
+  let sessionFailure,debuggerFailure
+  try{await client.create(application,env.WEBVIEW2_USER_DATA_FOLDER)}catch(e){sessionFailure=e;throw e}finally{launch.requestedCapabilities=client.requestedCapabilities||null;launch.sessionCreated=!!client.session;try{launch.after=webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER});recordDebugger('debugger-after-session')}catch(e){debuggerFailure=e;launch.debuggerGap=String(e.message)}receipt('session-launch',launch);save();if(debuggerFailure&&!sessionFailure)throw debuggerFailure}
   const nativeProcesses=processSnapshot(output,[...ports]);assert.ok(nativeProcesses.processes.some(p=>p.exe?.toLowerCase()===application.toLowerCase()),'没有同SHA exe的真实PID');assert.ok(nativeProcesses.processes.some(p=>p.exe?.toLowerCase()===runtime.path.toLowerCase()),'实际WebView2进程不是精确配套runtime');for(const p of nativeProcesses.processes)identities.set(`${p.pid}:${p.creationDate}`,p);receipt('native-process-identities',nativeProcesses)
   const intermediary=nativeProcesses.processes.find(p=>p.pid===driver.pid),nativeDriver=nativeProcesses.processes.filter(p=>p.exe?.toLowerCase()===edge.toLowerCase());assert.equal(nativeDriver.length,1,'实际Microsoft driver进程不明确');tauriEvidence.sha256AfterSession=hash(tauri);tauriEvidence.session={...client.sessionInfo,ports:{intermediary:driverPort,native:nativePort},processes:{intermediary,native:nativeDriver[0]},listeners:nativeProcesses.listeners};assertTauriDriverEvidence(tauriEvidence,report.drivers.edge,application);receipt('tauri-driver-native-session-identity',tauriEvidence);save()
   await until(()=>client.script('return !!window.__TAURI__?.core?.invoke'))
@@ -486,14 +549,16 @@ async function execute(o){
  }catch(e){report.errors.push(redact(e.stack||String(e)));report.status='failed';process.exitCode=1}
  finally{
   // 每项独立尝试；失败后不改宿主/外部任务来追绿。保留私有HOME，不上传。
+  try{if(report.sessionLaunch)recordDebugger('debugger-before-cleanup')}catch(e){report.cleanup.errors.push('debugger boundary: '+String(e.message))}
   try{if(client){receipt('webdriver-trace',client.events);await client.screenshot(path.join(pub,'final.png'))}}catch(e){report.cleanup.errors.push('native final screenshot: '+redact(String(e)))}
   try{if(client)await client.close()}catch(e){report.cleanup.errors.push('native session close: '+redact(String(e)))}
   try{if(server){server.closeAllConnections();await new Promise(r=>server.close(r))}}catch(e){report.cleanup.errors.push('frame server close: '+String(e))}
   try{const snap=processSnapshot(output,[...ports]);receipt('processes-before-cleanup',snap);for(const p of snap.processes)identities.set(`${p.pid}:${p.creationDate}`,p);for(const pid of pending){if(![...identities.values()].some(x=>x.pid===pid)){const r=ps(`$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}';if($p){@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath}|ConvertTo-Json}else{'null'}`);const p=JSON.parse(r);if(p)identities.set(`${p.pid}:${p.creationDate}`,p)}}
    assert.ok(identities.size,'清理身份集合为空');for(const p of identities.values()){const current=processSnapshot(output,[],[p]).present.find(x=>x.pid===p.pid&&x.creationDate===p.creationDate);if(current)spawnSync('taskkill.exe',['/PID',String(p.pid),'/T','/F'],{windowsHide:true,timeout:30000})}
    let after;await until(async()=>{after=processSnapshot(output,[...ports],[...identities.values()]);return !after.processes.length&&!after.listeners.length&&!after.present.some(x=>identities.has(`${x.pid}:${x.creationDate}`))},30000)
-   Object.assign(report.cleanup,{processes:after.processes,listeners:after.listeners,identities:[...identities.values()]});receipt('processes-after-cleanup',after)
+   Object.assign(report.cleanup,{processes:after.processes,listeners:after.listeners,identities:[...identities.values()],ports:[...ports]});receipt('processes-after-cleanup',after)
   }catch(e){report.cleanup.errors.push('PID/CreationDate/port cleanup: '+redact(String(e)))}
+  try{if(report.sessionLaunch){const observed=report.debuggerAttempts?.findLast(x=>x.evidence?.identities?.length&&x.evidence?.ports?.length)?.evidence;const after=processSnapshot(output,[...ports],[...identities.values()]);receipt('debugger-after-cleanup',after);assertWebviewDebuggerClosed(observed,after);report.cleanup.webviewDebugger={observation:after,ports:[...ports]}}}catch(e){report.cleanup.errors.push('debugger final: '+String(e.message))}
   try{const after=shared.hostSnapshot(proof),extraAfter=hostExtra(proof.actualProfile);receipt('host-after',after);receipt('host-extra-after',extraAfter);shared.assertHostUnchanged(before,after);assert.deepEqual(extraAfter,extraBefore);report.cleanup.hostUnchanged=true}catch(e){report.cleanup.errors.push('host canary: '+redact(String(e)))}
   try{if(report.tooling){report.tooling.after=gitSnapshot(tooling,proof.toolingSha);assert.deepEqual(report.tooling.after,report.tooling.before)}if(report.source){report.source.after=gitSnapshot(candidate,o['--sha']);assert.deepEqual(report.source.after,report.source.before)}}catch(e){report.cleanup.errors.push('source/tooling post check: '+String(e))}
   for(const [key,chunks]of Object.entries(driverLogs)){let text=redact(Buffer.concat(chunks).toString('utf8'));if(invokeKey)text=text.replaceAll(invokeKey,'[REDACTED]');fs.writeFileSync(path.join(pub,'driver-'+key+'.log'),text)}

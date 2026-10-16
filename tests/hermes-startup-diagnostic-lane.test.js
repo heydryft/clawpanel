@@ -52,7 +52,12 @@ test('诊断 command line 超出 Windows 32767 限制时失败', async () => {
 test('仅 execute 可显式选择诊断，诊断报告永不满足完整资格', () => {
   assert.equal(parseArgs(['--execute', '--startup-diagnostic'])['--startup-diagnostic'], true)
   assert.throws(() => parseArgs(['--plan', '--startup-diagnostic']), /execute/)
-  assert.equal(qualificationStatus({ diagnostic: { enabled: true }, hostUnchanged: true, stages: ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve'].map(name => ({ name, status: 'passed' })), browser: { actualChromium: true }, nativeTauri: { status: 'passed', qualificationComplete: true } }), 'diagnostic-only-not-qualification')
+  const gatewayStatusReadback = { schemaVersion: 1, status: 'passed', requestFailed: false, api: { cmd: 'hermes_gateway_action', status: 200, result: 'Gateway is running (PID: 1234)' }, exec: [
+    { event: 'execFile-start', callId: 1, pid: 1234, utc: '2026-10-16T22:36:18.419Z', command: ['gateway', 'status'] },
+    { event: 'execFile-result', callId: 1, pid: 1234, utc: '2026-10-16T22:36:19.419Z', source: 'callback', error: null, code: null, signal: null, killed: false, stdout: 'Gateway is running (PID: 1234)', stdoutTruncated: false },
+    { event: 'execFile-close', callId: 1, pid: 1234, utc: '2026-10-16T22:36:19.420Z', error: null, code: 0, signal: null, killed: false },
+  ] }
+  assert.equal(qualificationStatus({ diagnostic: { enabled: true }, hostUnchanged: true, stages: ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve'].map(name => ({ name, status: 'passed' })), browser: { actualChromium: true }, nativeTauri: { status: 'passed', qualificationComplete: true }, gatewayStatusReadback }), 'diagnostic-only-not-qualification')
 })
 test('诊断只允许运行 Windows，不准以 Linux 全 skipped 完成', () => {
   assert.throws(() => matrixFromInputs({ TARGET: 'baseline', BASELINE_SHA: 'a'.repeat(40), PLATFORM: 'linux', STARTUP_DIAGNOSTIC: 'true' }), /Windows/)

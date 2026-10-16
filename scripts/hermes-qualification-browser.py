@@ -6,12 +6,16 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import sys
+import subprocess
+import shlex
+import tarfile
+from xml.sax.saxutils import escape
 import time
 import traceback
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 import uuid
 
 if not __debug__:
@@ -50,11 +54,301 @@ def validate_base_url(value):
     return value.rstrip('/')
 
 
+# 私有测试字体证据：不安装系统包，不修改CSS/DOM，不把cmap声明代替实际渲染。
+def parse_fc_charset(value):
+    assert isinstance(value, str) and value.strip(), 'fontconfig charset缺失'
+    rows, end = [], -1
+    for word in value.split():
+        assert re.fullmatch(r'[0-9a-fA-F]+(?:-[0-9a-fA-F]+)?', word), 'fontconfig charset格式'
+        parts = word.split('-'); first = int(parts[0], 16); last = int(parts[-1], 16)
+        assert end < first <= last <= 0x10ffff, 'fontconfig charset范围/次序'
+        rows.append((first, last)); end = last
+    return rows
+
+
+FONT_NAMES = {'NotoSansCJK-Bold.ttc', 'NotoSansCJK-Regular.ttc', 'NotoSerifCJK-Bold.ttc', 'NotoSerifCJK-Regular.ttc'}
+APT_FONT_FLAGS = ['-o', 'Acquire::AllowInsecureRepositories=false', '-o', 'Acquire::AllowWeakRepositories=false',
+                  '-o', 'APT::Get::AllowUnauthenticated=false', '-o', 'Acquire::ForceHash=SHA256']
+
+
+def font_command(args, *, cwd=None, env=None, timeout=15):
+    try:
+        result = subprocess.run(args, cwd=cwd, env={**(os.environ if env is None else env), 'LC_ALL': 'C.UTF-8'}, capture_output=True, text=True, encoding='utf-8', timeout=timeout, check=False)
+        assert len(result.stdout.encode('utf-8')) <= 4 * 1024 * 1024, '字体metadata输出超限'
+        return {'args': args, 'exitCode': result.returncode, 'stdout': result.stdout, 'error': redact(result.stderr)}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {'args': args, 'exitCode': 127, 'stdout': '', 'error': redact(error)}
+
+
+def deb822(text):
+    rows, row, key = [], {}, None
+    for line in [*text.splitlines(), '']:
+        if not line:
+            if row: rows.append(row)
+            row, key = {}, None
+        elif line[0].isspace():
+            assert key, 'apt字段续行缺键'
+            row[key] += '\n' + line.strip()
+        else:
+            key, sep, value = line.partition(':')
+            assert sep and key not in row, 'apt字段缺失/重复'
+            row[key] = value.strip()
+    return rows
+
+
+def validate_font_download(metadata, indexes, uris, version):
+    records = deb822(metadata)
+    assert len(records) == 1, '字体包索引非唯一'
+    record = records[0]
+    assert record['Package'] == record.get('Source', 'fonts-noto-cjk').split(' ')[0] == 'fonts-noto-cjk'
+    assert record['Architecture'] == 'all' and record['Version'] == version and re.fullmatch(r'[0-9][a-zA-Z0-9.+:~_-]*', version)
+    size, unpacked = int(record['Size']), int(record['Installed-Size']) * 1024
+    assert 0 < size <= 128 * 1024 * 1024 and 0 < unpacked <= 512 * 1024 * 1024, '字体包大小未知/超限'
+    assert re.fullmatch('[a-f0-9]{64}', record['SHA256']), '字体包缺SHA256'
+    name = record['Filename']; parts = PurePosixPath(name).parts
+    assert name.startswith('pool/main/f/fonts-noto-cjk/') and '..' not in parts and name.endswith('_all.deb') and '\\' not in name
+    lines = uris.strip().splitlines(); assert len(lines) == 1, '字体下载URI非唯一'
+    uri, archive, stated_size, stated_hash = shlex.split(lines[0])
+    url = urlsplit(uri)
+    assert url.scheme in ('https', 'http') and not (url.username or url.password or url.query or url.fragment)
+    assert url.hostname in ('archive.ubuntu.com', 'azure.archive.ubuntu.com', 'security.ubuntu.com', 'ports.ubuntu.com') or re.fullmatch(r'[a-z]{2}\.archive\.ubuntu\.com', url.hostname or '')
+    assert unquote(url.path).endswith('/' + unquote(name)) and int(stated_size) == size and stated_hash == 'SHA256:' + record['SHA256']
+    assert re.fullmatch(r'fonts-noto-cjk_[a-zA-Z0-9+_.:%~-]+_all\.deb', archive), '字体下载文件名'
+    trusted = [i for i in deb822(indexes) if i.get('Identifier') == 'Packages' and i.get('Origin') == i.get('Label') == 'Ubuntu'
+               and i.get('Trusted') == 'yes' and uri.startswith(i.get('Site', '').rstrip('/') + '/') and i.get('Site')]
+    assert trusted, '没有相应已签名Ubuntu索引'
+    return {'version': version, 'sha256': record['SHA256'], 'bytes': size, 'unpackedLimit': unpacked,
+            'sourceURL': uri, 'archiveName': archive, 'metadata': record, 'indexes': trusted}
+
+
+def fingerprint_font_file(file, directory='/usr/share/fonts'):
+    file, directory = Path(file), Path(directory)
+    assert file.is_absolute() and file.is_file() and not any(p.is_symlink() for p in [file, *file.parents]), '字体文件类型/路径'
+    assert file.resolve().is_relative_to(directory.resolve()) and file.resolve() == file, '字体不在限定目录/路径链接'
+    h = hashlib.sha256()
+    with file.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(65536), b''): h.update(chunk)
+    return {'file': str(file), 'sha256': h.hexdigest(), 'bytes': file.stat().st_size}
+
+
+# 仅从已校验deb的data tar提取四个普通字体，不执行control/postinst或导入包的系统配置。
+def extract_private_font_tar(stream, destination, unpacked_limit):
+    assert type(unpacked_limit) is int and 0 < unpacked_limit <= 512 * 1024 * 1024
+    destination = Path(destination); assert not destination.exists()
+    destination.mkdir(mode=0o700)
+    class BoundedTar:
+        remaining = unpacked_limit + 4096 * 1024
+        def read(self, size=-1):
+            assert size >= 0, 'tar无界读取'
+            data = stream.read(min(size, self.remaining + 1)); self.remaining -= len(data)
+            assert self.remaining >= 0, 'tar流总量超限'
+            return data
+    bounded = BoundedTar(); members, fonts, seen, total = [], [], set(), 0
+    with tarfile.open(fileobj=bounded, mode='r|') as archive:
+        for member in archive:
+            original = member.name
+            name = original[2:] if original.startswith('./') else original
+            if name in ('', '.') and member.isdir(): continue
+            path = PurePosixPath(name)
+            assert not path.is_absolute() and '..' not in path.parts and '\\' not in name and name not in seen and len(seen) < 4096, 'tar路径逃逸/重复/超额'
+            seen.add(name); item = {'name': name, 'type': member.type.decode('ascii'), 'bytes': member.size, 'extracted': False}
+            assert member.isdir() or member.isfile() or member.issym(), 'tar特殊文件/硬链接'
+            is_font = name.startswith('usr/share/fonts/')
+            if is_font and not member.isdir():
+                assert member.isfile() and name == 'usr/share/fonts/opentype/noto/' + path.name and path.name in FONT_NAMES, '字体成员不是受管普通文件'
+            if member.isfile():
+                total += member.size; assert member.size >= 0 and total <= unpacked_limit, 'tar解压量超限'
+                source = archive.extractfile(member); h = hashlib.sha256(); count = 0
+                target = (destination / path.name).open('xb') if is_font else None
+                try:
+                    for chunk in iter(lambda: source.read(65536), b''):
+                        count += len(chunk); assert count <= member.size
+                        h.update(chunk)
+                        if target: target.write(chunk)
+                finally:
+                    if target: target.close()
+                assert count == member.size, 'tar成员不完整'
+                item['sha256'] = h.hexdigest()
+                if is_font:
+                    item['extracted'] = True
+                    fonts.append({'file': str(destination / path.name), 'bytes': count, 'sha256': h.hexdigest(), 'archiveMember': name})
+            if member.issym(): item['ignoredLinkTarget'] = member.linkname
+            members.append(item)
+    while bounded.read(65536): pass
+    assert {Path(f['file']).name for f in fonts} == FONT_NAMES, '字体成员缺失'
+    return {'members': members, 'fonts': fonts, 'unpackedBytes': total}
+
+
+def verify_private_fonts(proof):
+    root = Path(proof['root'])
+    assert root.is_absolute() and root.resolve() == root and not any(p.is_symlink() for p in [root, *root.parents])
+    assert Path(proof['config']) == root / 'fonts.conf' and Path(proof['archive']).parent == root / 'download', '私有字体证据目录'
+    config = fingerprint_font_file(proof['config'], root); archive = fingerprint_font_file(proof['archive'], root)
+    assert config['sha256'] == proof['configSha256'] and archive['sha256'] == proof['archiveSha256'] and archive['bytes'] == proof['archiveBytes'] > 0, '字体配置/归档漂移'
+    assert len(proof['fonts']) == 4 and {Path(f['file']).name for f in proof['fonts']} == FONT_NAMES
+    for font in proof['fonts']:
+        assert Path(font['file']).parent == root / 'fonts'
+        actual = fingerprint_font_file(font['file'], root / 'fonts')
+        assert actual['sha256'] == font['sha256'] and actual['bytes'] == font['bytes'], '私有字体成员漂移'
+    assert (root / 'cache').is_dir() and not (root / 'cache').is_symlink()
+
+
+def private_font_environment(proof, parent=None):
+    verify_private_fonts(proof)
+    root = Path(proof['root'])
+    child = {**(os.environ if parent is None else parent), 'FONTCONFIG_FILE': str(root / 'fonts.conf'),
+             'FONTCONFIG_PATH': str(root), 'XDG_CACHE_HOME': str(root / 'cache')}
+    child.pop('FONTCONFIG_SYSROOT', None)
+    return child
+
+
+def font_environment(phase, private=None):
+    assert phase in ('before', 'after')
+    assert phase != 'after' or private, 'after必须为私有字体环境'
+    env = private_font_environment(private) if private else None
+    commands = {'packages': font_command(['dpkg-query', '-W', '-f', '${Package}\t${Version}\n', 'fontconfig']),
+                'origin': font_command(['apt-cache', 'policy', 'fonts-noto-cjk']),
+                'fontconfig': font_command(['fc-list', ':lang=zh-cn', '--format', '%{file}\t%{index}\t%{family}\n'], env=env)}
+    result = {'schemaVersion': 2, 'scope': 'private-fontconfig-environment-not-product-fix', 'phase': phase,
+              'platform': sys.platform, 'capturedAt': utc(), 'commands': commands, 'faces': [],
+              'osRelease': Path('/etc/os-release').read_text() if Path('/etc/os-release').is_file() else ''}
+    if phase == 'after':
+        assert sys.platform == 'linux' and all(c['exitCode'] == 0 for c in commands.values()), '既有fontconfig工具未就绪'
+        result['packages'] = dict(row.split('\t', 1) for row in commands['packages']['stdout'].splitlines())
+        assert result['packages'].get('fontconfig'), '既有fontconfig版本缺失'
+        result['packages']['fonts-noto-cjk'] = private['package']['version']; result['private'] = private
+        for font in private['fonts']:
+            query = font_command(['fc-query', '--format', '%{index}\t%{family}\t%{postscriptname}\t%{charset}\n', font['file']], env=env)
+            assert query['exitCode'] == 0, 'fc-query实际字体失败'
+            for line in query['stdout'].splitlines():
+                index, family, postscript, charset = line.split('\t', 3)
+                assert index.isdigit() and family and postscript; parse_fc_charset(charset)
+                result['faces'].append({**font, 'index': int(index), 'family': family, 'postscriptName': postscript, 'charset': charset})
+        assert result['faces'], '未发现实际私有Noto字体face'
+    return result
+
+
+def prepare_private_fonts(evidence, private_root):
+    assert sys.platform == 'linux' and os.geteuid() != 0, '字体准备仅非root Linux job'
+    out, root = Path(evidence).resolve(), Path(private_root).absolute()
+    assert out.is_dir() and out.parent == root.parent and not root.exists() and root.resolve() == root
+    started = time.monotonic()
+    (out / 'fontconfig-before.json').write_text(json.dumps(font_environment('before'), ensure_ascii=False, indent=2))
+    root.mkdir(mode=0o700); download = root / 'download'; download.mkdir(); (root / 'cache').mkdir()
+    receipts = {}
+    def command(label, args, **kwargs):
+        value = font_command(args, **kwargs); receipts[label] = value
+        (out / 'font-package.json').write_text(json.dumps({'status': 'preparing', 'commands': receipts}, ensure_ascii=False, indent=2))
+        assert value['exitCode'] == 0, '字体准备失败: ' + label
+        return value['stdout']
+    policy = command('policy', ['apt-cache', 'policy', 'fonts-noto-cjk'])
+    candidate = re.search(r'^\s*Candidate: (\S+)$', policy, re.M); assert candidate and candidate[1] != '(none)', '字体候选缺失'
+    spec = 'fonts-noto-cjk=' + candidate[1]
+    metadata = command('metadata', ['apt-cache', 'show', '--no-all-versions', spec])
+    indexes = command('indexes', ['apt-get', 'indextargets'])
+    uris = command('uris', ['apt-get', *APT_FONT_FLAGS, '--print-uris', 'download', spec], cwd=download)
+    package = validate_font_download(metadata, indexes, uris, candidate[1])
+    command('download', ['apt-get', *APT_FONT_FLAGS, 'download', spec], cwd=download, timeout=120)
+    deb = download / package['archiveName']; assert list(download.iterdir()) == [deb], '字体下载出现额外文件'
+    actual = fingerprint_font_file(deb, download)
+    assert actual['sha256'] == package['sha256'] and actual['bytes'] == package['bytes'], '字体归档SHA/大小漂移'
+    control = deb822(command('control', ['dpkg-deb', '--field', str(deb)]))
+    assert len(control) == 1 and all(control[0].get(k) == package['metadata'][k] for k in ('Package', 'Version', 'Architecture', 'Installed-Size')), 'deb实际control与索引不同'
+    # dpkg-deb只向pipe解包data，不安装、不执行maintainer scripts。
+    with subprocess.Popen(['dpkg-deb', '--fsys-tarfile', str(deb)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+        try:
+            extracted = extract_private_font_tar(child.stdout, root / 'fonts', package['unpackedLimit'])
+            assert child.wait(timeout=15) == 0, 'deb data解包失败'
+        finally:
+            if child.poll() is None: child.kill()
+    config = root / 'fonts.conf'
+    config.write_text('<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd"><fontconfig>'
+                      '<dir>' + escape(str(root / 'fonts')) + '</dir><cachedir>' + escape(str(root / 'cache')) + '</cachedir>'
+                      '<alias><family>sans-serif</family><prefer><family>Noto Sans CJK SC</family></prefer></alias>'
+                      '<alias><family>serif</family><prefer><family>Noto Serif CJK SC</family></prefer></alias>'
+                      '<alias><family>monospace</family><prefer><family>Noto Sans Mono CJK SC</family></prefer></alias></fontconfig>', encoding='utf-8')
+    proof = {'root': str(root), 'config': str(config), 'configSha256': hashlib.sha256(config.read_bytes()).hexdigest(),
+             'archive': str(deb), 'archiveSha256': actual['sha256'], 'archiveBytes': actual['bytes'], **extracted, 'package': package}
+    command('private-cache', ['fc-cache', '--force', str(root / 'fonts')], env=private_font_environment(proof))
+    (out / 'font-package.json').write_text(json.dumps({'proof': proof, 'commands': receipts}, ensure_ascii=False, indent=2))
+    (out / 'fontconfig-after.json').write_text(json.dumps(font_environment('after', proof), ensure_ascii=False, indent=2))
+    (out / 'font-setup-timing.json').write_text(json.dumps({'elapsedSeconds': time.monotonic()-started, 'scope': 'non-root private font setup outside210s; visual root cause unproven'}))
+
+
+def read_font_environment(directory):
+    root = Path(directory).absolute(); assert not root.is_symlink()
+    snapshots, hashes = {}, {}
+    for phase in ('before', 'after'):
+        file = root / ('fontconfig-' + phase + '.json')
+        assert file.is_file() and not any(p.is_symlink() for p in [file, *file.parents]), '字体环境收据路径'
+        raw = file.read_bytes(); snapshots[phase] = json.loads(raw); hashes[phase + 'Sha256'] = hashlib.sha256(raw).hexdigest()
+        assert snapshots[phase]['phase'] == phase and snapshots[phase]['schemaVersion'] == 2
+    after = snapshots['after']
+    assert after['platform'] == 'linux' and after['faces'] and all(c['exitCode'] == 0 for c in after['commands'].values())
+    assert all(after['packages'].get(name) for name in ('fontconfig', 'fonts-noto-cjk'))
+    env = private_font_environment(after['private']); known = {f['file']: f for f in after['private']['fonts']}
+    for face in after['faces']:
+        parse_fc_charset(face['charset']); font = known[face['file']]
+        assert face['sha256'] == font['sha256'] and face['bytes'] == font['bytes'], '字体face不是实际归档成员'
+    return {**hashes, 'faces': after['faces'], 'childEnv': env, 'rootCause': 'private font remediation pending real screenshot review; not established by cmap alone'}
+
+
+def assert_cjk_coverage(text, platform_fonts, faces):
+    points = sorted({ord(c) for c in text if 0x3400 <= ord(c) <= 0x9fff or 0x20000 <= ord(c) <= 0x323af})
+    assert points, '真实回复缺中文样本'
+    assert isinstance(platform_fonts, list) and platform_fonts, '缺实际CDP字体'
+    used = [f for f in platform_fonts if type(f.get('glyphCount')) in (int, float)
+            and math.isfinite(f['glyphCount']) and f['glyphCount'] > 0 and f['glyphCount'] == int(f['glyphCount'])
+            and f.get('isCustomFont') is False]
+    matched = [f for f in faces if any(p.get('postScriptName') == f['postscriptName'] for p in used)]
+    ranges = [r for f in matched for r in parse_fc_charset(f['charset'])]
+    missing = [format(c, 'x') for c in points if not any(a <= c <= b for a, b in ranges)]
+    assert matched and not missing, '实际渲染字体缺中文glyph覆盖: ' + ','.join(missing)
+    assert all(re.fullmatch('[a-f0-9]{64}', f['sha256']) for f in matched), '实际字体文件hash缺失'
+    return {'textSha256': hashlib.sha256(text.encode()).hexdigest(), 'codepoints': [format(c, 'x') for c in points],
+            'missingCodepoints': missing, 'platformFonts': platform_fonts, 'matchedFaces': matched}
+
+
+def capture_cjk_sample(page, locator, text, label, screenshot, faces):
+    actual = locator.evaluate("""e => { const parts=[]; for(let n=e;n;n=n.parentElement){const p=n.parentElement;parts.unshift(n.localName+(p?':nth-child('+(Array.from(p.children).indexOf(n)+1)+')':''))} const r=e.getBoundingClientRect();return {text:e.innerText,selector:parts.join(' > '),visible:r.width>0&&r.height>0,fontFamily:getComputedStyle(e).fontFamily} }""")
+    assert actual['text'] == text and actual['visible'], '不是实际可见完整中文回复'
+    session = page.context.new_cdp_session(page)
+    try:
+        session.send('DOM.enable'); session.send('CSS.enable')
+        doc = session.send('DOM.getDocument', {'depth': 0})
+        node = session.send('DOM.querySelector', {'nodeId': doc['root']['nodeId'], 'selector': actual['selector']})
+        assert node['nodeId'] > 0, '实际回复DOM节点缺失'
+        fonts = session.send('CSS.getPlatformFontsForNode', {'nodeId': node['nodeId']})['fonts']
+        proof = assert_cjk_coverage(text, fonts, faces)
+    finally:
+        session.detach()
+    screenshot = Path(screenshot)
+    assert screenshot.is_file() and not screenshot.is_symlink(), '实际截图PNG缺失'
+    raw = screenshot.read_bytes(); assert raw[:8] == bytes.fromhex('89504e470d0a1a0a'), '实际截图PNG缺失'
+    return {**proof, 'label': label, 'selector': actual['selector'], 'computedFontFamily': actual['fontFamily'],
+            'screenshot': Path(screenshot).name, 'screenshotSha256': hashlib.sha256(raw).hexdigest()}
+
+
+def validate_cjk_report(proof, texts=None):
+    assert proof['required'] is True and len(proof['samples']) == 2
+    assert [s['label'] for s in proof['samples']] == ['reply', 'restarted']
+    for key in ('beforeSha256', 'afterSha256'):
+        assert re.fullmatch('[a-f0-9]{64}', proof['environment'][key]), '字体环境hash缺失'
+    for i, sample in enumerate(proof['samples']):
+        assert sample['missingCodepoints'] == [] and re.fullmatch('[a-f0-9]{64}', sample['screenshotSha256'])
+        text = texts[i] if texts else ''.join(chr(int(c, 16)) for c in sample['codepoints'])
+        recomputed = assert_cjk_coverage(text, sample['platformFonts'], proof['environment']['faces'])
+        assert sample['codepoints'] == recomputed['codepoints']
+        if texts:
+            assert sample['textSha256'] == recomputed['textSha256'], '字体证明未绑定本轮回复'
+
+
 def parse_options(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base-url', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--hold', type=int, default=210)
+    p.add_argument('--font-environment', help='host准备的fontconfig before/after证据目录；不预建本轮output')
     a = p.parse_args(argv)
     try:
         a.base_url = validate_base_url(a.base_url)
@@ -149,6 +443,8 @@ def validate_report(r):
         nonces.append(n)
         assert send['method'] == 'button.click', '必须实际 Send 按钮'
         assert send['reply'] == full_reply(n) and send['fullReplyVisible'] is True
+    if r.get('cjk', {}).get('required'):
+        validate_cjk_report(r['cjk'], [send['reply'] for send in r['sends']])
     provider = r['provider']
     assert type(provider['afterSequence']) is int and provider['afterSequence'] >= 0
     receipts = provider['receipts']
@@ -209,6 +505,7 @@ def run(a):
          'scriptSha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
          'hold': {'seconds': a.hold, 'health': []}, 'lifecycle': {}, 'sends': [],
          'limitations': ['不安装runtime；warm不是fresh；不归因本机异常signal；不覆盖Tauri；不是releaseReady']}
+    r['cjk'] = {'required': bool(getattr(a, 'font_environment', None)), 'samples': [], 'status': 'not-requested'}
     browser = context = page = None
 
     def save():
@@ -216,6 +513,10 @@ def run(a):
 
     try:
         # host readiness：只需 Playwright 模块和预装 Chromium；不在脚本里 pip/install。
+        font_faces, font_child_env = [], None
+        if r['cjk']['required']:
+            environment = read_font_environment(a.font_environment); font_faces = environment.pop('faces'); font_child_env = environment.pop('childEnv')
+            r['cjk'].update(environment={**environment, 'faces': []}, status='pending-actual-rendering')
         import playwright
         from playwright.sync_api import sync_playwright, expect
         from importlib.metadata import version
@@ -224,7 +525,7 @@ def run(a):
                      'headless': True}
         with sync_playwright() as p:
             assert Path(p.chromium.executable_path).is_file(), 'host Chromium 未就绪，请由 workflow 预装'
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, env=font_child_env)
             context = browser.new_context(viewport={'width': 1440, 'height': 1000}, locale='zh-CN')
             context.tracing.start(screenshots=True, snapshots=True, sources=True)
             page = context.new_page()
@@ -304,6 +605,10 @@ def run(a):
                 reply = send(nonce)
                 r['steps'].append(expected_steps(a.hold)[1])
                 page.screenshot(path=str(out / 'reply.png'))
+                if r['cjk']['required']:
+                    sample = capture_cjk_sample(page, page.get_by_text(reply, exact=True).last, reply, 'reply', out / 'reply.png', font_faces)
+                    r['cjk']['samples'].append(sample); r['cjk']['environment']['faces'] = sample['matchedFaces']
+                    save()
                 page.reload(wait_until='domcontentloaded')
                 online()
                 expect(page.get_by_text(reply, exact=True).last).to_be_visible(timeout=60000)
@@ -347,6 +652,13 @@ def run(a):
                 reply2 = send('browser-acceptance-' + str(uuid.uuid4()))
                 r['steps'].append(expected_steps(a.hold)[6])
                 page.screenshot(path=str(out / 'restarted.png'))
+                if r['cjk']['required']:
+                    sample = capture_cjk_sample(page, page.get_by_text(reply2, exact=True).last, reply2, 'restarted', out / 'restarted.png', font_faces)
+                    r['cjk']['samples'].append(sample)
+                    known = {(f['file'], f['index']) for f in r['cjk']['environment']['faces']}
+                    r['cjk']['environment']['faces'].extend(f for f in sample['matchedFaces'] if (f['file'], f['index']) not in known)
+                    r['cjk']['status'] = 'cmap-and-actual-fonts-verified-png-review-pending'
+                    save()
                 api('hermes_gateway_action', {'action': 'stop'})
                 r['lifecycle']['finalStop'] = stopped()
                 expect(page.get_by_text(reply, exact=True).last).to_be_visible(timeout=10000)

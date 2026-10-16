@@ -247,6 +247,8 @@ export async function runNativeCleanup(steps) {
 function assertNativeUiComplete(r) {
   assertNativeTooling(r)
   assertNativePage(r.nativePage)
+  assert.equal(r.webviewRuntime?.driverSource?.candidateSha, r.mode === COMPATIBILITY_MODE ? r.seedSha : r.candidateSha, 'driver builder来源SHA不是当前app/兼容seed')
+  assert.equal(nativePath(r.webviewDebugger.metadata.userDataFolder), nativePath(r.sessionLaunch.envUserDataFolder)); assertWebviewDebugger(r.webviewDebugger); assertWebviewDebuggerClosed(r.webviewDebugger, r.webviewDebuggerCleanup); assert.ok(!r.debuggerGap, '存在未闭合debugger边界缺口'); assert.equal(nativePath(r.webviewDebugger.runtimePath), nativePath(r.webviewRuntime.path)); assert.ok(r.allFinalPorts.includes(r.webviewDebugger.port))
   assert.ok(r.completed && r.hostUnchanged && r.nativeProcessesExited && r.driverPortsClosed)
   assert.ok(!r.error && !r.cleanupError && !r.hostOrSourceError && !r.providerError)
   assert.equal(r.rounds.length, 2)
@@ -445,6 +447,76 @@ export class NativeWebDriver {
   async close() { if (this.session) { await this.command('DELETE', ''); this.session = null } }
 }
 
+
+// 调试开关仅限driver及其子进程；不继承其它debugger覆盖，不写宿主环境。
+export function nativeDriverChildEnv(env) {
+  return { ...Object.fromEntries(Object.entries(env).filter(([k]) => !/^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k))), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=0 --remote-debugging-address=127.0.0.1' }
+}
+const debugPath = value => (path.win32.isAbsolute(value) ? path.win32 : path).normalize(value).toLowerCase()
+const debugIdentity = p => `${p.pid}:${p.creationDate}`
+const debugArgs = (text, key) => [...(text || '').matchAll(new RegExp('(?:^|\\s)--' + key + '=(?:"([^"]+)"|([^\\s"]+))(?=\\s|$)', 'g'))].map(m => m[1] || m[2])
+export function assertWebviewDebugger(e) {
+  assert.ok(e && Array.isArray(e.observation?.processes) && Array.isArray(e.observation.listeners), 'DevTools缺实际CIM/TCP观察')
+  const rows = Object.entries(e.metadata?.files || {}).filter(([, row]) => row.exists)
+  assert.ok(rows.length, 'DevToolsActivePort缺失')
+  for (const [name, row] of rows) { assert.ok(['DevToolsActivePort', 'EBWebView/DevToolsActivePort'].includes(name)); assert.ok(row.size <= 4096 && row.contentRead && row.validEndpoint && /^[a-f0-9]{64}$/.test(row.sha256), 'DevTools文件超限/格式错误'); assert.ok(Number.isInteger(row.port) && row.port > 0 && row.port < 65536, 'DevTools端口无效') }
+  const unique = [...new Set(rows.map(([, row]) => row.port))]; assert.equal(unique.length, 1, 'DevTools文件端口歧义'); assert.equal(e.port, unique[0], 'DevTools端口未绑定文件')
+  const paths = path.win32.isAbsolute(e.metadata.userDataFolder) ? path.win32 : path
+  const allowed = rows.map(([name]) => debugPath(paths.dirname(paths.join(e.metadata.userDataFolder, name))))
+  const owners = e.observation.processes.filter(p => p.exe && debugPath(p.exe) === debugPath(e.runtimePath) && debugArgs(p.commandLine, 'user-data-dir').length === 1 && allowed.includes(debugPath(debugArgs(p.commandLine, 'user-data-dir')[0])) && !/(?:^|\s)--type=/.test(p.commandLine || ''))
+  assert.equal(owners.length, 1, 'DevTools缺唯一精确runtime/privateUDD browser进程')
+  const owner = owners[0]; assert.ok(Number.isInteger(owner.pid) && owner.pid > 0 && Number.isFinite(Date.parse(owner.creationDate)), 'DevTools缺PID/CreationDate')
+  assert.deepEqual(debugArgs(owner.commandLine, 'remote-debugging-port'), ['0'], 'DevTools实际命令未开启随机端口')
+  assert.deepEqual(debugArgs(owner.commandLine, 'remote-debugging-address'), ['127.0.0.1'], 'DevTools实际命令未限制回环')
+  const listeners = e.observation.listeners.filter(p => p.port === e.port); assert.ok(listeners.length, 'DevTools缺实际监听端口')
+  for (const p of listeners) { assert.ok(['127.0.0.1', '::1'].includes(p.localAddress), 'DevTools监听非loopback'); assert.equal(p.pid, owner.pid, 'DevTools监听错PID'); assert.equal(p.creationDate, owner.creationDate, 'DevTools监听错CreationDate'); assert.equal(debugPath(p.exe), debugPath(e.runtimePath), 'DevTools监听错runtime') }
+  assert.ok(e.ports?.includes(e.port) && e.identities?.some(p => debugIdentity(p) === debugIdentity(owner) && debugPath(p.exe) === debugPath(e.runtimePath)), 'DevTools未纳入清理端口/身份');
+  if (e.expected) { assert.equal(debugIdentity(owner), debugIdentity(e.expected), 'DevTools身份改变/PID复用'); assert.equal(e.port, e.expected.port, 'DevTools端口改变') }
+  return owner
+}
+export function captureWebviewDebugger({ home, userDataFolder, runtimePath, snapshot, ports, identities, expected }) {
+  const e = { capturedAt: new Date().toISOString(), runtimePath, expected: expected?.process ? { ...expected.process, port: expected.port } : null }
+  try {
+    e.metadata = webviewProfileMetadata({ home, userDataFolder })
+    for (const row of Object.values(e.metadata.files)) if (Number.isInteger(row.port) && row.port > 0 && row.port < 65536) ports.add(row.port)
+    e.ports = [...ports]; e.observation = snapshot([...ports], [...identities.values()])
+    // 仅保存由本次CIM实际观察、属于精确runtime和私有UDD的身份；错owner绝不成为taskkill目标。
+    for (const p of e.observation.processes) if (p.exe && debugPath(p.exe) === debugPath(runtimePath) && debugArgs(p.commandLine, 'user-data-dir').some(v => [userDataFolder, path.join(userDataFolder, 'EBWebView')].some(dir => debugPath(dir) === debugPath(v))) && Number.isInteger(p.pid) && p.pid > 0 && Number.isFinite(Date.parse(p.creationDate))) identities.set(debugIdentity(p), p)
+    for (const p of e.observation.listeners) if (identities.has(debugIdentity(p))) ports.add(p.port)
+    e.ports = [...ports]; e.identities = [...identities.values()]
+    e.port = Object.values(e.metadata.files).find(row => row.port)?.port
+    e.process = assertWebviewDebugger(e); e.status = 'verified-private-webview-debugger'; return e
+  } catch (error) { e.gap = String(error.message); e.identities = [...identities.values()]; e.ports = [...ports]; error.debuggerEvidence = e; throw error }
+}
+export function assertWebviewDebuggerClosed(e, after) {
+  assert.ok(e?.identities?.length && e.ports?.length, 'DevTools清理缺非空身份/端口')
+  for (const key of ['processes', 'present', 'listeners']) assert.ok(Array.isArray(after?.[key]), 'DevTools清理缺实际回读')
+  assert.equal(after.processes.length, 0, 'DevTools私有进程仍存活');
+  assert.ok(e.identities.every(p => Number.isInteger(p.pid) && p.pid > 0 && Number.isFinite(Date.parse(p.creationDate))), 'DevTools清理身份无效');
+  assert.ok(e.ports.every(p => Number.isInteger(p) && p > 0 && p < 65536), 'DevTools清理端口无效');
+  const keys = new Set(e.identities.map(debugIdentity))
+  assert.ok(![...after.processes, ...after.present].some(p => keys.has(debugIdentity(p))), 'DevTools原身份仍存活')
+  assert.ok(!after.listeners.some(p => e.ports.includes(p.port)), 'DevTools监听端口未关闭')
+}
+export function webviewDebuggerObservationSource({ userDataFolder, ports, tracked = [] }) {
+  assert.ok(ports.every(p => Number.isInteger(p) && p > 0 && p < 65536)); assert.ok(tracked.every(p => Number.isInteger(p.pid) && p.pid > 0))
+  return `$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$u=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(userDataFolder).toString('base64')}'));$ports=@(${ports.join(',')});$ids=@(${tracked.map(p => p.pid).join(',')});$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$owned=@($all|Where-Object {$_.ProcessId -ne $PID -and $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -and $_.CommandLine.IndexOf($u,[StringComparison]::OrdinalIgnoreCase) -ge 0});function Row($p){if(!$p -or !$p.CreationDate){throw 'missing debugger CIM identity'};@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath;commandLine=$(if($owned.ProcessId -contains $p.ProcessId){$p.CommandLine}else{$null})}};$listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq 'Listen' -and ($ports -contains [int]$_.LocalPort -or $owned.ProcessId -contains [int]$_.OwningProcess)}|ForEach-Object {$c=$_;$p=$all|Where-Object {$_.ProcessId -eq $c.OwningProcess}|Select-Object -First 1;$r=Row $p;$r.port=[int]$c.LocalPort;$r.localAddress=$c.LocalAddress;$r});@{processes=@($owned|ForEach-Object {Row $_});present=@($all|Where-Object {$ids -contains [int]$_.ProcessId}|ForEach-Object {Row $_});listeners=$listeners}|ConvertTo-Json -Depth 6 -Compress`
+}
+
+
+// 复用同VM、同seed builder的实际driver/runtime收据，不根据进程名猜版本。
+export function readNativeDebuggerRuntime({ webOutput, driver, nativeDriver, candidateSha }) {
+  const variant = path.basename(webOutput).match(/^hermes-qualification-(.+)$/)?.[1]; assert.ok(variant, '缺已验证Web输出命名')
+  const build = physical(path.join(path.dirname(webOutput), 'hermes-native-build-' + variant)), receiptFile = physical(path.join(build, 'driver-receipt.json'))
+  const report = read(path.join(build, 'build-receipt.json')), drivers = read(receiptFile), runtime = read(path.join(build, 'installed-webview2.json'))
+  assert.equal(report.status, 'passed'); assert.equal(report.candidateSha, candidateSha); assert.equal(report.driverReceiptSha256, hash(receiptFile), 'builder driver收据hash不符')
+  assert.equal(nativePath(drivers.tauri.path), nativePath(driver)); assert.equal(drivers.tauri.sha256, hash(physical(driver))); assert.equal(drivers.microsoft.sha256, hash(physical(nativeDriver)))
+  assert.deepEqual(runtime, drivers.microsoft.webview2); assert.match(runtime.version, /^\d+\.\d+\.\d+\.\d+$/); assert.equal(runtime.binaryVersion.match(/^\d+\.\d+\.\d+\.\d+/)?.[0], runtime.version)
+  assert.equal(drivers.microsoft.version.trim().match(/^(?:MSEdgeDriver|Microsoft Edge WebDriver) (\d+\.\d+\.\d+\.\d+)(?: \([^\r\n()]+\))?$/)?.[1], runtime.version)
+  assert.equal(path.basename(physical(runtime.path)).toLowerCase(), 'msedgewebview2.exe'); assert.ok(runtime.registry && Object.keys(runtime.registry).length)
+  return { ...runtime, driverSource: { candidateSha, buildDirectory: build, tauriDriver: physical(driver), nativeDriver: physical(nativeDriver) }, sha256: hash(runtime.path), driverReceiptSha256: hash(receiptFile), buildReceiptSha256: hash(path.join(build, 'build-receipt.json')) }
+}
+
 export function webviewProfileMetadata({ home, userDataFolder }) {
   const root = physical(home), folder = physical(userDataFolder)
   assert.ok(folder !== root && inside(root, folder), 'profile越出私有HOME')
@@ -456,11 +528,11 @@ export function webviewProfileMetadata({ home, userDataFolder }) {
       const stat = fs.lstatSync(file), row = { exists: true, size: stat.size, mtimeMs: stat.mtimeMs, contentRead: false }
       assert.ok(stat.isFile() && !stat.isSymbolicLink(), 'DevTools文件类型'); result.files[name] = row
       if (stat.size <= 4096) {
-        const fd = fs.openSync(file, 'r'), buffer = Buffer.alloc(4097); let n
-        try { n = fs.readSync(fd, buffer, 0, buffer.length, 0) } finally { fs.closeSync(fd) }
-        if (n <= 4096) {
+        const fd = fs.openSync(file, 'r'), buffer = Buffer.alloc(4096); let n, stable
+        try { n = fs.readSync(fd, buffer, 0, buffer.length, 0); stable = n === stat.size && fs.fstatSync(fd).size === n } finally { fs.closeSync(fd) }
+        if (n <= 4096 && stable) {
           const bytes = buffer.subarray(0, n), first = bytes.toString('utf8').split(/\r?\n/)[0], port = /^\d+$/.test(first) ? Number(first) : 0
-          Object.assign(row, { contentRead: true, sha256: sha256(bytes), port: port > 0 && port <= 65535 ? port : null })
+          Object.assign(row, { contentRead: true, validEndpoint: /^[1-9]\d{0,4}\r?\n\/devtools\/browser\/[A-Za-z0-9._-]+\r?\n?$/.test(bytes.toString('utf8')), sha256: sha256(bytes), port: port > 0 && port <= 65535 ? port : null })
         }
       }
     } catch (e) { if (e.code !== 'ENOENT') throw e; result.files[name] = { exists: false } }
@@ -566,7 +638,18 @@ async function execute(o) {
   const sources = compatibility ? report.compatibility.binding.sourceHashes : Object.fromEntries(['src-tauri/src/commands/hermes.rs', 'src-tauri/src/lib.rs', 'src-tauri/Cargo.lock', 'package.json', ...(fs.existsSync(path.join(root, 'scripts/hermes-pm-runtime.js')) ? ['scripts/hermes-pm-runtime.js'] : [])].map(f => [f, hash(path.join(root, f))]))
   const watchedIdentities = new Map(), ports = new Set(), activeListeners = new Map()
   let driver, provider, client, providerPort, driverPort, nativePort
-  const nativePids = new Set()
+  const nativePids = new Set(), debuggerPorts = new Set(), debuggerIdentities = new Map()
+  function nativeDebuggerSnapshot(wanted = [...debuggerPorts], tracked = [...debuggerIdentities.values()]) {
+    const code = webviewDebuggerObservationSource({ userDataFolder: env.WEBVIEW2_USER_DATA_FOLDER, ports: wanted, tracked })
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')], { env: psChildEnv, encoding: 'utf8', windowsHide: true, timeout: 30000, maxBuffer: 16 * 1024 * 1024 })
+    assert.equal(r.status, 0, r.stderr); return JSON.parse(r.stdout.replace(/^\uFEFF/, ''))
+  }
+  function recordDebugger(stage) {
+    let evidence
+    try { evidence = captureWebviewDebugger({ home, userDataFolder: env.WEBVIEW2_USER_DATA_FOLDER, runtimePath: report.webviewRuntime.path, snapshot: nativeDebuggerSnapshot, ports: debuggerPorts, identities: debuggerIdentities, expected: report.webviewDebugger }); report.webviewDebugger ||= evidence; return evidence }
+    catch (e) { report.debuggerGap = String(e.message); evidence = e.debuggerEvidence || { gap: report.debuggerGap }; throw e }
+    finally { (report.debuggerAttempts ||= []).push({ stage, evidence }); fs.writeFileSync(path.join(output, stage + '.json'), JSON.stringify(evidence, null, 2)); save() }
+  }
   async function ipc(cmd, args, timeout) {
     const receipt = { cmd, ok: false, at: new Date().toISOString() }; report.ipc.push(receipt)
     try { const value = await client.ipc(cmd, args, timeout); receipt.ok = true; return value } finally { save() }
@@ -626,11 +709,11 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
   }
   function applicationPids() {
     const a = Buffer.from(app).toString('base64'), u = Buffer.from(env.WEBVIEW2_USER_DATA_FOLDER).toString('base64')
-    const code = `$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$a=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${a}'));$u=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${u}'));@(Get-CimInstance Win32_Process|Where-Object {$_.ProcessId -ne $PID -and ($_.ExecutablePath -eq $a -or ($_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -and $_.CommandLine.Contains($u)))}|Select-Object ProcessId,ExecutablePath,CreationDate)|ConvertTo-Json -Compress`
+    const code = `$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$a=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${a}'));$u=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${u}'));@(Get-CimInstance Win32_Process|Where-Object {$_.ProcessId -ne $PID -and ($_.ExecutablePath -eq $a -or ($_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -and $_.CommandLine.Contains($u)))}|Select-Object ProcessId,ExecutablePath,CommandLine,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}})|ConvertTo-Json -Compress`
     const r = spawnSync('powershell.exe', ['-NoProfile', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')], { env: psChildEnv, encoding: 'utf8', windowsHide: true, timeout: 30000 })
     assert.equal(r.status, 0, r.stderr)
     const rows = r.stdout.trim() ? JSON.parse(r.stdout.replace(/^\uFEFF/, '')) : []
-    return Array.isArray(rows) ? rows : [rows]
+    return (Array.isArray(rows) ? rows : [rows]).filter(p => nativePath(p.ExecutablePath) === nativePath(app) || report.webviewRuntime && nativePath(p.ExecutablePath) === nativePath(report.webviewRuntime.path) && debugArgs(p.CommandLine, 'user-data-dir').some(v => [env.WEBVIEW2_USER_DATA_FOLDER, path.join(env.WEBVIEW2_USER_DATA_FOLDER, 'EBWebView')].some(dir => nativePath(dir) === nativePath(v))))
   }
   async function observe(item) {
     const seen = await client.script(`const k='__CLAWPANEL_HERMES_QUALIFICATION_ERRORS__';if(!window[k]){window[k]=[];addEventListener('error',e=>window[k].push(String(e.error?.stack||e.message).slice(0,4000)));addEventListener('unhandledrejection',e=>window[k].push(String(e.reason?.stack||e.reason).slice(0,4000)))}return window[k].splice(0);`)
@@ -681,17 +764,20 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
     provider = await createNativeProvider({ report, save })
     await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve)); providerPort = provider.address().port
     driverPort = await freePort(); nativePort = await freePort()
+    report.webviewRuntime = readNativeDebuggerRuntime({ webOutput, driver: o['--driver'], nativeDriver: o['--native-driver'], candidateSha: prior.candidateSha }); save()
     const log = fs.openSync(path.join(output, 'driver.log'), 'a')
-    driver = spawn(physical(o['--driver']), ['--port', String(driverPort), '--native-port', String(nativePort), '--native-driver', physical(o['--native-driver'])], { env, windowsHide: true, stdio: ['ignore', log, log] })
+    driver = spawn(physical(o['--driver']), ['--port', String(driverPort), '--native-port', String(nativePort), '--native-driver', physical(o['--native-driver'])], { env: nativeDriverChildEnv(env), windowsHide: true, stdio: ['ignore', log, log] })
     fs.closeSync(log)
     let spawnError; driver.once('error', e => { spawnError = e })
     await until(async () => { if (spawnError) throw spawnError; return await reachable(driverPort) }, 30000)
     client = new NativeWebDriver(`http://127.0.0.1:${driverPort}`, { compatibility })
     const launch = { application: app, envUserDataFolder: env.WEBVIEW2_USER_DATA_FOLDER, before: webviewProfileMetadata({ home, userDataFolder: env.WEBVIEW2_USER_DATA_FOLDER }) }; report.sessionLaunch = launch; save()
-    try { report.webdriver = await client.create(app, env.WEBVIEW2_USER_DATA_FOLDER) } finally {
+    let sessionFailure, debuggerFailure
+    try { report.webdriver = await client.create(app, env.WEBVIEW2_USER_DATA_FOLDER) } catch (e) { sessionFailure = e; throw e } finally {
       launch.requestedCapabilities = client.requestedCapabilities || null; launch.sessionCreated = !!client.session
       try { launch.after = webviewProfileMetadata({ home, userDataFolder: env.WEBVIEW2_USER_DATA_FOLDER }) } catch (e) { launch.metadataError = String(e) }
-      fs.writeFileSync(path.join(output, 'session-launch.json'), JSON.stringify(launch, null, 2)); save()
+      try { recordDebugger('debugger-after-session') } catch (e) { debuggerFailure = e; launch.debuggerGap = String(e.message) }
+      fs.writeFileSync(path.join(output, 'session-launch.json'), JSON.stringify(launch, null, 2)); save(); if (debuggerFailure && !sessionFailure) throw debuggerFailure
     }
     if (compatibility) report.compatibility.blockedInstallerCommands = client.blockedInstallerCommands
     const startedApps = applicationPids(); assert.ok(startedApps.some(p => p.ExecutablePath.toLowerCase() === app.toLowerCase()), '没有实际 ClawPanel.exe 进程')
@@ -858,6 +944,7 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
       screenshot: async () => { if (client?.session) await client.screenshot(path.join(output, 'final.png')) },
       productionStop: async () => { if (client?.session) await stop() },
       applicationSnapshot: async () => { for (const p of applicationPids()) nativePids.add(p.ProcessId) },
+      debuggerBefore: async () => { if (report.sessionLaunch) recordDebugger('debugger-before-cleanup') },
       sessionClose: async () => { if (client?.session) await client.close() },
       driver: async () => {
         if (driver?.pid) {
@@ -876,9 +963,13 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
         report.tooling.after = readNativeToolingSnapshot({ root: toolingRoot, sha: proof.toolingSha })
         assert.deepEqual(report.tooling.after, report.tooling.before, 'harness/qualification/provider/profile/collision字节漂移')
       },
+      debuggerKill: async () => {
+        const current = nativeDebuggerSnapshot()
+        for (const p of current.present) if (debuggerIdentities.has(debugIdentity(p)) && debugPath(p.exe) === debugPath(report.webviewRuntime.path)) spawnSync('taskkill.exe', ['/PID', String(p.pid), '/T', '/F'], { windowsHide: true, timeout: 30000 })
+      },
       nativeKill: async () => {
         // 仅清理实际EXE/私有WebView2，不按名称扫全机；失败不跳过后续核验。
-        for (const p of applicationPids()) { nativePids.add(p.ProcessId); spawnSync('taskkill.exe', ['/PID', String(p.ProcessId), '/T', '/F'], { windowsHide: true, encoding: 'utf8', timeout: 30000 }) }
+        for (const p of applicationPids()) { nativePids.add(p.ProcessId); const current = applicationPids().find(q => q.ProcessId === p.ProcessId && q.ExecutablePath === p.ExecutablePath); if (current && p.CreationDate === current.CreationDate) spawnSync('taskkill.exe', ['/PID', String(p.ProcessId), '/T', '/F'], { windowsHide: true, encoding: 'utf8', timeout: 30000 }) }
       },
       nativeFinal: async () => {
         await until(() => [...nativePids].every(pid => !processExists(pid)), 30000)
@@ -888,8 +979,14 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
         const final = await verifyRuntimeStopped(report.cleanup?.productionStop === true)
         report.cleanup.final = final
       },
+      debuggerFinal: async () => {
+        if (!report.sessionLaunch) return
+        const observed = report.debuggerAttempts?.findLast(x => x.evidence?.identities?.length && x.evidence?.ports?.length)?.evidence
+        const after = nativeDebuggerSnapshot(); fs.writeFileSync(path.join(output, 'debugger-after-cleanup.json'), JSON.stringify(after, null, 2)); assertWebviewDebuggerClosed(observed, after)
+        report.webviewDebuggerCleanup = after
+      },
       portsFinal: async () => {
-        const allPorts = [...new Set([...ports, driverPort, nativePort, providerPort].filter(Boolean))]
+        const allPorts = [...new Set([...ports, ...debuggerPorts, driverPort, nativePort, providerPort].filter(Boolean))]
         await until(async () => (await Promise.all(allPorts.map(reachable))).every(v => !v), 30000)
         report.driverPortsClosed = true; report.allFinalPorts = allPorts
       },

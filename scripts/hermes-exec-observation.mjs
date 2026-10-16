@@ -1,7 +1,7 @@
 // 只读诊断工厂，可直接 function.toString 嵌入可信 preload；不负责安装或准入。
 // 无模块闭包/外部依赖：只需 Node 全局 Buffer，以及调用者注入原 execFile/write。
 // 不序列化 options/env/error.message/error.cmd。调用者须通过 secrets/redact 提供业务凭据脱敏。
-// 每流最多保留/输出1MiB；仅start/result/close，不重试、改预算、换结果或改stream编码。
+// 每流最多保留/输出1MiB；仅start/result/close，额外只记录块首末UTC/总字节，不改流或预算。
 export function createHermesExecFileObserver(execFile, { write = () => {}, secrets = [], redact = text => text } = {}) {
   if (typeof execFile !== 'function' || typeof write !== 'function' || typeof redact !== 'function') throw new TypeError('exec observer requires execFile/write/redact functions')
   if (!Array.isArray(secrets) || !secrets.every(value => typeof value === 'string')) throw new TypeError('exec observer secrets must be strings')
@@ -45,14 +45,16 @@ export function createHermesExecFileObserver(execFile, { write = () => {}, secre
   }
   function collector() {
     const bytes = Buffer.alloc(limit)
-    let kept = 0, seen = 0
+    let kept = 0, seen = 0, firstChunkUtc = null, lastChunkUtc = null
     return {
       add(chunk) {
         const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8')
+        if (value.length) { const utc = new Date().toISOString(); firstChunkUtc ??= utc; lastChunkUtc = utc }
         seen += value.length
         if (kept < limit) kept += value.copy(bytes, kept, 0, Math.min(value.length, limit - kept))
       },
       value() { return { text: sanitize(decode(bytes.subarray(0, kept), seen > kept), seen > kept), truncated: seen > kept } },
+      timing() { return { firstChunkUtc, lastChunkUtc, bytes: seen } },
     }
   }
   function errorFields(error) {
@@ -73,6 +75,7 @@ export function createHermesExecFileObserver(execFile, { write = () => {}, secre
     const callId = ++sequence, stdout = collector(), stderr = collector()
     let child, returned = false, resultRecorded = false, callbackSnapshot, resultErrorSnapshot, emittedError, emittedErrorSnapshot, earlyResult
     const base = event => ({ schemaVersion: 1, event, callId, utc: new Date().toISOString(), pid: child?.pid ?? null })
+    const streamTiming = () => ({ stdout: stdout.timing(), stderr: stderr.timing() })
     const start = () => observe(() => {
       const argv = [], input = callArgs[1]
       let hideNext = false, argvTruncated = Array.isArray(input) && input.length > 128
@@ -97,7 +100,7 @@ export function createHermesExecFileObserver(execFile, { write = () => {}, secre
         // 在应用回调修改 Error 前冻结原字段；写入方也只收到副本。
         resultErrorSnapshot = values ? errorFields(error) : emittedErrorSnapshot ?? errorFields(error)
         callbackSnapshot = output(values)
-        return { ...base('execFile-result'), source, ...callbackSnapshot, error: resultErrorSnapshot ? { ...resultErrorSnapshot } : null, code: error ? resultErrorSnapshot.code : code ?? null, signal: error ? resultErrorSnapshot.signal : signal ?? null, killed: error ? resultErrorSnapshot.killed : child?.killed ?? false }
+        return { ...base('execFile-result'), source, ...callbackSnapshot, streamTiming: streamTiming(), error: resultErrorSnapshot ? { ...resultErrorSnapshot } : null, code: error ? resultErrorSnapshot.code : code ?? null, signal: error ? resultErrorSnapshot.signal : signal ?? null, killed: error ? resultErrorSnapshot.killed : child?.killed ?? false }
       })
     }
     // 只定位 Node normalizeExecFileArgs 实际消费的回调槽，不读取或克隆 options/env。
@@ -124,7 +127,7 @@ export function createHermesExecFileObserver(execFile, { write = () => {}, secre
     child.once('error', error => { emittedError = error; try { emittedErrorSnapshot = errorFields(error) } catch { /* 原生错误仍由应用处理。 */ } })
     child.once('close', (code, signal) => {
       if (!resultRecorded) result('close-no-callback', null, code, signal)
-      observe(() => ({ ...base('execFile-close'), code, signal, killed: child.killed, error: resultErrorSnapshot ? { ...resultErrorSnapshot } : null, ...(callbackSnapshot || output(null)) }))
+      observe(() => ({ ...base('execFile-close'), code, signal, killed: child.killed, error: resultErrorSnapshot ? { ...resultErrorSnapshot } : null, ...(callbackSnapshot || output(null)), streamTiming: streamTiming() }))
     })
     return child
   }

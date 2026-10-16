@@ -275,7 +275,51 @@ export function classifyProviderRequest(body) {
   return 'unattributed'
 }
 
+// 独立检查原一次status的HTTP与原exec闭环；旧health、UI或passed自述均不替代本项。
+export function assertGatewayStatusReadback(r) {
+  assert.ok(r?.schemaVersion === 1 && r.status === 'passed' && r.requestFailed === false, 'STATUS_READBACK_MISSING_OR_FAILED')
+  assert.ok(r.api?.cmd === 'hermes_gateway_action' && Number.isInteger(r.api.status) && r.api.status >= 200 && r.api.status < 300, 'STATUS_HTTP_FAILED')
+  const text = r.api.result
+  assert.ok(typeof text === 'string' && Buffer.byteLength(text) <= 1024 * 1024 && text.trim() && !/^unknown$/i.test(text.trim()), 'STATUS_VALUE_INVALID')
+  // 本隔离入口刚启动自己的Gateway；帮助文字/未运行状态不算运行回读。
+  assert.ok(/(?:^|\n)\s*(?:✓\s*)?Gateway is running\b/.test(text), 'STATUS_NOT_RUNNING')
+  assert.ok(Array.isArray(r.exec) && r.exec.length === 3, 'STATUS_EXEC_EVIDENCE_MISSING')
+  const [start, result, close] = r.exec
+  assert.deepEqual(r.exec.map(e => e.event), ['execFile-start', 'execFile-result', 'execFile-close'], 'STATUS_EXEC_ORDER')
+  assert.deepEqual(start.command, ['gateway', 'status'], 'STATUS_EXEC_COMMAND')
+  assert.ok(Number.isSafeInteger(start.pid) && start.pid > 0 && Number.isSafeInteger(start.callId) && start.callId > 0 && r.exec.every(e => e.pid === start.pid && e.callId === start.callId && typeof e.utc === 'string' && Number.isFinite(Date.parse(e.utc))), 'STATUS_EXEC_IDENTITY')
+  assert.ok(result.source === 'callback' && result.error === null && (result.code === null || result.code === 0) && result.signal === null && result.killed === false, 'STATUS_EXEC_FAILED')
+  assert.ok(close.code === 0 && close.error === null && close.signal === null && close.killed === false, 'STATUS_EXEC_CLOSE_FAILED')
+  assert.ok(typeof result.stdout === 'string' && result.stdoutTruncated === false && result.stdout.trim() === text.trim(), 'STATUS_EXEC_OUTPUT_MISMATCH')
+}
+
+// request只执行原API一次；失败转为独立红收据，后续UI/生命周期照常取证，不重试或等额外close。
+export async function collectGatewayStatusReadback({ request, apiReceipts, readExecEvents }) {
+  const cursor = apiReceipts.length, r = { schemaVersion: 1, status: 'failed', requestFailed: false, startedAt: new Date().toISOString() }
+  try { await request() } catch { r.requestFailed = true }
+  try {
+    const receipts = apiReceipts.slice(cursor)
+    assert.equal(receipts.length, 1, 'STATUS_API_RECEIPT_COUNT')
+    const receipt = receipts[0]
+    r.api = { cmd: receipt.cmd, status: receipt.status, result: typeof receipt.result === 'string' && Buffer.byteLength(receipt.result) <= 1024 * 1024 ? receipt.result : null }
+    const events = readExecEvents(), starts = events.filter(e => e.event === 'execFile-start' && Array.isArray(e.argv) && e.argv.at(-2) === 'gateway' && e.argv.at(-1) === 'status')
+    assert.equal(starts.length, 1, 'STATUS_EXEC_START_COUNT')
+    const start = starts[0]
+    r.exec = events.filter(e => e.callId === start.callId && e.pid === start.pid && e.event?.startsWith('execFile-')).map(e => {
+      const row = Object.fromEntries(['event', 'callId', 'pid', 'utc', 'source', 'code', 'signal', 'killed'].filter(k => Object.hasOwn(e, k)).map(k => [k, e[k]]))
+      if (e.event === 'execFile-start') row.command = e.argv.slice(-2)
+      if (Object.hasOwn(e, 'error')) row.error = e.error === null ? null : Object.fromEntries(['name', 'code', 'signal', 'killed', 'errno', 'syscall'].filter(k => Object.hasOwn(e.error, k)).map(k => [k, e.error[k]]))
+      if (e.event === 'execFile-result') { row.stdout = e.stdout; row.stdoutTruncated = e.stdoutTruncated }
+      return row
+    })
+    r.status = 'passed'; assertGatewayStatusReadback(r)
+  } catch { r.status = 'failed'; r.failure = 'STATUS_READBACK_FAILED' }
+  r.finishedAt = new Date().toISOString()
+  return r
+}
+
 export function qualificationStatus(r) {
+  try { assertGatewayStatusReadback(r.gatewayStatusReadback) } catch { return 'failed' }
   if (r.diagnostic?.enabled) return r.hostUnchanged === true ? 'diagnostic-only-not-qualification' : 'failed'
   if (!STAGES.every(name => r.stages?.some(s => s.name === name && s.status === 'passed')) || !r.hostUnchanged) return 'failed'
   const b = r.browser
@@ -632,6 +676,33 @@ export function observeQualificationCommand(child, receipt) {
   return { timeout() { Object.assign(state, { timedOutAt: new Date().toISOString(), directExitCodeAtTimeout: child.exitCode, directSignalAtTimeout: child.signalCode, stdoutEndedAtTimeout: child.stdout?.readableEnded ?? null, stderrEndedAtTimeout: child.stderr?.readableEnded ?? null }) } }
 }
 
+let qualificationBrowserImportActive = false
+export async function loadQualificationChromium({ home, cacheDirectory, moduleFile, importer = url => import(url) }) {
+  assert.equal(qualificationBrowserImportActive, false, '拒绝并发 browser import 环境串扰')
+  assert.ok(path.isAbsolute(home) && path.isAbsolute(cacheDirectory) && path.isAbsolute(moduleFile), '私有 browser 路径必须绝对')
+  assert.equal(cacheDirectory, path.join(home, '.browsers'), '只接受私有 HOME 的固定 cache')
+  assert.equal(moduleFile, path.join(home, 'browser-tools/node_modules/playwright/index.mjs'), '只接受本轮私有 module')
+  for (const file of [home, cacheDirectory, moduleFile]) physical(file)
+  assert.ok(fs.statSync(cacheDirectory).isDirectory() && fs.statSync(moduleFile).isFile(), '私有 browser cache/module 缺失')
+  const name = 'PLAYWRIGHT_BROWSERS_PATH'
+  const keys = process.platform === 'win32' ? Object.keys(process.env).filter(k => k.toUpperCase() === name) : Object.keys(process.env).filter(k => k === name)
+  assert.ok(keys.length <= 1, 'browser cache 环境字段重复')
+  const key = keys[0] || name, present = keys.length === 1, value = process.env[key]
+  qualificationBrowserImportActive = true
+  let chromium
+  try {
+    // 仅当前一次性验收进程的模块初始化作用域；不写用户/系统环境、注册表或宿主cache。
+    // 官方registry在import时固定路径；finally先还原，再用显式私有env启动真实browser。
+    process.env[key] = cacheDirectory
+    ;({ chromium } = await importer(pathToFileURL(moduleFile).href))
+  } finally {
+    try { if (present) process.env[key] = value; else delete process.env[key] } finally { qualificationBrowserImportActive = false }
+  }
+  const executable = chromium?.executablePath?.()
+  assert.ok(typeof executable === 'string' && path.isAbsolute(executable) && within(cacheDirectory, executable), 'browser registry不在私有cache；拒绝旧module或宿主路径')
+  return chromium
+}
+
 async function execute(o) {
   if (o['--startup-stack-samples']) assert.ok(o['--version'] === '0.22.2' && o['--variant'] === 'new', 'stack samples require new candidate')
   for (const k of ['--root', '--sha', '--version', '--variant', '--output']) assert.ok(o[k], `缺少 ${k}`)
@@ -845,7 +916,12 @@ async function execute(o) {
       await run(process.execPath, ['--input-type=module', '-e', merge, path.join(env.HERMES_HOME, 'config.yaml'), String(dashboardPort), o['--sha']])
       await api('hermes_env_set', { key: 'API_SERVER_HOST', value: '127.0.0.1' }); await api('hermes_env_set', { key: 'API_SERVER_PORT', value: String(runtimePort) }); await api('hermes_set_gateway_url', { url: `http://127.0.0.1:${runtimePort}` })
       const profiles = await api('hermes_profiles_list'); assert.ok(profiles.profiles.some(p => p.name === 'default')); await api('hermes_profile_use', { name: 'default' })
-      stopped = false; await api('hermes_gateway_action', { action: 'start' }); await api('hermes_health_check'); await api('hermes_capabilities'); await api('hermes_gateway_action', { action: 'status' })
+      stopped = false; await api('hermes_gateway_action', { action: 'start' }); await api('hermes_health_check'); await api('hermes_capabilities')
+      const readAudit = () => fs.readFileSync(path.join(output, 'spawn-audit.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+      let statusAuditCursor
+      try { statusAuditCursor = readAudit().length } catch { /* 缺原观察仍调用原status并判红，不遮住后续UI。 */ }
+      r.gatewayStatusReadback = await collectGatewayStatusReadback({ request: () => api('hermes_gateway_action', { action: 'status' }), apiReceipts, readExecEvents: () => { assert.ok(Number.isInteger(statusAuditCursor), 'STATUS_AUDIT_BASELINE_MISSING'); return readAudit().slice(statusAuditCursor) } })
+      write('gateway-status-readback.json', r.gatewayStatusReadback); save()
       if (diagnostic) { r.diagnostic.gatewayReadyWithinBudget = true; await capturePids(); return { scope: r.diagnostic.scope, gatewayReadyWithinBudget: true } }
       const dash = await api('hermes_dashboard_start'); assert.equal(dash.started, true); assert.equal((await api('hermes_dashboard_probe')).running, true); await capturePids()
       // 官方40747修复Node24.16与旧zip stream的死锁；固定测试工具版本，不降Node或扩安装预算。
@@ -860,8 +936,13 @@ async function execute(o) {
       write('browser-tooling.json', r.browserTooling); save()
       // 本验收只用默认headless shell；不再下载未使用的headed Chrome，原600秒和真实启动/长UI门禁不变。
       await run(process.execPath, [path.join(home, 'browser-tools/node_modules/playwright/cli.js'), 'install', '--only-shell', 'chromium'], { timeout: 600000, browserDiagnostics: true })
-      const { chromium } = await import(pathToFileURL(path.join(home, 'browser-tools/node_modules/playwright/index.mjs')))
-      browser = await chromium.launch({ headless: true }); context = await browser.newContext({ locale: 'zh-CN' }); await context.tracing.start({ screenshots: true, snapshots: true, sources: true })
+      const parentEnvironmentBeforeImport = digest(JSON.stringify(process.env))
+      const chromium = await loadQualificationChromium({ home, cacheDirectory: env.PLAYWRIGHT_BROWSERS_PATH, moduleFile: path.join(browserModules, 'playwright/index.mjs') })
+      r.browserTooling.parentEnvironmentRestored = digest(JSON.stringify(process.env)) === parentEnvironmentBeforeImport
+      r.browserTooling.defaultRegistryExecutablePath = chromium.executablePath()
+      assert.equal(r.browserTooling.parentEnvironmentRestored, true, 'browser import后验收进程环境没有复原')
+      write('browser-tooling.json', r.browserTooling); save()
+      browser = await chromium.launch({ headless: true, env }); context = await browser.newContext({ locale: 'zh-CN' }); await context.tracing.start({ screenshots: true, snapshots: true, sources: true })
       const pageErrors = [], screenshots = [], prompts = []; context.on('page', p => p.on('pageerror', e => pageErrors.push(String(e))))
       const page = await context.newPage(); await page.goto(base + '/#/h/chat'); await page.locator('#hm-chat-input').waitFor()
       const dashPage = await context.newPage(); const dashResponse = await dashPage.goto(`http://127.0.0.1:${dashboardPort}`); assert.equal(dashResponse.status(), 200); await dashPage.locator('body').waitFor(); await dashPage.screenshot({ path: path.join(output, 'dashboard.png'), fullPage: true }); screenshots.push('dashboard.png'); await dashPage.close()
