@@ -128,7 +128,7 @@ function completedWebFixture(gatewayStatusReadback) {
 const stateNames = ['gateway.pid', 'gateway.lock', 'gateway_state.json']
 const stateSha = data => createHash('sha256').update(data).digest('hex')
 function stateFixture(t, name) {
-  const tmp = fs.realpathSync(os.tmpdir()), dir = fs.mkdtempSync(path.join(tmp, 'hermes-status-files-')), home = path.join(dir, 'h'), hermes = path.join(home, '.hermes'), children = [], rows = []
+  const tmp = fs.realpathSync.native(os.tmpdir()), dir = fs.mkdtempSync(path.join(tmp, 'hermes-status-files-')), home = path.join(dir, 'h'), hermes = path.join(home, '.hermes'), children = [], rows = []
   fs.mkdirSync(hermes, { recursive: true })
   const marker = 'SYNTHETIC_PRIVATE_STATE_DO_NOT_PUBLISH_87da', argv = ['-c', marker, 'gateway', 'run']
   const record = { pid: 5932, kind: 'hermes-gateway', argv, start_time: 1792186376412040, hermes_home: hermes, clawpanel_legacy_identity: { create_time: 1792186376.4120407, script_sha256: 'a'.repeat(64), pin: 'f97608f178d1ffeca59860195ab7da295f7c8e5f', privatecode: marker }, gateway_state: 'running', updated_at: '2026-10-16T22:36:11.000Z', desired_state: 'running', api_key: marker, privatecode: marker, nested: { password: marker } }
@@ -138,7 +138,7 @@ function stateFixture(t, name) {
   t.after(async () => {
     for (const c of children) { c.stdin?.end(); await new Promise(resolve => { if (c.exitCode !== null || c.signalCode !== null) return resolve(); c.once('close', resolve) }) }
     if (process.env.HERMES_STATE_TEST_EVIDENCE) { fs.mkdirSync(process.env.HERMES_STATE_TEST_EVIDENCE, { recursive: true }); fs.writeFileSync(path.join(process.env.HERMES_STATE_TEST_EVIDENCE, name + '.json'), JSON.stringify({ scope: 'own private files, no Hermes/VM installation or process identity query', platform: process.platform, node: process.version, rows }, null, 2)) }
-    const rel = path.relative(tmp, fs.realpathSync(dir)); assert.ok(rel && !rel.startsWith('..') && !path.isAbsolute(rel)); fs.rmSync(dir, { recursive: true, force: true })
+    const rel = path.relative(tmp, fs.realpathSync.native(dir)); assert.ok(rel && !rel.startsWith('..') && !path.isAbsolute(rel)); fs.rmSync(dir, { recursive: true, force: true })
   })
   return { dir, home, hermes, record, marker, argv, write, originals, rows, children }
 }
