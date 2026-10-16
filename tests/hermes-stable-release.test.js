@@ -65,14 +65,23 @@ test('source installer uses upstream stage protocol without mutating user PATH',
   const tauriSource = readSource('src-tauri/src/commands/hermes.rs')
 
   assert.match(webSource, /stages: \['repository', 'venv', 'python-deps', 'config', 'complete'\]/)
-  assert.doesNotMatch(webSource, /'-ForceCommit'|'--force-commit'/)
+  // 新 PM 禁用强制提交；固定旧 wrapper 必须显式启用，禁止将旧分支参数混入新协议。
+  const legacyWeb = webSource.match(/    if \(HERMES_STABLE_VERSION === '0\.21\.5'\) \{[^]*?\n    \}(?=\n    if \(HERMES_STABLE_VERSION !== '0\.22\.2')/)?.[0]
+  assert.ok(legacyWeb, '缺少精确旧版分支')
+  assert.match(legacyWeb, /HERMES_STABLE_COMMIT !== 'f97608f178d1ffeca59860195ab7da295f7c8e5f'/)
+  assert.match(legacyWeb, /'-ForceCommit'/)
+  assert.doesNotMatch(webSource.replace(legacyWeb, ''), /'-ForceCommit'|'--force-commit'/)
   assert.match(webSource, /'-Commit', HERMES_STABLE_COMMIT,/)
   assert.match(webSource, /'--commit', HERMES_STABLE_COMMIT,/)
   assert.match(webSource, /HERMES_STABLE_BRANCH = 'release\/0\.22\.2'/)
   assert.match(webSource, /'--branch', HERMES_STABLE_BRANCH,/)
   assert.match(webSource, /'-Branch', HERMES_STABLE_BRANCH,/)
   assert.match(tauriSource, /HERMES_STABLE_BRANCH: &str = "release\/0\.22\.2"/)
-  assert.doesNotMatch(tauriSource, /\.arg\("-ForceCommit"\)|\.arg\("--force-commit"\)/)
+  const legacyRust = tauriSource.match(/        if HERMES_STABLE_VERSION == "0\.21\.5" \{[^]*?\n        \} else \{/)?.[0]
+  assert.ok(legacyRust, '缺少精确原生旧版分支')
+  assert.match(legacyRust, /"f97608f178d1ffeca59860195ab7da295f7c8e5f"/)
+  assert.match(legacyRust, /\.arg\("-ForceCommit"\)/)
+  assert.doesNotMatch(tauriSource.replace(legacyRust, ''), /\.arg\("-ForceCommit"\)|\.arg\("--force-commit"\)/)
   assert.match(tauriSource, /\[\s*"repository",\s*"venv",\s*"python-deps",\s*"config",\s*"complete",?\s*\]/)
   assert.doesNotMatch(tauriSource, /"config-templates",\s*"platform-sdks",\s*"bootstrap-marker"/)
   assert.match(tauriSource, /\.arg\("-Commit"\)\s*\.arg\(HERMES_STABLE_COMMIT\)/)
