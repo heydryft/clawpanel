@@ -21,6 +21,7 @@ import { PiRuntime } from './pi-runtime.js'
 import { createDshAuth, redactDshOutput } from './deepseek-harness-auth.js'
 import { channelPluginStatusAt, channelPluginStatusFromInventory, installChannelPluginAt, redactPluginOutput } from './channel-plugin-install.js'
 import { buildWeixinCompatibilityStatus, resolveWeixinInstallVersion } from './weixin-compat.js'
+import { createWeixinConsentManager, isWeixinInstallTarget, validateWeixinRequestOrigin, verifyWeixinInstalledFiles, resolveWeixinConsentHostMode, verifyWeixinConfigReadback, inspectWeixinConsentHostSdk } from './weixin-install-consent.js'
 import * as skillhubSdk from './lib/skillhub-sdk.js'
 import { createBackgroundJobQueue } from './media-background-queue.js'
 import { normalizeModelApiType } from '../src/lib/model-presets.js'
@@ -13786,6 +13787,8 @@ const handlers = {
   },
 
   install_plugin({ packageName }) {
+    if (isWeixinInstallTarget({ packageName })) throw weixinConsentRequired()
+    if (_weixinInstallExecuting) throw Object.assign(new Error('微信安装正在持锁执行'), { code: 'WEIXIN_BUSY' })
     if (!packageName || !packageName.trim()) throw new Error('包名不能为空')
     const spec = packageName.trim()
     try {
@@ -13810,7 +13813,10 @@ const handlers = {
   },
 
   async install_channel_plugin({ packageName, pluginId, version }, onEvent = () => {}, updateExisting = false, replaceExisting = false) {
-    return installChannelPluginAt({
+    if (isWeixinInstallTarget({ packageName, pluginId })) throw weixinConsentRequired()
+    if (_weixinInstallExecuting) throw Object.assign(new Error('微信安装正在持锁执行'), { code: 'WEIXIN_BUSY' })
+    _otherChannelInstalls++
+    try { return await installChannelPluginAt({
       root: OPENCLAW_DIR, packageName, pluginId, version, updateExisting, replaceExisting,
       expectedVersion: replaceExisting ? version : null,
       hostVersion: readVersionFromInstallation(resolveOpenclawCliPath()),
@@ -13818,7 +13824,7 @@ const handlers = {
       status: id => handlers.get_channel_plugin_status({ pluginId: id }),
       enable: id => handlers.toggle_plugin({ pluginId: id, enabled: true }),
       onEvent,
-    })
+    }) } finally { _otherChannelInstalls-- }
   },
 
   async pairing_list_channel({ channel }) {
@@ -19919,13 +19925,7 @@ const handlers = {
     const emit = (event, values) => onEvent({ event, payload: { platform, action, ...values } })
     const channel = platformStorageKey(platform)
     if (channel === 'openclaw-weixin' && action === 'install') {
-      const current = await handlers.check_weixin_plugin_status()
-      if (!current.installAllowed) throw new Error(current.installError)
-      const target = resolveWeixinInstallVersion(current.hostVersion, version)
-      return handlers.install_channel_plugin({ packageName: '@tencent-weixin/openclaw-weixin', pluginId: channel, version: target }, event => {
-        if (event.event === 'plugin-log') emit('channel-action-log', { message: event.payload, kind: 'info' })
-        if (event.event === 'plugin-progress') emit('channel-action-progress', { progress: event.payload })
-      }, true, true)
+      throw weixinConsentRequired()
     }
     if (action !== 'login' || !['openclaw-weixin', 'zalouser', 'whatsapp'].includes(channel)) throw new Error('不支持的渠道操作')
     let pendingLine = ''
@@ -20592,6 +20592,83 @@ async function _handleHermesAgentRunStream(req, res, args = {}) {
   }
 }
 
+// 微信安装能力仅在当前服务进程保存；不接受请求体传入 session、版本或命令参数。
+let _weixinConsentManager = null
+let _weixinInstallExecuting = false
+let _otherChannelInstalls = 0
+const _weixinAnonymousSessions = new Map()
+const _weixinCliContracts = new Map()
+function weixinConsentRequired() {
+  return Object.assign(new Error('微信安装需要先准备固定包并由用户明确确认；旧入口不会执行安装'), { code: 'WEIXIN_CONSENT_REQUIRED' })
+}
+const weixinDigest = value => crypto.createHash('sha256').update(value).digest('hex')
+async function readWeixinInstallState() {
+  const hostVersion = readWeixinHostVersion(), cli = resolveOpenclawCliPath()
+  if (!cli) throw Object.assign(new Error('未找到实际 OpenClaw CLI'), { code: 'WEIXIN_HOST_CHANGED' })
+  const pkg = findOpenclawPackageJson(cli)
+  const cliIdentity = weixinDigest(JSON.stringify([fs.realpathSync.native(cli), weixinDigest(fs.readFileSync(cli)), pkg && weixinDigest(fs.readFileSync(pkg))]))
+  let capabilityMode = _weixinCliContracts.get(cliIdentity)
+  if (!capabilityMode) {
+    const help = await runOpenclawCaptured(['plugins', 'install', '--help'], { timeoutMs: 30000 })
+    if (help.status !== 0) throw Object.assign(new Error('读取实际微信安装 CLI 契约失败'), { code: 'WEIXIN_LEGACY_UNSUPPORTED' })
+    capabilityMode = resolveWeixinConsentHostMode(hostVersion, help.stdout)
+    _weixinCliContracts.set(cliIdentity, capabilityMode)
+    if (_weixinCliContracts.size > 8) _weixinCliContracts.delete(_weixinCliContracts.keys().next().value)
+  }
+  const status = await handlers.get_channel_plugin_status({ pluginId: 'openclaw-weixin' })
+  const config = readOpenclawConfigOptional()
+  let installedVersion = null, previousDeclared = null
+  if (status.installed || status.builtin) {
+    const actualRoot = fs.realpathSync.native(status.path), managed = fs.realpathSync.native(OPENCLAW_DIR)
+    const relative = path.relative(managed, actualRoot)
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw Object.assign(new Error('现有微信插件不在受管配置目录内，保留原插件'), { code: 'WEIXIN_HOST_CHANGED' })
+    installedVersion = JSON.parse(fs.readFileSync(path.join(actualRoot, 'package.json'), 'utf8')).version
+    const manifestPath = path.join(actualRoot, 'openclaw.plugin.json')
+    if (fs.statSync(manifestPath).size > 65536) throw weixinConsentRequired()
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    previousDeclared = { channels: Array.isArray(manifest.channels) ? manifest.channels : [] }
+  }
+  return { hostVersion, installed: !!(status.installed || status.builtin), installedVersion, path: status.installed || status.builtin ? status.path : null, configIdentity: weixinDigest(JSON.stringify(config)), protectedConfigSnapshot: config, cliIdentity, hostSdk: inspectWeixinConsentHostSdk(pkg ? path.dirname(pkg) : ''), capabilityMode, previousDeclared }
+}
+function getWeixinConsentManager() {
+  return _weixinConsentManager ||= createWeixinConsentManager({
+    root: OPENCLAW_DIR,
+    readState: readWeixinInstallState,
+    run: (args, emit) => runOpenclawCaptured(args, { timeoutMs: 600000, onOutput: line => emit({ event: 'channel-action-log', payload: { platform: 'weixin', action: 'install', message: redactPluginOutput(line), kind: 'info' } }) }),
+    readback: async (review, emit, state) => {
+      const enabled = await runOpenclawCaptured(['plugins', 'enable', 'openclaw-weixin'], { timeoutMs: 30000, onOutput: line => emit({ event: 'channel-action-log', payload: { platform: 'weixin', action: 'install', message: redactPluginOutput(line), kind: 'info' } }) })
+      if (enabled.status !== 0) throw Object.assign(new Error(`微信启用未通过上游策略: ${redactPluginOutput(openclawResultOutput(enabled))}`), { code: 'WEIXIN_READBACK_FAILED' })
+      const list = await runOpenclawCaptured(['plugins', 'list', '--json'], { timeoutMs: 60000 })
+      if (list.status !== 0) throw Object.assign(new Error(`实际 SDK 加载失败: ${redactPluginOutput(openclawResultOutput(list))}`), { code: 'WEIXIN_READBACK_FAILED' })
+      const inventory = JSON.parse(list.stdout.slice(list.stdout.indexOf('{')))
+      const plugin = inventory.plugins?.find(p => p.id === 'openclaw-weixin')
+      const config = readOpenclawConfigOptional()
+      if (!plugin?.rootDir || !verifyWeixinConfigReadback(state.protectedConfigSnapshot, config, state.hostVersion)) throw Object.assign(new Error('微信安装后路径或受保护配置回读不一致（仅允许本插件启用及已核实的内核元数据）'), { code: 'WEIXIN_READBACK_FAILED' })
+      const root = fs.realpathSync.native(plugin.rootDir), relative = path.relative(fs.realpathSync.native(OPENCLAW_DIR), root)
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw weixinConsentRequired()
+      verifyWeixinInstalledFiles(root, review)
+      return { installed: true, version: JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version, enabled: config.plugins?.entries?.['openclaw-weixin']?.enabled === true, sdkLoaded: plugin.status === 'loaded' && plugin.dependencyStatus?.requiredInstalled !== false && !plugin.dependencyStatus?.missing?.length, configVerified: true }
+    },
+  })
+}
+function weixinRequestContext(req, res, create) {
+  const origin = validateWeixinRequestOrigin(req), generation = _webEmbedAuthGeneration, cookies = parseCookies(req)
+  const passwordMode = !!getAccessPassword()
+  let token = passwordMode ? cookies.clawpanel_session : cookies.clawpanel_weixin_session
+  if (!passwordMode) {
+    for (const [key, expiry] of _weixinAnonymousSessions) if (Date.now() > expiry) _weixinAnonymousSessions.delete(key)
+    if (!_weixinAnonymousSessions.has(token) && create) {
+      if (_weixinAnonymousSessions.size >= 128) throw Object.assign(new Error('微信确认会话配额已满'), { code: 'WEIXIN_BUSY' })
+      token = crypto.randomBytes(32).toString('base64url')
+      _weixinAnonymousSessions.set(token, Date.now() + 1800000)
+      res.setHeader('Set-Cookie', `clawpanel_weixin_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1800${req.socket.encrypted ? '; Secure' : ''}`)
+    }
+  }
+  const valid = () => generation === _webEmbedAuthGeneration && passwordMode === !!getAccessPassword() && (passwordMode ? !!token && isAuthenticated(req) : !!token && Date.now() <= (_weixinAnonymousSessions.get(token) || 0))
+  if (!valid()) throw Object.assign(new Error('微信安装确认会话已失效'), { code: 'WEIXIN_SESSION' })
+  return { origin, sessionKey: weixinDigest(`${passwordMode ? 'login' : 'anonymous'}:${generation}:${token}`), valid, redact: value => token ? redactPluginOutput(value).split(token).join('[REDACTED]') : redactPluginOutput(value) }
+}
+
 // API 中间件（dev server 和 preview server 共用）
 async function _apiMiddleware(req, res, next) {
   if (isOpenCodeEmbedRequest(req.url)) {
@@ -20766,6 +20843,7 @@ async function _apiMiddleware(req, res, next) {
   }
 
   if (cmd === 'auth_logout') {
+    _weixinAnonymousSessions.delete(parseCookies(req).clawpanel_weixin_session)
     const cookies = parseCookies(req)
     const session = _sessions.get(cookies.clawpanel_session)
     if (cookies.clawpanel_session) _sessions.delete(cookies.clawpanel_session)
@@ -20786,6 +20864,42 @@ async function _apiMiddleware(req, res, next) {
   }
 
   const activeInst = getActiveInstance()
+
+  if (['prepare_weixin_install', 'cancel_weixin_install', 'confirm_weixin_install', 'weixin_install_confirm_stream'].includes(cmd)) {
+    let heartbeat, scrub = redactPluginOutput
+    try {
+      const context = weixinRequestContext(req, res, cmd === 'prepare_weixin_install')
+      scrub = context.redact
+      if (activeInst.type !== 'local') throw Object.assign(new Error('微信确认能力仅在当前本地实例使用，请打开目标实例页面'), { code: 'WEIXIN_SESSION' })
+      const args = await readBody(req), manager = getWeixinConsentManager()
+      if (typeof args.confirmationToken === 'string' && args.confirmationToken) {
+        const ticket = args.confirmationToken
+        scrub = value => context.redact(value).split(ticket).join('[REDACTED]')
+      }
+      let result
+      if (cmd === 'prepare_weixin_install') result = await manager.prepare(args, context)
+      else if (cmd === 'cancel_weixin_install') result = await manager.cancel(args, context)
+      else {
+        if (_weixinInstallExecuting || _otherChannelInstalls) throw Object.assign(new Error('已有渠道安装进行中，请等待完成'), { code: 'WEIXIN_BUSY' })
+        _weixinInstallExecuting = true
+        try {
+          const emit = event => { if (!res.destroyed) res.write(scrub(JSON.stringify(event)) + '\n') }
+          if (cmd === 'weixin_install_confirm_stream') {
+            res.setHeader('Content-Type', 'application/x-ndjson'); res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Accel-Buffering', 'no')
+            res.flushHeaders?.(); heartbeat = setInterval(() => emit({ event: 'heartbeat' }), 10000)
+          }
+          result = await manager.confirm(args, context, cmd === 'weixin_install_confirm_stream' ? emit : () => {})
+        } finally { _weixinInstallExecuting = false }
+      }
+      if (!res.headersSent) res.setHeader('Cache-Control', 'no-store')
+      if (cmd === 'weixin_install_confirm_stream') res.end(scrub(JSON.stringify({ event: 'result', result })) + '\n')
+      else { res.setHeader('Content-Type', 'application/json'); res.end(cmd === 'prepare_weixin_install' ? JSON.stringify(result) : scrub(JSON.stringify(result))) }
+    } catch (error) {
+      if (res.headersSent) res.end(JSON.stringify({ event: 'error', error: scrub(error.message), code: error.code }) + '\n')
+      else { res.statusCode = error.code === 'WEIXIN_ORIGIN' ? 403 : error.code === 'WEIXIN_SESSION' ? 401 : 409; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ error: scrub(error.message), code: error.code || 'WEIXIN_INSTALL_FAILED' })) }
+    } finally { clearInterval(heartbeat) }
+    return
+  }
 
   if (cmd === 'channel_plugin_install_stream' || cmd === 'channel_action_stream') {
     const args = await readBody(req)
@@ -20863,9 +20977,9 @@ async function _apiMiddleware(req, res, next) {
     res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify(result))
   } catch (e) {
-    res.statusCode = e.code === 'EMBED_AUTH_CHANGED' ? 401 : 500
+    res.statusCode = e.code === 'EMBED_AUTH_CHANGED' ? 401 : typeof e.code === 'string' && e.code.startsWith('WEIXIN_') ? 409 : 500
     res.setHeader('Content-Type', 'application/json')
-    res.end(JSON.stringify({ error: e.message || String(e) }))
+    res.end(JSON.stringify({ error: e.message || String(e), ...(typeof e.code === 'string' && e.code.startsWith('WEIXIN_') ? { code: e.code } : {}) }))
   }
 }
 

@@ -74,7 +74,7 @@ function logRequest(cmd, args, duration, cached = false) {
     timestamp: Date.now(),
     time: new Date().toLocaleTimeString('zh-CN', { hour12: false, fractionalSecondDigits: 3 }),
     cmd,
-    args: JSON.stringify(args),
+    args: JSON.stringify(args, (key, value) => /^(?:confirmationToken|authSession|authSessionToken|sessionToken|clawpanel_session|clawpanel_weixin_session|authorization|cookie|password)$/i.test(key) ? '[REDACTED]' : value),
     duration: duration ? `${duration}ms` : '-',
     cached
   }
@@ -180,10 +180,30 @@ async function webInvoke(cmd, args) {
   return resp.json()
 }
 
+async function weixinConsentInvoke(cmd, args) {
+  try {
+    if (isTauriRuntime()) return await (await getTauriInvoke())(cmd, args)
+    const response = await fetch(`/__api/${cmd}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-ClawPanel-Consent': '1' }, body: JSON.stringify(args), credentials: 'same-origin' })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
+    return data
+  } catch (error) { throw new Error(redactWeixinConsentText(error?.message || error, args?.confirmationToken)) }
+}
+
+// 确认能力只保留在调用栈；传输异常和第三方输出也不能把票据带到 action log/toast。
+function redactWeixinConsentText(value, ticket) {
+  let text = String(value)
+  if (ticket) text = text.split(ticket).join('[REDACTED]')
+  return text.replace(/((?:confirmationToken|authSession(?:Token)?|sessionToken|clawpanel_(?:weixin_)?session|authorization|cookie|password)\s*["']?\s*[:=]\s*["']?)[^\s,"'};]+/gi, '$1[REDACTED]')
+}
+function redactWeixinConsentValue(value, ticket) {
+  return JSON.parse(redactWeixinConsentText(JSON.stringify(value, (key, item) => /^(?:confirmationToken|authSession|authSessionToken|sessionToken|clawpanel_session|clawpanel_weixin_session|authorization|cookie|password)$/i.test(key) ? '[REDACTED]' : item), ticket))
+}
+
 async function webStreamInvoke(cmd, args, onEvent, options = {}) {
   const resp = await fetch(`/__api/${cmd}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     body: JSON.stringify(args || {}),
     signal: options.signal,
   })
@@ -451,6 +471,27 @@ export const api = {
     return result
   },
   checkWeixinPluginStatus: () => invoke('check_weixin_plugin_status'),
+  // 单次确认能力不进入通用请求日志，避免把 opaque token 留在前端调试记录里。
+  prepareWeixinInstall: (operation) => weixinConsentInvoke('prepare_weixin_install', { operation }),
+  cancelWeixinInstall: (operationId, confirmationToken) => weixinConsentInvoke('cancel_weixin_install', { operationId, confirmationToken }),
+  confirmWeixinInstall: async (confirmation) => {
+    const ticket = confirmation.confirmationToken
+    try {
+    if (isTauriRuntime()) return redactWeixinConsentValue(await (await getTauriInvoke())('confirm_weixin_install', confirmation), ticket)
+    let result, failure
+    await webStreamInvoke('weixin_install_confirm_stream', confirmation, event => {
+      event = redactWeixinConsentValue(event, ticket)
+      if (event.event === 'result') result = event.result
+      else if (event.event === 'error') failure = event.error
+      else for (const cb of _webChannelListeners.get(event.event) || []) cb({ payload: event.payload })
+    }, { headers: { 'X-ClawPanel-Consent': '1' } })
+    if (failure) throw new Error(String(failure).split(ticket).join('[REDACTED]'))
+    if (!result?.ok || result.readback?.sdkLoaded !== true) throw new Error('微信安装连接未获得真实成功回读，请检查状态；不会自动重复安装')
+    invalidate('list_all_plugins', 'read_openclaw_config', 'list_configured_platforms')
+    return result
+    } catch (error) { throw new Error(redactWeixinConsentText(error?.message || error, ticket)) }
+    finally { confirmation.confirmationToken = null }
+  },
 
   // Agent 渠道绑定管理
   getAgentBindings: (agentId) => invoke('get_agent_bindings', { agentId }),

@@ -11,6 +11,7 @@ import { showContentModal, showConfirm } from '../components/modal.js'
 import { icon } from '../lib/icons.js'
 import { CHANNEL_LABELS } from '../lib/channel-labels.js'
 import { t } from '../lib/i18n.js'
+import { renderWeixinConsentReview, renderWeixinManualConsentHint } from './channels-weixin-consent.js'
 import { termHelpHtml, attachTermTooltips } from '../lib/term-tooltip.js'
 import { wsClient } from '../lib/ws-client.js'
 import {
@@ -2299,7 +2300,7 @@ async function openConfigDialog(pid, page, state, accountId) {
 
     const modal = showContentModal({
       title: `${reg.label} ${t('channels.setup')}`,
-      content: actionOnlyGuide + pluginStatusHtml + manualCommandHtml + actionOnlyBtns,
+      content: actionOnlyGuide + pluginStatusHtml + manualCommandHtml + (pid === 'weixin' ? renderWeixinManualConsentHint() : '') + actionOnlyBtns,
       buttons: [
         { label: t('channels.close'), className: 'btn btn-secondary', id: 'btn-close' },
       ],
@@ -2317,6 +2318,42 @@ async function openConfigDialog(pid, page, state, accountId) {
       }
     })
 
+    let weixinInstalled = false
+    // 不以普通 confirm/回车代替明确勾选；关闭、取消和过期都撤销本次能力。
+    const reviewWeixinInstall = async () => {
+      const prepared = await api.prepareWeixinInstall(weixinInstalled ? 'upgrade' : 'install')
+      if (!modal.isConnected || prepared.protocolVersion !== 1 || prepared.artifact?.version !== '2.4.9' || !prepared.review?.reviewToken) {
+        try { await api.cancelWeixinInstall(prepared.operationId, prepared.confirmationToken) } catch {} finally { prepared.confirmationToken = null }
+        if (!modal.isConnected) return null
+        throw new Error(t('channels.weixinConsentInvalid'))
+      }
+      const a = prepared.artifact, r = prepared.review
+      const review = showContentModal({
+        title: t('channels.weixinConsentTitle'), width: 680,
+        content: renderWeixinConsentReview(prepared),
+        buttons: [{ id: 'weixin-consent-confirm', label: t('channels.weixinConsentConfirm'), className: 'btn btn-primary' }],
+      })
+      review.dataset.weixinConsentReview = ''
+      const accept = review.querySelector('[data-weixin-consent-accept]'), confirm = review.querySelector('#weixin-consent-confirm'), cancel = review.querySelector('[data-action="cancel"]')
+      confirm.dataset.weixinConsentConfirm = ''; cancel.dataset.weixinConsentCancel = ''; confirm.disabled = true; cancel.focus()
+      return new Promise(resolve => {
+        let finished = false
+        const finish = async (accepted) => {
+          if (finished) return
+          finished = true; clearTimeout(timer); observer.disconnect(); review.remove()
+          const confirmation = accepted ? { operationId: prepared.operationId, confirmationToken: prepared.confirmationToken, accepted: true, artifactSha256: a.sha256, reviewToken: r.reviewToken } : null
+          try { if (!accepted) await api.cancelWeixinInstall(prepared.operationId, prepared.confirmationToken) } catch {} finally { prepared.confirmationToken = null }
+          resolve(confirmation)
+        }
+        const current = () => Date.now() < Date.parse(prepared.expiresAt)
+        accept.addEventListener('change', () => { confirm.disabled = !accept.checked || !current() })
+        confirm.onclick = () => { if (accept.checked && current()) finish(true) }
+        cancel.onclick = () => finish(false)
+        const observer = new MutationObserver(() => { if (!review.isConnected || !modal.isConnected) finish(false) })
+        observer.observe(document.body, { childList: true, subtree: true })
+        const timer = setTimeout(() => finish(false), Math.max(0, Math.min(300000, Date.parse(prepared.expiresAt) - Date.now())))
+      })
+    }
     // 两端共享兼容性状态；未知版本不伪装成已兼容，安装目标与 npm 最新版分别展示。
     const refreshWeixinStatus = async () => {
       if (pid !== 'weixin') return
@@ -2338,6 +2375,7 @@ async function openConfigDialog(pid, page, state, accountId) {
         if (!s) throw new Error(t('channels.pluginStatusFailed'))
         const parts = []
         const installed = s.installed || s.builtin
+        weixinInstalled = !!installed
         const tone = installed && s.compatible === true ? 'success' : installed ? 'warning' : 'text-secondary'
         const label = !installed ? t('channels.pluginNotInstalled') : s.compatible === true
           ? t('channels.pluginInstalled') : s.compatible === false ? t('channels.pluginIncompatible') : t('channels.weixinCompatUnknown')
@@ -2393,11 +2431,19 @@ async function openConfigDialog(pid, page, state, accountId) {
         const listen = safeTauriListen
         let unlistenLog = null, unlistenProgress = null
         let _qrTimer = null
+        let _flushQr = () => {}
+        let weixinConfirmation = null
         const cleanup = () => { unlistenLog?.(); unlistenProgress?.(); clearTimeout(_qrTimer) }
 
         try {
           btn.disabled = true
           btn.textContent = t('channels.executingShort')
+          weixinConfirmation = pid === 'weixin' && actionId === 'install' ? await reviewWeixinInstall() : null
+          if (pid === 'weixin' && actionId === 'install' && !weixinConfirmation) {
+            const title = actionResultEl.querySelector('[data-channel-action-title]')
+            if (title) title.textContent = t('channels.weixinConsentCancelled')
+            return
+          }
           if (logBox) {
             const hint = document.createElement('div')
             hint.style.cssText = 'color:var(--text-tertiary);font-style:italic'
@@ -2407,7 +2453,7 @@ async function openConfigDialog(pid, page, state, accountId) {
           }
           const _qrBuf = []
           let _qrDone = false
-          const _flushQr = () => {
+          _flushQr = () => {
             if (!_qrBuf.length || _qrDone) return
             _qrDone = true
             // 解析 Unicode 半块字符为二值矩阵
@@ -2489,7 +2535,9 @@ async function openConfigDialog(pid, page, state, accountId) {
           // runChannelAction 的版本由后端自动检测（微信/QQ 版本号独立于 OpenClaw）
           const output = actionId === 'restart' && pid === 'weixin'
             ? await api.restartGateway()
-            : await api.runChannelAction(pid, actionId, null)
+            : pid === 'weixin' && actionId === 'install'
+              ? (await api.confirmWeixinInstall(weixinConfirmation)).message
+              : await api.runChannelAction(pid, actionId, null)
           _flushQr() // 命令结束后刷新残留 QR 缓冲
           if (progressBar) progressBar.style.width = '100%'
           if (progressText) progressText.textContent = '100%'
@@ -2529,6 +2577,7 @@ async function openConfigDialog(pid, page, state, accountId) {
             logBox.appendChild(div)
           }
         } finally {
+          if (weixinConfirmation) weixinConfirmation.confirmationToken = null
           cleanup()
           modal.querySelectorAll('[data-channel-action]').forEach(b => { b.disabled = false })
           btn.textContent = reg.actions.find(a => a.id === actionId)?.label || t('channels.execute')

@@ -1,0 +1,23 @@
+{
+  "name": "@tencent-weixin/openclaw-weixin",
+  "version": "2.4.9",
+  "dist": {
+    "shasum": "d74a3ad07cc43f27eb3ec48f3eb1c0945cae2384",
+    "tarball": "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.9.tgz",
+    "fileCount": 125,
+    "integrity": "sha512-SfaYehR1Cwq2VV5HxJBp9sVilMms420VfZlMbF4YjRbWomr5+GxfXp9HkeU6y5TbnOc4Ysq0qPw1yBvJwbenBA==",
+    "signatures": [
+      {
+        "sig": "MEUCIDJ+0wtzV43pbyDIwTJYSS+9JSREPeRGrheGfcrOiRpJAiEA1qW9LcXrH4OmMQRk8ZOKMWaEu9QtrC5+9ELqVk5D2So=",
+        "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+      },
+      {
+        "sig": "MEUCIQCvNQcL170li5HmQuXxxNKpC6wPscE+9Nm+SAy6mVVgPwIgTZEaSvE3WQ3bLEH6BtESbKRgENBj0NY3ml+TwY+cpXw=",
+        "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"
+      }
+    ],
+    "unpackedSize": 696653
+  },
+  "sourceCommit": "43675b66551d12d6853155a7869a50fb12a18a1e",
+  "sha256": "467e8047f7114e45944961fcd3eda9421843c9c65db61ea24176e252ab800ee4"
+}
