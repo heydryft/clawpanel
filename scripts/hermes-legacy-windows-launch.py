@@ -171,6 +171,101 @@ def _runtime_facts():
                 process_create_time_filetime_100ns=creation_ticks)
 
 
+def _legacy_managed_base_physical(value, root, facts, *, slot):
+    """仅R20实测UV3.11→3.11.17私有junction；原始事实/通用物理守卫保持不变。"""
+    alias = root / '.hermes-runtime/python/cpython-3.11-windows-x86_64-none'
+    requested = Path(value)
+    if slot not in ('facts.base-executable', 'facts.base-prefix', 'venv-config.home') or requested not in (alias, alias / 'python.exe'):
+        return _physical(value, slot=slot)
+    try:
+        link = alias.lstat()
+        if not getattr(link, 'st_file_attributes', 0) & 0x400:
+            return _physical(value, slot=slot)
+        if (stat.S_ISLNK(link.st_mode) or not stat.S_ISDIR(link.st_mode) or
+                getattr(link, 'st_reparse_tag', None) != 0xa0000003):
+            return _physical(value, slot=slot)
+        store = _physical(root / '.hermes-runtime/python', slot='layout.python-store')
+        target = store / 'cpython-3.11.17-windows-x86_64-none'
+
+        def link_state():
+            info = alias.lstat()
+            _require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                getattr(info, 'st_file_attributes', 0) & 0x400 and getattr(info, 'st_reparse_tag', None) == 0xa0000003,
+                'managed Python alias is not the fixed directory junction')
+            text = os.readlink(alias)
+            # 只识别本地Win32 extended drive语法；UNC/相对/其他目标仍被原守卫拒绝。
+            if text.startswith('\\\\?\\') and re.match(r'[a-zA-Z]:[\\/]', text[4:]):
+                text = text[4:]
+            _require(Path(text) == target and '..' not in text.replace('\\', '/').split('/'),
+                     'managed Python alias target mismatch')
+            return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_mode,
+                    getattr(info, 'st_file_attributes', 0), getattr(info, 'st_reparse_tag', None), text)
+
+        before_link = link_state()
+        _require(_physical(target, slot='facts.base-prefix') == target and target.is_dir(),
+                 'managed Python alias target must be physical directory')
+        image = _physical(target / 'python.exe', slot='facts.process-executable')
+        _require(sys.version_info[:3] == (3, 11, 17), 'managed Python alias version mismatch')
+        head = _physical(root / '.git/HEAD', slot='layout.git-head').read_bytes()
+        _require(head in (LEGACY_PIN.encode(), (LEGACY_PIN+'\n').encode(), (LEGACY_PIN+'\r\n').encode()),
+                 'Git detached pin mismatch')
+        _SourceContract(root, SOURCE_HASHES)
+
+        def native_identity():
+            current = _runtime_facts()
+            _require(all(current.get(k) == v for k, v in dict(platform='win32', os_name='nt',
+                native_machine=0x8664, process_machine=0, bits=64, isolated=1, dont_write_bytecode=True).items()),
+                'managed Python alias requires native isolated runtime')
+            keys = ('executable', 'prefix', 'base_executable', 'base_prefix', 'process_executable',
+                    'process_id', 'process_create_time_filetime_100ns')
+            _require(all(current.get(k) == facts.get(k) for k in keys) and
+                current['process_id'] == os.getpid() and type(current['process_create_time_filetime_100ns']) is int and
+                current['process_create_time_filetime_100ns'] > 116444736000000000,
+                'managed Python alias process facts changed')
+            _require(_physical(current['executable'], slot='facts.executable') == root / 'venv/Scripts/python.exe' and
+                _physical(current['prefix'], slot='facts.prefix') == root / 'venv' and
+                Path(current['base_executable']) == alias / 'python.exe' and
+                Path(current['base_prefix']) in (alias, target) and
+                _physical(current['process_executable'], slot='facts.process-executable') == image,
+                'managed Python alias native image mismatch')
+
+        def binary_state(path):
+            with path.open('rb') as stream:
+                info = os.fstat(stream.fileno())
+                _require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 64 * 1024 * 1024 and
+                    info.st_ino > 0 and not getattr(info, 'st_file_attributes', 0) & 0x400,
+                    'managed Python alias image is not a bounded regular file')
+                data = stream.read(64 * 1024 * 1024 + 1)
+                after = os.fstat(stream.fileno())
+                identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                _require(identity(info) == identity(after) and len(data) == info.st_size,
+                         'managed Python alias image changed during read')
+                return identity(info), hashlib.sha256(data).hexdigest()
+
+        native_identity()
+        binary = binary_state(image)
+        _require(binary_state(alias / 'python.exe') == binary and binary_state(image) == binary,
+                 'managed Python alias binary identity/hash mismatch')
+        _require(link_state() == before_link, 'managed Python alias changed during admission')
+        _require(_physical(target / 'python.exe', slot='facts.process-executable') == image,
+                 'managed Python alias target changed')
+        native_identity()
+        if os.environ.get('CLAWPANEL_HERMES_PHASE_TIMING') == '1':
+            try:
+                import json
+                print('CLAWPANEL_HERMES_LEGACY_ALIAS ' + json.dumps(dict(schemaVersion=1,
+                    processId=facts['process_id'], creationTimeFiletime100ns=facts['process_create_time_filetime_100ns'],
+                    pin=LEGACY_PIN, sourceFilesVerified=len(SOURCE_HASHES), junctionTag=0xa0000003,
+                    aliasRelative=alias.relative_to(root).as_posix(), targetRelative=target.relative_to(root).as_posix(),
+                    binarySha256=binary[1], binaryHashScope='stable-live-image-file-not-vendor-attestation'),
+                    separators=(',', ':')), file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
+        return target if requested == alias else image
+    except (OSError, ValueError, TypeError, KeyError):
+        raise SystemExit('ClawPanel legacy Windows: managed Python alias unavailable') from None
+
+
 def _validate_layout(root, home, pin, mode, facts):
     """内部纯准入检查；生产仅使用 _runtime_facts 实测值，无 CLI 覆盖参数。"""
     _require(pin == LEGACY_PIN and mode == 'console', 'pin/mode contract mismatch')
@@ -184,10 +279,10 @@ def _validate_layout(root, home, pin, mode, facts):
     venv = _physical(root / 'venv', slot='layout.venv')
     _require(_physical(facts['prefix'], slot='facts.prefix') == venv and
              _physical(facts['executable'], slot='facts.executable') == _physical(venv / 'Scripts/python.exe', slot='layout.venv-executable'), 'managed venv interpreter mismatch')
-    base = _physical(facts['base_executable'], slot='facts.base-executable')
+    base = _legacy_managed_base_physical(facts['base_executable'], root, facts, slot='facts.base-executable')
     store = _physical(root / '.hermes-runtime/python', slot='layout.python-store')
     _require(base.name.lower() == 'python.exe' and store in base.parents and
-             _physical(facts['base_prefix'], slot='facts.base-prefix') == base.parent, 'managed base interpreter mismatch')
+             _legacy_managed_base_physical(facts['base_prefix'], root, facts, slot='facts.base-prefix') == base.parent, 'managed base interpreter mismatch')
     # venv 是启动器/逻辑 Python；此时正在执行的 Win32 image 是真实 base Python。
     _require(_physical(facts.get('process_executable', ''), slot='facts.process-executable') == base, 'native process image differs from managed base Python')
     _require(type(facts.get('process_id')) is int and facts['process_id'] == os.getpid(), 'native process PID mismatch')
@@ -201,7 +296,7 @@ def _validate_layout(root, home, pin, mode, facts):
             _require(key not in cfg, 'duplicate venv configuration')
             cfg[key] = value.strip()
     _require(cfg.get('include-system-site-packages', '').lower() == 'false', 'system site packages denied')
-    _require(_physical(cfg.get('home', ''), slot='venv-config.home') == base.parent, 'venv base home mismatch')
+    _require(_legacy_managed_base_physical(cfg.get('home', ''), root, facts, slot='venv-config.home') == base.parent, 'venv base home mismatch')
     git = _physical(root / '.git', slot='layout.git')
     _require(git.is_dir(), 'physical Git directory required')
     head = _physical(git / 'HEAD', slot='layout.git-head').read_bytes()

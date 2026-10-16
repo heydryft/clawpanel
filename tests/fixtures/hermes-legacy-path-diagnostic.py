@@ -148,10 +148,23 @@ class Contract(unittest.TestCase):
                         m._validate_layout(self.root,self.home,m.LEGACY_PIN,'console',self.facts)
                 self.assertEqual(self.event(out.getvalue())['slot'], slot)
 
-    def test_no_changes_to_original_layout_profile_module_identity_or_pin_decisions(self):
+    def test_only_three_fixed_alias_operands_change_other_layout_profile_identity_and_pin_ast_unchanged(self):
+        aliases = []
         class StripSlots(ast.NodeTransformer):
             def visit_Call(self, node):
                 self.generic_visit(node)
+                if isinstance(node.func, ast.Name) and node.func.id == '_legacy_managed_base_physical':
+                    self_outer.assertEqual(len(node.args), 3)
+                    self_outer.assertEqual(ast.dump(node.args[1]), ast.dump(ast.Name(id='root',ctx=ast.Load())))
+                    self_outer.assertEqual(ast.dump(node.args[2]), ast.dump(ast.Name(id='facts',ctx=ast.Load())))
+                    self_outer.assertEqual(len(node.keywords), 1)
+                    slot = node.keywords[0].value.value
+                    operands = {'facts.base-executable': "facts['base_executable']",
+                        'facts.base-prefix': "facts['base_prefix']", 'venv-config.home': "cfg.get('home', '')"}
+                    self_outer.assertIn(slot, operands)
+                    self_outer.assertEqual(ast.dump(node.args[0]), ast.dump(ast.parse(operands[slot],mode='eval').body))
+                    aliases.append(slot)
+                    node.func.id = '_physical'; node.args = node.args[:1]
                 if isinstance(node.func, ast.Name) and node.func.id == '_physical':
                     self_outer.assertEqual(len(node.keywords), 1)
                     self_outer.assertEqual(node.keywords[0].arg, 'slot')
@@ -164,6 +177,7 @@ class Contract(unittest.TestCase):
             if isinstance(node,(ast.FunctionDef,ast.ClassDef)) and node.name in expected['unchangedAstExceptSlotKeywords']:
                 clean = StripSlots().visit(node)
                 self.assertEqual(hashlib.sha256(ast.dump(clean,include_attributes=False).encode()).hexdigest(), expected['unchangedAstExceptSlotKeywords'][node.name], node.name)
+        self.assertCountEqual(aliases, ['facts.base-executable','facts.base-prefix','venv-config.home'])
         hashes = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SOURCE_HASHES' for t in n.targets))
         self.assertEqual(hashes,expected['sourceHashes'])
 
