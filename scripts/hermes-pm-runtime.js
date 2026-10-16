@@ -190,8 +190,21 @@ finally:
 
 // 版本探针只读本机官方 metadata，不把同步远程更新检查混进安装/状态验收。
 export const HERMES_PRIVATE_METADATA_SCRIPT = String.raw`
-import hashlib, inspect, os, subprocess, sys
+import hashlib, inspect, json, os, subprocess, sys
 from pathlib import Path
+
+
+# 仅显式启用时输出固定阶段/PID/单调耗时；不含路径、参数、配置或错误内容。
+def _hp(name):
+    if os.environ.get('CLAWPANEL_HERMES_PHASE_TIMING')!='1' or name not in 'entry src_b src_e store reexec imp_b imp_e cur_b cur_e debt1_b debt1_e act_b act_e state1_b state1_e prof_b prof_e boot_b boot_e state2_b state2_e debt2_b debt2_e policy_b policy_e main_b main_exit preflight meta_b meta_e pyjson_b pyjson_e'.split():return
+    import time
+    t=time.perf_counter_ns();d=_hp.__dict__;s=d.setdefault('t',t);p=d.get('p',t);i=d.get('i',0)+1
+    d.update(p=t,i=i)
+    try:
+        print('CLAWPANEL_HERMES_PHASE '+json.dumps(dict(schemaVersion=1,scope='metadata',phase=name,pid=os.getpid(),ppid=os.getppid(),sequence=i,elapsedMs=round((t-s)/1e6,3),deltaMs=round((t-p)/1e6,3))),file=sys.stderr,flush=True)
+    except (OSError,ValueError):pass
+
+_hp('entry')
 
 def reexec_selected_python(python):
     command = [str(python), *sys.orig_argv[1:]]
@@ -209,32 +222,42 @@ if os.environ.get('HERMES_RUNTIME_DIR') and Path(os.environ['HERMES_RUNTIME_DIR'
     raise RuntimeError('Hermes metadata: foreign runtime override')
 if os.environ.get('HERMES_INSTALL_ROOT') and Path(os.environ['HERMES_INSTALL_ROOT']).resolve() != root:
     raise RuntimeError('Hermes metadata: foreign install root override')
+_hp('src_b')
 head = subprocess.run(['git','-C',str(root),'rev-parse','HEAD'],check=True,capture_output=True,text=True).stdout.strip()
 if head != pin:
     raise RuntimeError('Hermes metadata: checkout mismatch')
 content = (root / 'hermes_cli/_startup_fast.py').read_bytes().replace(b'\r\n',b'\n')
 if hashlib.sha256(content).hexdigest() != '94818a6fcf1f8607e1690a95c9f9042b57aa910ebc9631cf84def5402edf1536':
     raise RuntimeError('Hermes metadata: upstream interface changed')
+_hp('src_e')
 sys.path.insert(0,str(root))
 from hermes_cli._launchers import resolve_store_python
 python = resolve_store_python(root,publication=True)
 if python is None or not python.is_file() or not python.resolve().is_relative_to(home / 'tools'):
     raise RuntimeError('Hermes metadata: selected store Python is missing or foreign')
+_hp('store')
 if os.path.normcase(os.path.abspath(python)) != os.path.normcase(os.path.abspath(sys.executable)):
     if os.environ.get('CLAWPANEL_HERMES_METADATA_REEXEC') == pin:
         raise RuntimeError('Hermes metadata: store Python identity mismatch')
     os.environ['CLAWPANEL_HERMES_METADATA_REEXEC'] = pin
+    _hp('reexec')
     reexec_selected_python(python)
 sys.argv[1:] = ['--version']
+_hp('act_b')
 from pm.environments import activate_dependencies
 activate_dependencies(root)
+_hp('act_e')
 import pm
+_hp('cur_b')
 if pm.venv_is_current(project_root=root) is not True:
     raise RuntimeError('Hermes metadata: PM currency false or unknown')
+_hp('cur_e')
 from hermes_cli._startup_fast import print_fast_version_info
 if list(inspect.signature(print_fast_version_info).parameters) != ['check_updates']:
     raise RuntimeError('Hermes metadata: callable signature changed')
+_hp('meta_b')
 print_fast_version_info(check_updates=False)
+_hp('meta_e')
 `
 
 // 普通 CLI 的唯一受管入口；不修改上游文件，不用依赖 venv/旧 launcher 启动 CLI。
@@ -249,6 +272,19 @@ import re
 import runpy
 import subprocess
 import sys
+
+
+# 仅显式启用时输出固定阶段/PID/单调耗时；不含路径、参数、配置或错误内容。
+def _hp(name):
+    if os.environ.get('CLAWPANEL_HERMES_PHASE_TIMING')!='1' or name not in 'entry src_b src_e store reexec imp_b imp_e cur_b cur_e debt1_b debt1_e act_b act_e state1_b state1_e prof_b prof_e boot_b boot_e state2_b state2_e debt2_b debt2_e policy_b policy_e main_b main_exit preflight meta_b meta_e pyjson_b pyjson_e'.split():return
+    import time
+    t=time.perf_counter_ns();d=_hp.__dict__;s=d.setdefault('t',t);p=d.get('p',t);i=d.get('i',0)+1
+    d.update(p=t,i=i)
+    try:
+        print('CLAWPANEL_HERMES_PHASE '+json.dumps(dict(schemaVersion=1,scope='launch',phase=name,pid=os.getpid(),ppid=os.getppid(),sequence=i,elapsedMs=round((t-s)/1e6,3),deltaMs=round((t-p)/1e6,3))),file=sys.stderr,flush=True)
+    except (OSError,ValueError):pass
+
+_hp('entry')
 
 PIN = 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
 HASHES = {
@@ -660,6 +696,7 @@ require(not os.environ.get('HERMES_RUNTIME_DIR') or Path(os.environ['HERMES_RUNT
 require(not os.environ.get('HERMES_INSTALL_ROOT') or Path(os.environ['HERMES_INSTALL_ROOT']).resolve() == root, 'foreign install root override')
 incoming = Path(os.environ['HERMES_HOME']).resolve()
 require(incoming == home or incoming.parent == home / 'profiles', 'incoming home escapes managed installation')
+_hp('src_b')
 head = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
 require(head == PIN, 'checkout commit mismatch')
 dirty = subprocess.run(['git', '-C', str(root), 'status', '--porcelain', '--untracked-files=normal'],
@@ -668,58 +705,86 @@ require(not dirty, 'checkout is dirty')
 for name, digest in HASHES.items():
     require(hashlib.sha256((root / name).read_bytes().replace(b'\r\n', b'\n')).hexdigest() == digest,
             'upstream source/interface changed: ' + name)
+_hp('src_e')
 sys.path.insert(0, str(root))
 from hermes_cli._launchers import resolve_store_python
 python = resolve_store_python(root, publication=True)
 require(python is not None and python.is_file() and (home / 'tools').resolve() == home / 'tools' and
         python.resolve().is_relative_to(home / 'tools'), 'selected store Python is missing or foreign')
+_hp('store')
 same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
 if not same:
     require(os.environ.get('CLAWPANEL_HERMES_LAUNCH_REEXEC') != PIN, 'selected store Python identity mismatch')
     os.environ['CLAWPANEL_HERMES_LAUNCH_REEXEC'] = PIN
+    _hp('reexec')
     reexec_selected_python(python)
 
 # 仅 bootstrap 阶段使用原 tail 身份，防止在 preflight 前隐式修复。
 sys.argv = [str(root / 'hermes_cli/source_completion.py'), '--version']
+_hp('imp_b')
 import pm
 from hermes_cli.venv_sync import completion_pending_path, _tree_matches_completed_stamp
+_hp('imp_e')
+_hp('cur_b')
 require(pm.venv_is_current(project_root=root) is True, 'PM currency is false or unknown')
+_hp('cur_e')
 require(not completion_pending_path(root).exists(), 'source completion debt remains')
+_hp('debt1_b')
 validate_no_repair_debt(root)
+_hp('debt1_e')
+_hp('act_b')
 from pm.environments import activate_dependencies
 activate_dependencies(root)
+_hp('act_e')
+_hp('state1_b')
 from hermes_cli.source_build import source_product_current
 validate_runtime_state(root)
+_hp('state1_e')
+_hp('prof_b')
 active = prepare_active_profile(root, home, argv)
 selected_argv = sys.argv[1:]
 from hermes_cli._parser import command_argv
 words = command_argv(sys.argv[1:])
 if sys.platform == 'win32':
     validate_windows_entrypoint(words)
+_hp('prof_e')
+_hp('boot_b')
 record = private_boot(root)
+_hp('boot_e')
+_hp('state2_b')
 validate_runtime_state(root)
+_hp('state2_e')
+_hp('debt2_b')
 validate_no_repair_debt(root)
+_hp('debt2_e')
 print('CLAWPANEL_HERMES_PRIVATE_PREFLIGHT ' + json.dumps({'commit': PIN, 'current': True, 'same': True,
       'completed': True, 'activeHome': str(active), 'bootRecord': str(record), 'command': words[:2]}), file=sys.stderr, flush=True)
 if mode.endswith('preflight'):
+    _hp('preflight')
     raise SystemExit(0)
 # 显式钉住已核验的 profile，避免 main 二次解析时 sticky 文件变化改向未维护的 HOME。
+_hp('policy_b')
 from hermes_cli.profiles import get_active_profile_name
 sys.argv = ['hermes', '--profile', get_active_profile_name(), *selected_argv]
 launch_script = sys.orig_argv[sys.orig_argv.index('-c') + 1]
 restore_policy = install_private_runtime_policy(root, home, launch_script, mode.startswith('--portable'))
 restore_profile_policy = None
+_hp('policy_e')
 try:
     restore_profile_policy = install_private_profile_task_policy(root, home)
     if python_json:
         # 只接收面板已编译的固定 helper；该通道没有暴露任意脚本 HTTP/IPC 接口。
+        _hp('pyjson_b')
         exec(compile(snippet, '<clawpanel-hermes-python-json>', 'exec'), {'__name__': '__main__'})
+        _hp('pyjson_e')
         raise SystemExit(0)
+    _hp('main_b')
     runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)
 finally:
     restore_policy()
     if restore_profile_policy is not None:
         restore_profile_policy()
+    _hp('main_exit')
 `
 
 /** 安装先确认原生 AMD64；普通运行还会在共享 Python 内再次调用原生 OS API。 */

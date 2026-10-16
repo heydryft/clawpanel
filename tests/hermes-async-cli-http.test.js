@@ -90,7 +90,7 @@ test('真实并发 HTTP：慢 profiles/sessions 不阻塞独立快速 health，�
   const received = new Promise(resolve => { sawHealth = resolve }), health = api('hermes_health_check'); await received; sawHealth = null
   const started = performance.now(), burst = await Promise.all([api('hermes_profiles_list'), api('hermes_sessions_list'), api('check_hermes')]), result = await health
   observations.push({ phase: 'burst', health: result, burst, wallMs: performance.now() - started })
-  assert.equal(result.status, 200, JSON.stringify(observations)); assert.deepEqual(result.value, payload); assert.ok(result.ms < 5000, '快速上游不得被CLI占满5秒预算')
+  assert.equal(result.status, 200, JSON.stringify(observations)); assert.deepEqual(result.value, payload); assert.ok(result.ms < 5000, '快速上游不得被CLI占满5秒预算: ' + JSON.stringify(result))
   assert.ok(burst.every(r => r.status === 200)); assert.ok(performance.now() - started < 11000, '两个CLI应并发而非各6.2秒串行')
   const events = fs.readFileSync(cliLog, 'utf8').trim().split('\n').map(s => JSON.parse(s)), starts = events.filter(e => e.event === 'start'), ends = events.filter(e => e.event === 'end')
   assert.equal(starts.length, 2, '不重放CLI'); assert.equal(ends.length, 2); assert.ok(Math.abs(starts[0].monotonicMs - starts[1].monotonicMs) < 2000)

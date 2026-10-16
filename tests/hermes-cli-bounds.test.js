@@ -51,7 +51,7 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
   const results = await Promise.all(pending); report.wallMs = performance.now() - started
   // 先保存完整红灯事实，再断言；不让第一个并发失败掩盖其他观测。
   report.events = readEvents(); report.peak = peak
-  assert.equal(health.status, 200); assert.deepEqual(health.value, healthPayload); assert.ok(health.ms < 2000)
+  assert.equal(health.status, 200, JSON.stringify(health)); assert.deepEqual(health.value, healthPayload); assert.ok(health.ms < 2000, 'CLI过载期间真实health: ' + JSON.stringify(health))
   assert.ok(peak <= 2, `实际子进程峰值 ${peak}，不应无界启动`)
   const busy = results.filter(r => r.status === 500 && /queue.*full/i.test(r.value.error))
   assert.equal(busy.length, 2, JSON.stringify(results)); assert.ok(busy.every(r => r.ms < 2000), '队满立即失败')
