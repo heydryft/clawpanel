@@ -25,6 +25,33 @@ const TTL_MS: u64 = 300_000;
 const COMPRESSED_MAX: usize = 1_048_576;
 const UNPACKED_MAX: usize = 4_194_304;
 const OUTPUT_MAX: usize = 1_048_576;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Artifact {
+    version: &'static str,
+    url: &'static str,
+    integrity: &'static str,
+    sha256: &'static str,
+    manifest_sha256: &'static str,
+    file_count: usize,
+    unpacked_size: usize,
+    compressed_size: usize,
+    sdk_subpath: &'static str,
+    source_commit: &'static str,
+}
+const ARTIFACT_249: Artifact = Artifact {
+    version: VERSION,
+    url: ARTIFACT_URL,
+    integrity: INTEGRITY,
+    sha256: ARTIFACT_SHA256,
+    manifest_sha256: MANIFEST_SHA256,
+    file_count: 125,
+    unpacked_size: 696_653,
+    compressed_size: 172_146,
+    sdk_subpath: "openclaw/plugin-sdk/infra-runtime",
+    source_commit: "43675b66551d12d6853155a7869a50fb12a18a1e",
+};
+const ARTIFACT_2410: Artifact = Artifact { version:"2.4.10", url:"https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.10.tgz", integrity:"sha512-qCN7rFtBK5BO/i5YGEJLdpC/8WQrm0dtPlQ0xNxku4RSyzGaRsiBoLVheU5hgpoOIBvfc5pUwKTktMbROLcIVg==", sha256:"69dd18af16a992edbe3700d244f9591ab52f5f58abfe976a9f1250bd8eacdbbb", manifest_sha256:"43957bcf2852862a337f7606a4c352c443e67eda16424a4cd158425768e6b1b8", file_count:131, unpacked_size:696_593, compressed_size:172_518, sdk_subpath:"openclaw/plugin-sdk/temp-path", source_commit:"c6643f6f0ac03574eb126f2d69569ea4267cc3c6" };
 static STORE: LazyLock<Mutex<ConsentStore>> = LazyLock::new(|| Mutex::new(ConsentStore::default()));
 static CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -56,6 +83,8 @@ struct Binding {
     installed_version: Option<String>,
     installed_path: String,
     installed_sha256: Option<String>,
+    artifact: Artifact,
+    host_sdk: String,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,7 +180,7 @@ impl ConsentStore {
         if !a.accepted {
             return Err(failure("WEIXIN_CONSENT_REQUIRED", "需要明确确认本次安装"));
         }
-        if a.artifact_sha256 != ARTIFACT_SHA256 || a.review_token != REVIEW_TOKEN {
+        if a.artifact_sha256 != binding.artifact.sha256 || a.review_token != REVIEW_TOKEN {
             return Err(failure(
                 "WEIXIN_ARTIFACT_CHANGED",
                 "确认内容发生变化，请重新准备",
@@ -234,14 +263,7 @@ pub(super) fn consent_required() -> String {
     )
 }
 fn capability_mode(host: &str) -> Result<&'static str, String> {
-    super::weixin_compat::resolve_version(host, Some(VERSION))?;
-    match host
-        .trim()
-        .trim_start_matches('v')
-        .split('-')
-        .next()
-        .unwrap_or_default()
-    {
+    match reviewed_host_base(host)? {
         "2026.9.8" | "2026.10.4" => Ok("native-cli"),
         "2026.5.12" => Ok("legacy-reviewed"),
         _ => Err(failure(
@@ -249,6 +271,72 @@ fn capability_mode(host: &str) -> Result<&'static str, String> {
             "当前内核的确认参数尚未核实，请保留现有插件",
         )),
     }
+}
+fn reviewed_host_base(host: &str) -> Result<&str, String> {
+    let re = regex::Regex::new(r"^v?(2026\.(?:5\.12|9\.8|10\.4))(?:-(\d+))?(?:-zh\.(\d+))?$")
+        .expect("固定已核宿主语法");
+    let captures = re
+        .captures(host.trim())
+        .ok_or_else(|| failure("WEIXIN_LEGACY_UNSUPPORTED", "宿主不在已核稳定矩阵内"))?;
+    for i in [2, 3] {
+        if captures
+            .get(i)
+            .is_some_and(|m| m.as_str().parse::<u32>().is_err())
+        {
+            return Err(failure("WEIXIN_LEGACY_UNSUPPORTED", "版本数字超界"));
+        }
+    }
+    Ok(captures.get(1).ok_or("宿主版本缺失")?.as_str())
+}
+fn artifact_for_host(host: &str) -> Result<Artifact, String> {
+    Ok(if reviewed_host_base(host)? == "2026.10.4" {
+        ARTIFACT_2410
+    } else {
+        ARTIFACT_249
+    })
+}
+struct PriorState {
+    repairing: bool,
+    public: Value,
+}
+fn prior_state(host: &str, installed: Option<&str>) -> Result<PriorState, String> {
+    let artifact = artifact_for_host(host)?;
+    let Some(version) = installed else {
+        return Ok(PriorState {
+            repairing: false,
+            public: json!({"compatible":null,"compatError":""}),
+        });
+    };
+    if artifact.version == "2.4.10" && version == "2.4.9" {
+        return Ok(PriorState {
+            repairing: true,
+            public: json!({"compatible":false,"compatError":"既有2.4.9依赖当前宿主缺失的SDK导出；需显式确认修复升级2.4.10，不将旧包视为健康"}),
+        });
+    }
+    if version == artifact.version {
+        return Ok(PriorState {
+            repairing: false,
+            public: json!({"compatible":true,"compatError":""}),
+        });
+    }
+    // 2410 在旧host及未知版本均未核实；不降级，也不从peer下限推断兼容。
+    if version == "2.4.10" || artifact.version == "2.4.10" {
+        return Err(failure(
+            "WEIXIN_HOST_CHANGED",
+            "既有插件不在本宿主已核修复范围，保留原状",
+        ));
+    }
+    let public = super::weixin_compat::compatibility(host, version);
+    if public["compatible"].as_bool() != Some(true) {
+        return Err(failure(
+            "WEIXIN_HOST_CHANGED",
+            "既有插件不在已核兼容矩阵，保留原状",
+        ));
+    }
+    Ok(PriorState {
+        repairing: false,
+        public,
+    })
 }
 fn validate_cli_help(host: &str, help: &str) -> Result<&'static str, String> {
     let mode = capability_mode(host)?;
@@ -287,12 +375,20 @@ fn install_arguments(archive: &Path, mode: &str, operation: &str) -> Result<Vec<
 fn declared_surface() -> Value {
     json!({"channels":[PLUGIN_ID],"providers":[],"tools":[],"contracts":[],"hooks":[],"mcpServers":[],"cliCommands":[],"cliBackends":[],"skills":[],"dangerousConfigFlags":[]})
 }
+#[cfg(test)]
 fn verify_compressed(bytes: &[u8]) -> Result<(), String> {
+    verify_compressed_for(bytes, &ARTIFACT_249)
+}
+fn verify_compressed_for(bytes: &[u8], artifact: &Artifact) -> Result<(), String> {
     let sri = format!(
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
     );
-    if bytes.len() > COMPRESSED_MAX || sha256(bytes) != ARTIFACT_SHA256 || sri != INTEGRITY {
+    if bytes.len() > COMPRESSED_MAX
+        || bytes.len() != artifact.compressed_size
+        || sha256(bytes) != artifact.sha256
+        || sri != artifact.integrity
+    {
         return Err(failure(
             "WEIXIN_ARTIFACT_CHANGED",
             "精确压缩包 SHA256/SRI 校验失败",
@@ -300,8 +396,12 @@ fn verify_compressed(bytes: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn validate_manifest(bytes: &[u8]) -> Result<Value, String> {
-    if sha256(bytes) != MANIFEST_SHA256 {
+    validate_manifest_for(bytes, &ARTIFACT_249)
+}
+fn validate_manifest_for(bytes: &[u8], artifact: &Artifact) -> Result<Value, String> {
+    if sha256(bytes) != artifact.manifest_sha256 {
         return Err(failure(
             "WEIXIN_ARTIFACT_CHANGED",
             "manifest 字节或能力声明已变化",
@@ -310,7 +410,7 @@ fn validate_manifest(bytes: &[u8]) -> Result<Value, String> {
     let m: Value = serde_json::from_slice(bytes)
         .map_err(|_| failure("WEIXIN_UNSAFE_ARTIFACT", "manifest JSON 无效"))?;
     if m["id"] != PLUGIN_ID
-        || m["version"] != VERSION
+        || m["version"] != artifact.version
         || m["channels"] != json!([PLUGIN_ID])
         || m.get("capabilities").is_some()
     {
@@ -465,18 +565,18 @@ fn parse_tar(bytes: &[u8]) -> Result<ArchiveReview, String> {
     }
     Err(failure("WEIXIN_UNSAFE_ARTIFACT", "归档缺少完整结束标记"))
 }
-fn review_tar(bytes: &[u8]) -> Result<ValidatedReview, String> {
+fn review_tar_for(bytes: &[u8], artifact: &Artifact) -> Result<ValidatedReview, String> {
     let mut r = parse_tar(bytes)?;
-    if r.files != 125 || r.unpacked_size != 696_653 {
+    if r.files != artifact.file_count || r.unpacked_size != artifact.unpacked_size {
         return Err(failure(
             "WEIXIN_ARTIFACT_CHANGED",
             "文件数或解包大小与审核包不符",
         ));
     }
-    let declared = validate_manifest(&r.manifest)?;
+    let declared = validate_manifest_for(&r.manifest, artifact)?;
     let p: Value = serde_json::from_slice(&r.package).map_err(|_| "package.json 无效")?;
     if p["name"] != PACKAGE_NAME
-        || p["version"] != VERSION
+        || p["version"] != artifact.version
         || p["peerDependencies"]["openclaw"] != ">=2026.5.12"
     {
         return Err(failure("WEIXIN_ARTIFACT_CHANGED", "包身份与 SDK 要求不符"));
@@ -484,7 +584,7 @@ fn review_tar(bytes: &[u8]) -> Result<ValidatedReview, String> {
     // 固定包的静态代码审核发现仅作提示，不取代 CLI 的危险代码扫描或安全策略。
     r.findings.push(json!({"code":"network-and-local-data","severity":"warning","message":"此第三方渠道代码会访问外部服务和本地数据；静态声明不是权限沙箱"}));
     Ok(ValidatedReview {
-        public: json!({"manifestSha256":MANIFEST_SHA256,"reviewToken":REVIEW_TOKEN,"declared":declared,"previousDeclared":null,"addedDeclared":declared,"warnings":["第三方插件在 Gateway 进程中执行，不是操作系统沙箱。","准备阶段不执行插件；上游安装扫描、策略与原始错误仍会保留。","旧版本声明面未核实的部分按完整新增能力展示。"],"scan":{"status":"reviewed","scope":"bounded-static-exact-artifact; upstream installer scan remains mandatory","findings":r.findings}}),
+        public: json!({"manifestSha256":artifact.manifest_sha256,"reviewToken":REVIEW_TOKEN,"declared":declared,"previousDeclared":null,"addedDeclared":declared,"warnings":["第三方插件在 Gateway 进程中执行，不是操作系统沙箱。","准备阶段不执行插件；上游安装扫描、策略与原始错误仍会保留。","旧版本声明面未核实的部分按完整新增能力展示。"],"scan":{"status":"reviewed","scope":"bounded-static-exact-artifact; upstream installer scan remains mandatory","findings":r.findings}}),
         file_checks: r.file_checks,
     })
 }
@@ -529,12 +629,147 @@ fn read_file(path: &Path, max: usize) -> Result<Vec<u8>, String> {
     }
     Ok(data)
 }
+#[cfg(test)]
 fn protected_config(config: &Value) -> Value {
-    let mut copy = config.clone();
-    if let Some(obj) = copy.as_object_mut() {
-        obj.remove("plugins");
+    protected_config_for(config, "2026.9.8")
+}
+fn remove_empty(parent: &mut Value, key: &str) {
+    if parent
+        .get(key)
+        .is_some_and(|v| v.as_object().is_some_and(|m| m.is_empty()))
+    {
+        if let Some(m) = parent.as_object_mut() {
+            m.remove(key);
+        }
     }
+}
+fn protected_config_for(config: &Value, host: &str) -> Value {
+    let mut copy = config.clone();
+    if let Some(plugins) = copy.get_mut("plugins") {
+        if let Some(entries) = plugins.get_mut("entries") {
+            if let Some(entry) = entries.get_mut(PLUGIN_ID).and_then(Value::as_object_mut) {
+                entry.remove("enabled");
+            }
+            remove_empty(entries, PLUGIN_ID);
+        }
+        if let Some(installs) = plugins.get_mut("installs").and_then(Value::as_object_mut) {
+            installs.remove(PLUGIN_ID);
+        }
+        remove_empty(plugins, "entries");
+        remove_empty(plugins, "installs");
+    }
+    remove_empty(&mut copy, "plugins");
+    if let Some(meta) = copy.get_mut("meta") {
+        if meta["lastTouchedVersion"] == host {
+            if let Some(m) = meta.as_object_mut() {
+                m.remove("lastTouchedVersion");
+                if m.get("lastTouchedAt")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| {
+                        regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+                            .expect("固定时间格式")
+                            .is_match(s)
+                            && chrono::DateTime::parse_from_rfc3339(s).is_ok()
+                    })
+                {
+                    m.remove("lastTouchedAt");
+                }
+            }
+        }
+        if let Some(m) = meta.get_mut("migrations").and_then(Value::as_object_mut) {
+            for key in ["modelPolicyAllowlist", "utilityModelSeparation"] {
+                if m.get(key) == Some(&json!(true)) {
+                    m.remove(key);
+                }
+            }
+        }
+        remove_empty(meta, "migrations");
+    }
+    remove_empty(&mut copy, "meta");
     copy
+}
+fn inspect_sdk_root(root: &Path, host: &str, artifact: &Artifact) -> Result<String, String> {
+    let bytes = read_file(&root.join("package.json"), COMPRESSED_MAX)?;
+    let p: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| failure("WEIXIN_SDK_UNSUPPORTED", "SDK包manifest无效"))?;
+    if !matches!(
+        p["name"].as_str(),
+        Some("openclaw" | "@qingchencloud/openclaw-zh")
+    ) || p["version"] != host
+    {
+        return Err(failure(
+            "WEIXIN_SDK_UNSUPPORTED",
+            "SDK包不是实际已选宿主版本",
+        ));
+    }
+    let key = format!(
+        "./{}",
+        artifact
+            .sdk_subpath
+            .strip_prefix("openclaw/")
+            .ok_or("SDK子路径无效")?
+    );
+    let export = &p["exports"][&key];
+    let target = export
+        .as_str()
+        .or_else(|| export["default"].as_str())
+        .ok_or_else(|| {
+            failure(
+                "WEIXIN_SDK_UNSUPPORTED",
+                "宿主缺少本次artifact需要的SDK导出",
+            )
+        })?;
+    if !target.starts_with("./")
+        || target.contains('\\')
+        || target[2..]
+            .split('/')
+            .any(|v| v.is_empty() || matches!(v, "." | "..") || v.contains(':'))
+    {
+        return Err(failure("WEIXIN_SDK_UNSUPPORTED", "SDK导出路径不安全"));
+    }
+    let file = root.join(&target[2..]);
+    ensure_no_links(&file)?;
+    let canonical = fs::canonicalize(&file)
+        .map_err(|_| failure("WEIXIN_SDK_UNSUPPORTED", "SDK导出文件缺失"))?;
+    if !crate::utils::path_is_inside_or_same(
+        &canonical,
+        &fs::canonicalize(root).map_err(|e| e.to_string())?,
+    ) {
+        return Err(failure("WEIXIN_SDK_UNSUPPORTED", "SDK路径逃逸"));
+    }
+    let mut identity = bytes;
+    identity.extend(read_file(&file, COMPRESSED_MAX)?);
+    Ok(format!(
+        "{}:{}:{}",
+        root.to_string_lossy(),
+        artifact.sdk_subpath,
+        sha256(&identity)
+    ))
+}
+fn sdk_identity(cli: &Path, host: &str, artifact: &Artifact) -> Result<String, String> {
+    // 只查已选CLI同树的固定npm布局；找到宿主后不借用别处SDK以掩盖缺导出。
+    for parent in cli.ancestors().skip(1).take(5) {
+        for root in [
+            parent.to_path_buf(),
+            parent.join("node_modules/openclaw"),
+            parent.join("node_modules/@qingchencloud/openclaw-zh"),
+        ] {
+            let manifest = root.join("package.json");
+            if !manifest.is_file() {
+                continue;
+            }
+            let bytes = read_file(&manifest, COMPRESSED_MAX)?;
+            let p: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| failure("WEIXIN_SDK_UNSUPPORTED", "宿主manifest无效"))?;
+            if matches!(
+                p["name"].as_str(),
+                Some("openclaw" | "@qingchencloud/openclaw-zh")
+            ) {
+                return inspect_sdk_root(&root, host, artifact);
+            }
+        }
+    }
+    Err(failure("WEIXIN_SDK_UNSUPPORTED", "未定位实际CLI的SDK包"))
 }
 fn managed_path(root: &Path, value: &Path) -> Result<PathBuf, String> {
     ensure_no_links(value)?;
@@ -593,6 +828,7 @@ struct Snapshot {
     extension: PathBuf,
     cli: PathBuf,
     protected_config: Value,
+    prior: PriorState,
 }
 fn host_command(state: &Snapshot) -> Result<tokio::process::Command, String> {
     let command = crate::utils::openclaw_command_async();
@@ -612,11 +848,13 @@ async fn snapshot(caller: String, operation: &str) -> Result<Snapshot, String> {
     let root = fs::canonicalize(&home).map_err(|e| e.to_string())?;
     let host = super::config::installed_openclaw_version_from_files().ok_or("未检测到内核版本")?;
     capability_mode(&host)?;
+    let artifact = artifact_for_host(&host)?;
     let cli = crate::utils::resolve_openclaw_cli_path().ok_or("未检测到内核命令")?;
     // npm 的已选 CLI 可为符号链接；固定其真实目标/字节，而非拒绝正常 npm 布局。
     // 下载包、暂存、插件目录仍独立执行无链接检查。
     let cli = fs::canonicalize(PathBuf::from(cli)).map_err(|e| e.to_string())?;
     let identity = cli_identity(&cli)?;
+    let host_sdk = sdk_identity(&cli, &host, &artifact)?;
     let mut help = crate::utils::openclaw_command_async();
     if !command_pins_cli(help.as_std(), &cli) {
         return Err(failure("WEIXIN_HOST_CHANGED", "help 来源与内核不一致"));
@@ -650,13 +888,9 @@ async fn snapshot(caller: String, operation: &str) -> Result<Snapshot, String> {
         let package = read_file(&extension.join("package.json"), COMPRESSED_MAX)?;
         let p: Value = serde_json::from_slice(&package).map_err(|_| "既有 package.json 无效")?;
         let version = p["version"].as_str().ok_or("既有插件版本缺失")?.to_string();
-        if super::weixin_compat::compatibility(&host, &version)["compatible"].as_bool()
-            != Some(true)
-        {
-            return Err(failure(
-                "WEIXIN_HOST_CHANGED",
-                "既有插件不在兼容矩阵中，保留原状",
-            ));
+        prior_state(&host, Some(&version))?;
+        if p["name"] != PACKAGE_NAME {
+            return Err(failure("WEIXIN_HOST_CHANGED", "既有插件包身份不符"));
         }
         let manifest = read_file(&extension.join("openclaw.plugin.json"), COMPRESSED_MAX)?;
         let mut identity = package;
@@ -677,7 +911,11 @@ async fn snapshot(caller: String, operation: &str) -> Result<Snapshot, String> {
     } else {
         b"{}".to_vec()
     };
-    let protected = protected_config(&super::config::load_openclaw_json()?);
+    // 不调用带自愈/迁移写回的通用读取器；未确认时只读原始配置字节。
+    let parsed: Value = serde_json::from_slice(&cfg)
+        .map_err(|_| failure("WEIXIN_HOST_CHANGED", "原配置不是严格JSON，请先修复配置"))?;
+    let protected = protected_config_for(&parsed, &host);
+    let prior = prior_state(&host, installed_version.as_deref())?;
     let binding = Binding {
         caller,
         operation: operation.into(),
@@ -687,6 +925,8 @@ async fn snapshot(caller: String, operation: &str) -> Result<Snapshot, String> {
         installed_version,
         installed_path: extension.to_string_lossy().into_owned(),
         installed_sha256,
+        artifact,
+        host_sdk,
     };
     Ok(Snapshot {
         binding,
@@ -694,6 +934,7 @@ async fn snapshot(caller: String, operation: &str) -> Result<Snapshot, String> {
         extension,
         cli,
         protected_config: protected,
+        prior,
     })
 }
 
@@ -767,8 +1008,11 @@ async fn bounded_process(
         }
     }
 }
-async fn inspect_compressed(archive: &[u8]) -> Result<ValidatedReview, String> {
-    verify_compressed(archive)?;
+async fn inspect_compressed(
+    archive: &[u8],
+    artifact: &Artifact,
+) -> Result<ValidatedReview, String> {
+    verify_compressed_for(archive, artifact)?;
     let node = super::config::check_node()?;
     let path = node["path"]
         .as_str()
@@ -787,9 +1031,9 @@ async fn inspect_compressed(archive: &[u8]) -> Result<ValidatedReview, String> {
     if !status.success() {
         return Err(failure("WEIXIN_UNSAFE_ARTIFACT", "静态解压失败"));
     }
-    review_tar(&tar)
+    review_tar_for(&tar, artifact)
 }
-async fn download() -> Result<Vec<u8>, String> {
+async fn download(artifact: &Artifact) -> Result<Vec<u8>, String> {
     use futures_util::StreamExt;
     let client = reqwest::Client::builder()
         .https_only(true)
@@ -801,13 +1045,13 @@ async fn download() -> Result<Vec<u8>, String> {
         .build()
         .map_err(|e| e.to_string())?;
     let response = client
-        .get(ARTIFACT_URL)
+        .get(artifact.url)
         .send()
         .await
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())?;
-    if response.url().as_str() != ARTIFACT_URL
+    if response.url().as_str() != artifact.url
         || response
             .content_length()
             .is_some_and(|n| n > COMPRESSED_MAX as u64)
@@ -823,7 +1067,7 @@ async fn download() -> Result<Vec<u8>, String> {
         }
         data.extend_from_slice(&part);
     }
-    verify_compressed(&data)?;
+    verify_compressed_for(&data, artifact)?;
     Ok(data)
 }
 struct Stage {
@@ -831,8 +1075,8 @@ struct Stage {
     archive: PathBuf,
 }
 impl Stage {
-    fn new(root: &Path, bytes: &[u8]) -> Result<Self, String> {
-        verify_compressed(bytes)?;
+    fn new(root: &Path, bytes: &[u8], artifact: &Artifact) -> Result<Self, String> {
+        verify_compressed_for(bytes, artifact)?;
         ensure_no_links(root)?;
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -847,7 +1091,7 @@ impl Stage {
         };
         builder.create(&directory).map_err(|e| e.to_string())?;
         let stage = Self {
-            archive: directory.join(format!("{ARTIFACT_SHA256}.tgz")),
+            archive: directory.join(format!("{}.tgz", artifact.sha256)),
             directory,
         };
         let mut options = fs::OpenOptions::new();
@@ -860,7 +1104,7 @@ impl Stage {
         let mut file = options.open(&stage.archive).map_err(|e| e.to_string())?;
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        verify_compressed(&read_file(&stage.archive, COMPRESSED_MAX)?)?;
+        verify_compressed_for(&read_file(&stage.archive, COMPRESSED_MAX)?, artifact)?;
         Ok(stage)
     }
 }
@@ -872,12 +1116,23 @@ impl Drop for Stage {
         }
     }
 }
+#[cfg(test)]
 fn check_readback(
     root: &Path,
     status: &Value,
     package: &Value,
     inventory: &Value,
     config: &Value,
+) -> Result<Value, String> {
+    check_readback_for(root, status, package, inventory, config, &ARTIFACT_249)
+}
+fn check_readback_for(
+    root: &Path,
+    status: &Value,
+    package: &Value,
+    inventory: &Value,
+    config: &Value,
+    artifact: &Artifact,
 ) -> Result<Value, String> {
     let key = crate::utils::canonicalize_path_for_safety(root, "回读根目录")
         .map(|p| crate::utils::path_compare_key(&p))?;
@@ -905,9 +1160,9 @@ fn check_readback(
     let valid = status["installed"].as_bool() == Some(true)
         && matches(&status["path"])
         && package["name"] == PACKAGE_NAME
-        && package["version"] == VERSION
+        && package["version"] == artifact.version
         && sdk.is_some_and(|p| {
-            p["version"] == VERSION
+            p["version"] == artifact.version
                 && matches(&p["rootDir"])
                 && p["status"] == "loaded"
                 && p["enabled"].as_bool() == Some(true)
@@ -920,8 +1175,11 @@ fn check_readback(
                     .is_some_and(|ids| ids.iter().any(|id| id == PLUGIN_ID))
         })
         && config["plugins"]["entries"][PLUGIN_ID]["enabled"].as_bool() == Some(true)
-        && config["plugins"]["installs"][PLUGIN_ID]["version"] == VERSION
-        && matches(&config["plugins"]["installs"][PLUGIN_ID]["installPath"]);
+        // 新版安装记录已迁出配置；路径必须由真实SDK注册表及磁盘状态交叉验证。
+        // 旧配置若仍含本插件安装记录，则逐项验证，不接受矛盾记录。
+        && config["plugins"].get("installs").is_none_or(Value::is_object)
+        && config["plugins"]["installs"].get(PLUGIN_ID).is_none_or(|record|
+            record["version"] == artifact.version && matches(&record["installPath"]));
     if !valid {
         return Err(failure(
             "WEIXIN_READBACK_FAILED",
@@ -929,7 +1187,7 @@ fn check_readback(
         ));
     }
     Ok(
-        json!({"installed":true,"version":VERSION,"path":root.to_string_lossy(),"enabled":true,"sdkLoaded":true,"configVerified":true}),
+        json!({"installed":true,"version":artifact.version,"path":root.to_string_lossy(),"enabled":true,"sdkLoaded":true,"configVerified":true}),
     )
 }
 fn verify_installed_files(root: &Path, checks: &[FileCheck]) -> Result<(), String> {
@@ -963,8 +1221,9 @@ pub(super) async fn prepare(
         .try_lock()
         .map_err(|_| failure("WEIXIN_BUSY", "已有插件操作进行中"))?;
     let state = snapshot(caller.clone(), &operation).await?;
-    let archive = download().await?;
-    let mut review = inspect_compressed(&archive).await?.public;
+    let artifact = state.binding.artifact;
+    let archive = download(&artifact).await?;
+    let mut review = inspect_compressed(&archive, &artifact).await?.public;
     let fresh = snapshot(caller.clone(), &operation).await?;
     if native_caller(window)? != caller || fresh.binding != state.binding {
         return Err(failure(
@@ -977,7 +1236,10 @@ pub(super) async fn prepare(
             &state.extension.join("openclaw.plugin.json"),
             COMPRESSED_MAX,
         )?;
-        if validate_manifest(&previous).is_ok() {
+        if [ARTIFACT_249, ARTIFACT_2410]
+            .iter()
+            .any(|a| validate_manifest_for(&previous, a).is_ok())
+        {
             review["previousDeclared"] = declared_surface();
             review["addedDeclared"] = json!({});
         }
@@ -998,7 +1260,11 @@ pub(super) async fn prepare(
     obj.insert("hostVersion".into(), json!(host));
     obj.insert("installedVersion".into(), json!(installed));
     obj.insert("capabilityMode".into(), json!(mode));
-    obj.insert("artifact".into(), json!({"packageName":PACKAGE_NAME,"version":VERSION,"url":ARTIFACT_URL,"integrity":INTEGRITY,"sha256":ARTIFACT_SHA256,"fileCount":125,"unpackedSize":696653}));
+    let mut public_artifact = serde_json::to_value(artifact).map_err(|e| e.to_string())?;
+    public_artifact["packageName"] = json!(PACKAGE_NAME);
+    obj.insert("artifact".into(), public_artifact);
+    obj.insert("repairingIncompatible".into(), json!(state.prior.repairing));
+    obj.insert("priorCompatibility".into(), state.prior.public);
     obj.insert("review".into(), review);
     Ok(value)
 }
@@ -1037,7 +1303,8 @@ pub(super) async fn confirm(
             .lock()
             .map_err(|_| "确认状态锁异常")?
             .claim(&state.binding, &approval, now_ms())?;
-    let review = inspect_compressed(&pending.archive).await?;
+    let artifact = pending.binding.artifact;
+    let review = inspect_compressed(&pending.archive, &artifact).await?;
     let fresh = snapshot(caller.clone(), &operation).await?;
     if native_caller(window)? != caller || fresh.binding != pending.binding {
         return Err(failure(
@@ -1045,7 +1312,7 @@ pub(super) async fn confirm(
             "确认后窗口或内核状态发生变化",
         ));
     }
-    let stage = Stage::new(&state.root, &pending.archive)?;
+    let stage = Stage::new(&state.root, &pending.archive, &artifact)?;
     if now_ms() >= pending.expires_ms {
         return Err(failure("WEIXIN_EXPIRED", "执行前确认已过期"));
     }
@@ -1085,15 +1352,18 @@ pub(super) async fn confirm(
         COMPRESSED_MAX,
     )?)
     .map_err(|e| e.to_string())?;
-    if package["name"] != PACKAGE_NAME || package["version"] != VERSION {
+    if package["name"] != PACKAGE_NAME || package["version"] != artifact.version {
         return Err(failure("WEIXIN_READBACK_FAILED", "安装后包身份不匹配"));
     }
-    validate_manifest(&read_file(
-        &actual_root.join("openclaw.plugin.json"),
-        COMPRESSED_MAX,
-    )?)?;
+    validate_manifest_for(
+        &read_file(&actual_root.join("openclaw.plugin.json"), COMPRESSED_MAX)?,
+        &artifact,
+    )?;
     verify_installed_files(&actual_root, &review.file_checks)?;
-    if protected_config(&super::config::load_openclaw_json()?) != state.protected_config {
+    let after: Value =
+        serde_json::from_slice(&read_file(&state.root.join("openclaw.json"), UNPACKED_MAX)?)
+            .map_err(|_| failure("WEIXIN_READBACK_FAILED", "配置回读JSON无效"))?;
+    if protected_config_for(&after, &state.binding.host_version) != state.protected_config {
         return Err(failure("WEIXIN_READBACK_FAILED", "非插件配置发生变化"));
     }
     let mut enable = host_command(&state)?;
@@ -1117,20 +1387,36 @@ pub(super) async fn confirm(
     if !exit.success() {
         return Err(failure("WEIXIN_READBACK_FAILED", &redacted_output(&errors)));
     }
-    let inventory: Value = serde_json::from_slice(&inventory)
+    let start = inventory
+        .iter()
+        .position(|b| *b == b'{')
+        .ok_or_else(|| failure("WEIXIN_READBACK_FAILED", "SDK注册表缺JSON对象"))?;
+    let inventory: Value = serde_json::from_slice(&inventory[start..])
         .map_err(|_| failure("WEIXIN_READBACK_FAILED", "实际 SDK 注册表 JSON 无效"))?;
-    let config = super::config::load_openclaw_json()?;
-    if protected_config(&config) != state.protected_config {
+    let config: Value =
+        serde_json::from_slice(&read_file(&state.root.join("openclaw.json"), UNPACKED_MAX)?)
+            .map_err(|_| failure("WEIXIN_READBACK_FAILED", "最终配置JSON无效"))?;
+    if protected_config_for(&config, &state.binding.host_version) != state.protected_config {
         return Err(failure("WEIXIN_READBACK_FAILED", "非插件配置回读不一致"));
     }
-    let readback = check_readback(&actual_root, &status, &package, &inventory, &config)?;
+    if sdk_identity(&state.cli, &state.binding.host_version, &artifact)? != state.binding.host_sdk {
+        return Err(failure("WEIXIN_HOST_CHANGED", "执行期间实际SDK发生变化"));
+    }
+    let readback = check_readback_for(
+        &actual_root,
+        &status,
+        &package,
+        &inventory,
+        &config,
+        &artifact,
+    )?;
     let _ = window.emit_to(
         window.label(),
         "channel-action-progress",
         json!({"platform":"weixin","action":"install","operationId":operation_id,"progress":100}),
     );
     Ok(
-        json!({"ok":true,"operationId":operation_id,"version":VERSION,"hostVersion":state.binding.host_version,"message":output,"readback":readback,"warnings":["SDK 已加载不代表微信扫码或外部消息收发已验证。"]}),
+        json!({"ok":true,"operationId":operation_id,"version":artifact.version,"hostVersion":state.binding.host_version,"message":output,"readback":readback,"warnings":["SDK 已加载不代表微信扫码或外部消息收发已验证。"]}),
     )
 }
 pub(super) fn cancel(
@@ -1163,6 +1449,8 @@ mod tests {
             installed_version: None,
             installed_path: "fixture-extension".into(),
             installed_sha256: None,
+            artifact: ARTIFACT_249,
+            host_sdk: "fixture-sdk".into(),
         }
     }
     fn approval(ticket: &Ticket) -> Approval {
@@ -1590,5 +1878,160 @@ mod tests {
         assert_eq!(protected_config(&old), protected_config(&next));
         next["channels"]["other"]["enabled"] = json!(false);
         assert_ne!(protected_config(&old), protected_config(&next));
+    }
+
+    #[test]
+    fn v2_host_selects_exact_artifact_not_peer_minimum_or_preview() {
+        for host in ["2026.5.12", "2026.9.8-1-zh.2"] {
+            assert_eq!(artifact_for_host(host).unwrap().version, "2.4.9");
+        }
+        assert_eq!(
+            artifact_for_host("v2026.10.4-1-zh.2").unwrap().version,
+            "2.4.10"
+        );
+        for host in [
+            "2026.10.5",
+            "2026.11.1",
+            "2026.10.4-beta.1",
+            "2026.10.4-zh.1-beta.1",
+            "2026.10.4-4294967296",
+            "unknown",
+        ] {
+            assert!(artifact_for_host(host).is_err(), "{host}");
+        }
+    }
+
+    #[test]
+    fn v2_incompatible249_on104_requires_explicit_upgrade_without_false_healthy() {
+        let prior = prior_state("2026.10.4", Some("2.4.9")).unwrap();
+        assert!(prior.repairing);
+        assert_eq!(prior.public["compatible"], false);
+        assert!(prior.public["compatError"]
+            .as_str()
+            .unwrap()
+            .contains("SDK"));
+        assert!(!prior_state("2026.10.4", Some("2.4.10")).unwrap().repairing);
+        for host in ["2026.5.12", "2026.9.8"] {
+            assert!(
+                prior_state(host, Some("2.4.10")).is_err(),
+                "旧host不降级未核2410"
+            );
+        }
+        assert!(prior_state("2026.10.4", Some("2.4.11")).is_err());
+    }
+
+    #[test]
+    fn v2_shared_review_digest_does_not_approve_other_artifact_or_manifest() {
+        let mut b = binding("main");
+        b.host_version = "2026.10.4".into();
+        b.artifact = ARTIFACT_2410;
+        let mut s = ConsentStore::default();
+        let t = s.issue(b.clone(), vec![1], 0).unwrap();
+        let mut a = approval(&t);
+        assert!(s.claim(&b, &a, 1).is_err());
+        a.artifact_sha256 = ARTIFACT_2410.sha256.into();
+        let mut changed = b.clone();
+        changed.artifact.manifest_sha256 = MANIFEST_SHA256;
+        assert!(s.claim(&changed, &a, 2).is_err());
+        changed = b.clone();
+        changed.artifact.integrity = INTEGRITY;
+        assert!(s.claim(&changed, &a, 2).is_err());
+        assert!(s.claim(&b, &a, 3).is_ok());
+        assert!(s.claim(&b, &a, 4).is_err());
+    }
+
+    #[test]
+    fn v2_cross_host_249_ticket_never_becomes2410_approval() {
+        let b = binding("main");
+        let mut s = ConsentStore::default();
+        let t = s.issue(b.clone(), vec![1], 0).unwrap();
+        let mut next = b.clone();
+        next.host_version = "2026.10.4".into();
+        next.artifact = ARTIFACT_2410;
+        let mut a = approval(&t);
+        a.artifact_sha256 = ARTIFACT_2410.sha256.into();
+        assert!(s.claim(&next, &a, 1).is_err());
+        assert!(s.claim(&b, &approval(&t), 2).is_ok());
+    }
+
+    #[test]
+    fn v2_sdk_preflight_pins_real_manifest_export_and_file_bytes() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("weixin-sdk-v2-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("dist")).unwrap();
+        let manifest = json!({"name":"openclaw","version":"2026.10.4","exports":{"./plugin-sdk/temp-path":{"default":"./dist/sdk.js"}}});
+        fs::write(root.join("package.json"), manifest.to_string()).unwrap();
+        fs::write(root.join("dist/sdk.js"), b"export const tempPath = 1").unwrap();
+        let first = inspect_sdk_root(&root, "2026.10.4", &ARTIFACT_2410).unwrap();
+        assert!(inspect_sdk_root(&root, "2026.10.4", &ARTIFACT_249).is_err());
+        fs::write(root.join("dist/sdk.js"), b"export const tempPath = 2").unwrap();
+        assert_ne!(
+            first,
+            inspect_sdk_root(&root, "2026.10.4", &ARTIFACT_2410).unwrap()
+        );
+        let mut escaped = manifest.clone();
+        escaped["exports"]["./plugin-sdk/temp-path"] = json!("./../outside.js");
+        fs::write(root.join("package.json"), escaped.to_string()).unwrap();
+        assert!(inspect_sdk_root(&root, "2026.10.4", &ARTIFACT_2410).is_err());
+        fs::write(root.join("package.json"), manifest.to_string()).unwrap();
+        assert!(inspect_sdk_root(&root, "2026.9.8", &ARTIFACT_2410).is_err());
+        let mut zh = manifest;
+        zh["name"] = json!("@qingchencloud/openclaw-zh");
+        fs::write(root.join("package.json"), zh.to_string()).unwrap();
+        assert!(inspect_sdk_root(&root, "2026.10.4", &ARTIFACT_2410).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v2_known_metadata_changes_allowed_but_not_unknown_meta_other_plugins_or_global_allow() {
+        let before = json!({"gateway":{"auth":{"token":"fixture"}},"plugins":{"entries":{"other":{"enabled":true}}}});
+        let mut next = before.clone();
+        next["meta"] = json!({"lastTouchedVersion":"2026.10.4","lastTouchedAt":"2026-10-17T00:00:00.000Z","migrations":{"modelPolicyAllowlist":true,"utilityModelSeparation":true}});
+        next["plugins"]["entries"]["openclaw-weixin"] = json!({"enabled":true});
+        next["plugins"]["installs"] = json!({"openclaw-weixin":{"version":"2.4.10"}});
+        assert_eq!(
+            protected_config_for(&before, "2026.10.4"),
+            protected_config_for(&next, "2026.10.4")
+        );
+        for n in 0..4 {
+            let mut bad = next.clone();
+            match n {
+                0 => bad["meta"]["unknown"] = json!(true),
+                1 => bad["meta"]["lastTouchedVersion"] = json!("2026.9.8"),
+                2 => bad["plugins"]["entries"]["other"]["enabled"] = json!(false),
+                _ => bad["plugins"]["allow"] = json!(["*"]),
+            };
+            assert_ne!(
+                protected_config_for(&before, "2026.10.4"),
+                protected_config_for(&bad, "2026.10.4")
+            );
+        }
+    }
+
+    #[test]
+    fn v2_modern_registry_path_is_authoritative_not_retired_config_install_record() {
+        let root = Path::new("fixture-extension");
+        let status = json!({"installed":true,"path":"fixture-extension"});
+        let package = json!({"name":PACKAGE_NAME,"version":"2.4.10"});
+        let inventory = json!({"plugins":[{"id":PLUGIN_ID,"version":"2.4.10","rootDir":"fixture-extension","status":"loaded","enabled":true,"channelIds":[PLUGIN_ID]}]});
+        let config = json!({"plugins":{"entries":{"openclaw-weixin":{"enabled":true}}}});
+        assert_eq!(
+            check_readback_for(root, &status, &package, &inventory, &config, &ARTIFACT_2410)
+                .unwrap()["version"],
+            "2.4.10"
+        );
+        let mut bad = inventory.clone();
+        bad["plugins"][0]["rootDir"] = json!("foreign");
+        assert!(
+            check_readback_for(root, &status, &package, &bad, &config, &ARTIFACT_2410).is_err()
+        );
+        let mut bad = config;
+        bad["plugins"]["installs"] =
+            json!({"openclaw-weixin":{"version":"2.4.9","installPath":"fixture-extension"}});
+        assert!(
+            check_readback_for(root, &status, &package, &inventory, &bad, &ARTIFACT_2410).is_err()
+        );
     }
 }
