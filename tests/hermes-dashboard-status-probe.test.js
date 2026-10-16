@@ -18,13 +18,13 @@ test('只有明确状态为正，帮助文案、URL/端口及未知 JSON 不猜�
   for (const s of ['', 'Usage: hermes dashboard --status\nManage running dashboards http://docs.example', 'http://127.0.0.1:9119', 'Default port: 9119', '{"running":false}']) assert.equal(parse(s), null, s)
 })
 
-test('成功状态只调用一次；仅命令失败回退，未知成功留给 TCP', () => {
-  const method = source.match(/  _hermesDashboardCliStatus\(port\) \{[^]*?\n  \},/)?.[0]
+test('成功状态只调用一次；仅命令失败回退，未知成功留给 TCP', async () => {
+  const method = source.match(/  (?:async )?_hermesDashboardCliStatus\(port\) \{[^]*?\n  \},/)?.[0]
   assert.ok(method)
   for (const first of [{ ok: true, stdout: 'No hermes dashboard or serve processes running.' }, { ok: true, stdout: 'Unknown output 9119' }, { ok: false }]) {
     const calls = []
     const obj = new Function('runHermesSilent', 'parseHermesDashboardStatus', `return {${method}}`)((program, args) => { calls.push([program, ...args]); return calls.length === 1 ? first : { ok: true, stdout: 'Dashboard running at http://127.0.0.1:9119' } }, parse)
-    const result = obj._hermesDashboardCliStatus(9119)
+    const result = await obj._hermesDashboardCliStatus(9119)
     assert.equal(calls.length, first.ok ? 1 : 2)
     if (first.ok && first.stdout.startsWith('No ')) assert.equal(result.running, false)
     else if (first.ok) assert.equal(result, null)

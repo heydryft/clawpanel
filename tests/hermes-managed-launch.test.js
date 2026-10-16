@@ -93,12 +93,12 @@ test('被忽略的 repair/tree-swap debt 与借用 HOME 不得让普通启动进
   assert.ok(script.indexOf('validate_no_repair_debt(root)\n') < script.indexOf('activate_dependencies(root)\n'))
 })
 
-test('受管 profile 预检错误不伪装成空 default 列表，旧版空列表兼容保留', () => {
-  const body = web.match(/  hermes_profiles_list\(\) \{[^]*?\n  }/)?.[0] || ''
+test('受管 profile 预检错误不伪装成空 default 列表，旧版空列表兼容保留', async () => {
+  const body = web.match(/  (?:async )?hermes_profiles_list\(\) \{[^]*?\n  }/)?.[0] || ''
   const build = new Function('runHermesSilent', 'parseHermesProfileListOutput', 'fs', 'path', 'hermesSourceDir', `return ({${body}}).hermes_profiles_list()`)
   const failed = () => ({ ok: false, stderr: 'PM currency false' })
-  assert.throws(() => build(failed, () => {}, { existsSync: () => true }, path, () => '/fixture'), /PM currency false/)
-  assert.deepEqual(build(failed, () => {}, { existsSync: () => false }, path, () => '/fixture'), { active: 'default', profiles: [] })
+  await assert.rejects(() => build(failed, () => {}, { existsSync: () => true }, path, () => '/fixture'), /PM currency false/)
+  assert.deepEqual(await build(failed, () => {}, { existsSync: () => false }, path, () => '/fixture'), { active: 'default', profiles: [] })
   assert.match(rust.match(/pub async fn hermes_profiles_list[^]*?\n}/)?.[0] || '', /Err\(error\)[^]*?\.join\("pm"\)[^]*?return Err\(error\)/)
 })
 

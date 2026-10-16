@@ -56,7 +56,7 @@ test('Hermes version detection probes --version before the legacy subcommand', (
 
   assert.match(webSource, /function runHermesVersionSilent\(\)[^]*?\['--version'\][^]*?\['version'\]/)
   assert.match(tauriSource, /fn hermes_version_at_path\(path: &str\)[^]*?&\["--version"\][^]*?&\["version"\]/)
-  assert.match(webSource, /const ver = runHermesVersionSilent\(\)/)
+  assert.match(webSource, /const ver = await runHermesVersionSilent\(\)/)
   assert.match(tauriSource, /match hermes_version_at_path\(&enhanced\)/)
 })
 
