@@ -10,8 +10,8 @@ const entry = new URL('../scripts/hermes-legacy-windows-launch.py', import.meta.
 
 // 只执行自有临时源码/模块；不导入、安装或启动真正的 Hermes。
 const driver = String.raw`
-import contextlib, hashlib, importlib, importlib.util, io, json, os, pathlib
-import subprocess, sys, tempfile, unittest
+import base64, contextlib, hashlib, importlib, importlib.util, io, json, os, pathlib
+import subprocess, sys, tempfile, unittest, zlib
 
 entry, output = map(pathlib.Path, sys.argv[1:3])
 spec = importlib.util.spec_from_file_location('_cp_legacy_entry', entry)
@@ -505,8 +505,12 @@ def run():
             with self.assertRaises(SystemExit):m._parse_args(bad)
 
     def test_production_cli_rejects_actual_host_before_any_hermes_import(self):
-        payload=entry.read_text(encoding='utf-8')
-        p=subprocess.run([sys.executable,'-I','-B','-c',payload,str(self.root),str(self.home),m.LEGACY_PIN,'console','--','--help'],
+        # 保留真实-c入口；测试自身也不能把扩大的未压缩源码塞爆Windows命令行。
+        raw=entry.read_bytes();encoded=base64.b64encode(zlib.compress(raw,9)).decode('ascii')
+        payload="import base64,zlib,hashlib;d=zlib.decompress(base64.b64decode('"+encoded+"'));assert hashlib.sha256(d).hexdigest()=='"+hashlib.sha256(raw).hexdigest()+"';exec(compile(d,'<owned-legacy-entry>','exec'))"
+        command=[sys.executable,'-I','-B','-c',payload,str(self.root),str(self.home),m.LEGACY_PIN,'console','--','--help']
+        self.assertLessEqual(len(subprocess.list2cmdline(command).encode('utf-16-le'))//2+1,32767)
+        p=subprocess.run(command,
             capture_output=True,text=True,timeout=10,env=dict(os.environ))
         self.assertNotEqual(p.returncode,0)
         self.assertFalse(pathlib.Path(os.environ['CP_EVENTS']).exists())
