@@ -4,7 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import http from 'node:http'
 import { createHermesExecFileObserver } from '../scripts/hermes-exec-observation.mjs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -123,6 +124,122 @@ function completedWebFixture(gatewayStatusReadback) {
   return { stages: ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve'].map(name => ({ name, status: 'passed' })), hostUnchanged: true,
     browser: { actualChromium: true, screenshots: ['a.png'], trace: 'trace.zip', pageErrors: [], completeReply: true, historyAfterReload: true }, gatewayStatusReadback }
 }
+
+const stateNames = ['gateway.pid', 'gateway.lock', 'gateway_state.json']
+const stateSha = data => createHash('sha256').update(data).digest('hex')
+function stateFixture(t, name) {
+  const tmp = fs.realpathSync(os.tmpdir()), dir = fs.mkdtempSync(path.join(tmp, 'hermes-status-files-')), home = path.join(dir, 'h'), hermes = path.join(home, '.hermes'), children = [], rows = []
+  fs.mkdirSync(hermes, { recursive: true })
+  const marker = 'SYNTHETIC_PRIVATE_STATE_DO_NOT_PUBLISH_87da', argv = ['-c', marker, 'gateway', 'run']
+  const record = { pid: 5932, kind: 'hermes-gateway', argv, start_time: 1792186376412040, hermes_home: hermes, clawpanel_legacy_identity: { create_time: 1792186376.4120407, script_sha256: 'a'.repeat(64), pin: 'f97608f178d1ffeca59860195ab7da295f7c8e5f', privatecode: marker }, gateway_state: 'running', updated_at: '2026-10-16T22:36:11.000Z', desired_state: 'running', api_key: marker, privatecode: marker, nested: { password: marker } }
+  const write = (file, value) => fs.writeFileSync(path.join(hermes, file), typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value))
+  for (const file of stateNames) write(file, record)
+  const originals = () => Object.fromEntries(stateNames.map(file => { const p = path.join(hermes, file), s = fs.lstatSync(p, { bigint: true }); return [file, { sha256: stateSha(fs.readFileSync(p)), inode: String(s.ino), size: String(s.size), mtime: String(s.mtimeNs), birthtime: String(s.birthtimeNs) }] }))
+  t.after(async () => {
+    for (const c of children) { c.stdin?.end(); await new Promise(resolve => { if (c.exitCode !== null || c.signalCode !== null) return resolve(); c.once('close', resolve) }) }
+    if (process.env.HERMES_STATE_TEST_EVIDENCE) { fs.mkdirSync(process.env.HERMES_STATE_TEST_EVIDENCE, { recursive: true }); fs.writeFileSync(path.join(process.env.HERMES_STATE_TEST_EVIDENCE, name + '.json'), JSON.stringify({ scope: 'own private files, no Hermes/VM installation or process identity query', platform: process.platform, node: process.version, rows }, null, 2)) }
+    const rel = path.relative(tmp, fs.realpathSync(dir)); assert.ok(rel && !rel.startsWith('..') && !path.isAbsolute(rel)); fs.rmSync(dir, { recursive: true, force: true })
+  })
+  return { dir, home, hermes, record, marker, argv, write, originals, rows, children }
+}
+
+test('状态文件首红E2E：仅确切3文件、typed身份/白名单/hash，原字节及mtime不变', async t => {
+  const { captureHermesGatewayStateFiles } = await load(), f = stateFixture(t, 'safe-three-files'), before = f.originals()
+  fs.writeFileSync(path.join(f.hermes, 'unrelated-private-canary'), f.marker)
+  const r = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(r)
+  assert.equal(r.status, 'complete'); assert.equal(r.phase, 'before-status'); assert.deepEqual(r.files.map(row => row.file), stateNames)
+  assert.deepEqual(r.limits, { perFileBytes: 65536, totalBytes: 131072 }); assert.equal(r.lockProbe, 'not-performed')
+  for (const row of r.files) {
+    const bytes = fs.readFileSync(path.join(f.hermes, row.file))
+    assert.equal(row.status, 'captured'); assert.equal(row.sha256, stateSha(bytes)); assert.equal(row.bytes, bytes.length)
+    assert.equal(row.record.pid, 5932); assert.equal(row.record.kind, 'hermes-gateway'); assert.equal(row.record.argvSha256, stateSha(JSON.stringify(f.argv)))
+    assert.equal(row.record.hermesHome.matchesPrivateHome, true); assert.equal(row.record.hermesHome.sha256, stateSha(f.hermes))
+    assert.deepEqual(row.record.legacyIdentity, { createTime: f.record.clawpanel_legacy_identity.create_time, scriptSha256: 'a'.repeat(64), pin: f.record.clawpanel_legacy_identity.pin })
+    assert.match(row.fileIdentity.inode, /^\d+$/); assert.match(row.fileIdentity.createdNs, /^\d+$/)
+  }
+  const json = JSON.stringify(r); assert.ok(!json.includes(f.marker)); assert.ok(!json.includes(f.hermes)); assert.ok(!json.includes('privatecode')); assert.ok(!json.includes('api_key'))
+  assert.deepEqual(f.originals(), before); assert.equal(fs.readFileSync(path.join(f.hermes, 'unrelated-private-canary'), 'utf8'), f.marker)
+})
+
+test('状态文件E2E：原status前后删除/替换按实记录missing与新身份，不补写、不锁定', async t => {
+  const { captureHermesGatewayStateFiles, qualificationStatus } = await load(), f = stateFixture(t, 'before-after-missing')
+  const before = captureHermesGatewayStateFiles(f.home, 'before-status'); let calls = 0
+  try { calls++; fs.unlinkSync(path.join(f.hermes, 'gateway.pid')); throw Error('original status failed') }
+  catch (error) { assert.equal(error.message, 'original status failed') }
+  finally { f.rows.push(before, captureHermesGatewayStateFiles(f.home, 'after-status')) }
+  const after = f.rows[1]; assert.equal(calls, 1); assert.equal(after.status, 'incomplete'); assert.equal(after.files[0].status, 'missing'); assert.equal(after.files[0].reason, 'ENOENT')
+  assert.equal(fs.existsSync(path.join(f.hermes, 'gateway.pid')), false)
+  assert.equal(qualificationStatus({ ...completedWebFixture(statusProof('unknown')), gatewayStatusFiles: { before, after } }), 'failed', 'status失败不因诊断文件存在而转绿')
+  assert.equal(qualificationStatus({ ...completedWebFixture(statusProof('unknown')), gatewayStatusFiles: undefined }), 'failed')
+  f.write('gateway.pid', '5932'); const bare = captureHermesGatewayStateFiles(f.home, 'after-status'); f.rows.push(bare)
+  assert.equal(bare.files[0].status, 'captured'); assert.equal(bare.files[0].record.format, 'bare-pid'); assert.equal(bare.files[0].record.pid, 5932)
+})
+
+test('状态文件E2E：空/畸形JSON/非法UTF8/非record类型均留原因不成功、不泄异常原文', async t => {
+  const { captureHermesGatewayStateFiles } = await load(), f = stateFixture(t, 'invalid-records')
+  for (const value of ['', f.marker, '[1,2]', 'null', '-4', Buffer.from([0xff, 0xfe])]) {
+    f.write('gateway.pid', value); const r = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(r)
+    assert.equal(r.status, 'incomplete'); assert.equal(r.files[0].status, 'invalid-record'); assert.equal(typeof r.files[0].reason, 'string'); assert.ok(!JSON.stringify(r).includes(f.marker))
+  }
+  f.write('gateway.pid', f.record); fs.rmSync(path.join(f.hermes, 'gateway_state.json')); fs.mkdirSync(path.join(f.hermes, 'gateway_state.json'))
+  const directory = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(directory); assert.equal(directory.files[2].status, 'rejected')
+})
+
+test('状态文件E2E：file64KiB与phase128KiB硬预算，超限不截断冒成功', async t => {
+  const { captureHermesGatewayStateFiles } = await load(), f = stateFixture(t, 'read-budgets')
+  f.write('gateway.pid', JSON.stringify({ padding: 'x'.repeat(65536) })); let r = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(r)
+  assert.equal(r.files[0].status, 'over-budget'); assert.equal(r.files[0].reason, 'FILE_BYTES'); assert.equal(r.files[0].bytesRead, 0); assert.equal(r.status, 'incomplete')
+  const exact = JSON.stringify({ padding: 'x'.repeat(65536 - 14) }); assert.equal(Buffer.byteLength(exact), 65536)
+  f.write('gateway.pid', exact); f.write('gateway.lock', exact); r = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(r)
+  assert.equal(r.files[0].status, 'captured'); assert.equal(r.files[1].status, 'captured'); assert.equal(r.files[2].status, 'over-budget'); assert.equal(r.files[2].reason, 'TOTAL_BYTES'); assert.equal(r.files[2].bytesRead, 0); assert.equal(r.bytesRead, 131072)
+})
+
+test('状态文件E2E：file/home链接、junction、硬链接和外部路径均拒绝且canary不变', async t => {
+  const { captureHermesGatewayStateFiles } = await load(), f = stateFixture(t, 'link-boundaries'), foreign = path.join(f.dir, 'foreign')
+  fs.mkdirSync(foreign); const canary = path.join(foreign, 'gateway.pid'); fs.writeFileSync(canary, f.marker)
+  fs.unlinkSync(path.join(f.hermes, 'gateway.pid')); fs.linkSync(canary, path.join(f.hermes, 'gateway.pid'))
+  let r = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(r); assert.equal(r.files[0].status, 'rejected'); assert.equal(fs.readFileSync(canary, 'utf8'), f.marker)
+  fs.unlinkSync(path.join(f.hermes, 'gateway.pid')); f.write('gateway.pid', f.record)
+  const renamed = path.join(f.home, 'original-hermes'); fs.renameSync(f.hermes, renamed); fs.symlinkSync(foreign, f.hermes, process.platform === 'win32' ? 'junction' : 'dir')
+  r = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(r); assert.equal(r.status, 'incomplete'); assert.ok(r.files.every(row => row.status === 'rejected')); assert.equal(fs.readFileSync(canary, 'utf8'), f.marker)
+  r = captureHermesGatewayStateFiles(f.home + path.sep + '..' + path.sep + 'foreign', 'before-status'); f.rows.push(r); assert.equal(r.status, 'incomplete'); assert.ok(r.files.every(row => row.status === 'rejected'))
+  assert.throws(() => captureHermesGatewayStateFiles(f.home, 'other-phase'))
+})
+
+test('状态文件E2E：Windows真实FileShare.None冲突留read-failed，不试图抢锁或写入', { skip: process.platform !== 'win32' }, async t => {
+  const { captureHermesGatewayStateFiles } = await load(), f = stateFixture(t, 'actual-windows-share-conflict'), before = f.originals()
+  const file = path.join(f.hermes, 'gateway.lock').replaceAll("'", "''")
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$f=[IO.File]::Open('${file}',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None);try{[Console]::Out.WriteLine('OWN_FILE_LOCK_READY');[Console]::Out.Flush();[Console]::In.ReadLine()|Out-Null}finally{$f.Dispose()}`], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); f.children.push(child)
+  let stderr = ''; child.stderr.on('data', d => { stderr += d })
+  await new Promise((resolve, reject) => { let out = ''; const timer = setTimeout(() => { child.stdin.end(); reject(Error('own share fixture readiness failed')) }, 5000); child.once('error', e => { clearTimeout(timer); reject(e) }); child.stdout.on('data', d => { out += d; if (out.includes('OWN_FILE_LOCK_READY')) { clearTimeout(timer); resolve() } }); child.once('exit', code => { clearTimeout(timer); if (!out.includes('OWN_FILE_LOCK_READY')) reject(Error('own share fixture exit ' + code + ':' + stderr)) }) })
+  const r = captureHermesGatewayStateFiles(f.home, 'before-status'); f.rows.push(r); assert.equal(r.status, 'incomplete'); assert.equal(r.files[1].status, 'read-failed'); assert.ok(['EACCES', 'EPERM', 'EBUSY', 'EAGAIN'].includes(r.files[1].reason)); assert.equal(r.lockProbe, 'not-performed')
+  child.stdin.end(); await new Promise(resolve => child.once('close', resolve)); assert.deepEqual(f.originals(), before)
+})
+
+test('状态文件E2E：原publish仅导出安全投影，真实私有argv/code/env与HOME不公开', async t => {
+  const { captureHermesGatewayStateFiles, publishEvidence } = await load(), f = stateFixture(t, 'safe-publication')
+  const raw = path.join(f.dir, 'raw'), publicDir = path.join(f.dir, 'public'); fs.mkdirSync(raw)
+  const r = { before: captureHermesGatewayStateFiles(f.home, 'before-status'), after: captureHermesGatewayStateFiles(f.home, 'after-status') }
+  fs.writeFileSync(path.join(raw, 'gateway-status-files.json'), JSON.stringify(r)); fs.symlinkSync(f.home, path.join(raw, 'h'), process.platform === 'win32' ? 'junction' : 'dir')
+  const result = await publishEvidence({ roots: { web: raw }, output: publicDir }); f.rows.push({ evidence: r, publication: result })
+  const published = fs.readFileSync(path.join(publicDir, 'web/gateway-status-files.json'), 'utf8')
+  assert.ok(!published.includes(f.marker)); assert.ok(!published.includes(f.hermes)); assert.deepEqual(JSON.parse(published), r); assert.equal(fs.existsSync(path.join(publicDir, 'web/h')), false)
+  const manifest = JSON.parse(fs.readFileSync(path.join(publicDir, 'publication-manifest.json'))); assert.equal(manifest.privateHomeUploaded, false); assert.ok(manifest.files.every(row => !row.path.includes('/h/')))
+})
+
+test('状态文件接线：VM准入后，原一次status的try/finally两侧取证，不新增查询/预算', () => {
+  const source = fs.readFileSync(script, 'utf8')
+  assert.ok(source.includes("captureHermesGatewayStateFiles(home, 'before-status')")); assert.ok(source.includes("captureHermesGatewayStateFiles(home, 'after-status')"))
+  assert.ok(source.indexOf('validateRunnerProof(proof)') < source.indexOf("captureHermesGatewayStateFiles(home, 'before-status')"))
+  const before = source.indexOf("captureHermesGatewayStateFiles(home, 'before-status')"), request = source.indexOf('r.gatewayStatusReadback = await collectGatewayStatusReadback'), after = source.indexOf("captureHermesGatewayStateFiles(home, 'after-status')")
+  assert.ok(before < request && request < after && after < source.indexOf('browser = await chromium.launch')); assert.match(source.slice(request, after), /finally/)
+  assert.ok(source.includes("write('gateway-status-files.json', r.gatewayStatusFiles)")); assert.equal([...source.matchAll(/api\('hermes_gateway_action', \{ action: 'status' \}\)/g)].length, 1)
+  const reader = source.indexOf('export function captureHermesGatewayStateFiles('); assert.ok(reader >= 0)
+  const body = source.slice(reader, source.indexOf('\nfunction physical(', reader))
+  assert.doesNotMatch(body, /\b(?:spawn|execFile|readdirSync|writeFileSync|mkdirSync|unlinkSync|renameSync|chmodSync|flock)\s*\(/)
+  const originalGate = source.replaceAll('\r\n', '\n').match(/export function qualificationStatus\(r\) \{[\s\S]*?\n\}/)[0]
+  assert.equal(stateSha(originalGate), '47cbdc43dcfa421eec94ec916dd04e9c3c187a5143358639f19a35728839e510', '纯诊断取证不改48ef资格算法/status硬门禁')
+})
 
 test('status漏判first red：R24真实200 unknown与SIGTERM，即使其他UI/生命周期全有效仍FAILED', async () => {
   const { qualificationStatus } = await load(), proof = statusProof('unknown')

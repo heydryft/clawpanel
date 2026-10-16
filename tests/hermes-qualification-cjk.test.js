@@ -164,15 +164,10 @@ def command(args,**kwargs):
  if args[0] in ('fc-cache','fc-query'):
   env=kwargs['env'];assert env['FONTCONFIG_FILE'].endswith('fonts.conf') and '/usr/share/fonts' not in env['XDG_CACHE_HOME']
  return {'args':args,'exitCode':0,'stdout':stdout,'error':''}
-class Process:
- def __init__(self,args,**kwargs):
-  processes.append(args);assert args[:2]==['dpkg-deb','--fsys-tarfile'];self.stdout=io.BytesIO(raw);self.closed=False
- def __enter__(self):return self
- def __exit__(self,*args):self.stdout.close()
- def wait(self,timeout=None):self.closed=True;return 0
- def poll(self):return 0 if self.closed else None
- def kill(self):self.closed=True
-m.font_command=command;m.subprocess.Popen=Process
+def extract(deb,destination,limit):
+ processes.append(str(deb));assert pathlib.Path(deb).read_bytes()==payload
+ return m.extract_private_font_tar(io.BytesIO(raw),destination,limit)
+m.font_command=command;m.extract_private_font_process=extract
 with tempfile.TemporaryDirectory() as d:
  root=pathlib.Path(d).resolve();out=root/'evidence';out.mkdir();private=root/'private';m.prepare_private_fonts(out,private)
  r=json.loads((out/'fontconfig-after.json').read_text());assert r['private']['archiveSha256']==sha and len(r['private']['fonts'])==4;env=m.read_font_environment(out)['childEnv'];assert env['FONTCONFIG_FILE']==str(private/'fonts.conf')
@@ -180,4 +175,102 @@ with tempfile.TemporaryDirectory() as d:
  reject(lambda:m.prepare_private_fonts(out,private))
  tamper=True;out2=root/'evidence2';out2.mkdir();before=len(processes);reject(lambda:m.prepare_private_fonts(out2,root/'bad-private'));assert len(processes)==before and not (out2/'fontconfig-after.json').exists()
 print(json.dumps({'isolatedPreparationE2E':True,'actualAPT':False,'actualFontOrGUIInstall':False}))
+`)})
+
+// Linux真实自有进程：初始红灯执行原with块，不运行apt/dpkg；外部16.5秒watchdog仅防探针挂死。
+const OWN_CHILD_PROBE = String.raw`
+import ast,ctypes,io,os,signal,subprocess,sys,tarfile,threading,time
+
+def run_case(kind):
+ assert sys.platform=='linux'
+ assert ctypes.CDLL(None).prctl(36,1,0,0,0)==0 # 仅探针做subreaper，收回自己孤儿fixture。
+ raw=io.BytesIO()
+ with tarfile.open(fileobj=raw,mode='w') as tar:
+  for name in sorted(m.FONT_NAMES):
+   value=('inert '+name).encode();item=tarfile.TarInfo('./usr/share/fonts/opentype/noto/'+name);item.size=len(value);tar.addfile(item,io.BytesIO(value))
+ payload=raw.getvalue();real_popen=subprocess.Popen;children=[];watchdog=[];timers=[]
+ sentinel=real_popen([sys.executable,'-c','import time;time.sleep(60)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+ with tempfile.TemporaryDirectory() as directory:
+  root=pathlib.Path(directory);pidfile=root/'identity.json';deb=root/'inert.deb';deb.write_bytes(b'fixture not a package')
+  source="""import json,os,subprocess,sys,time
+kind,pidfile,datafile=sys.argv[1:]
+record={'pid':os.getpid(),'pgid':os.getpgrp()}
+if kind=='mid-stream':
+ child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])
+ record['descendant']=child.pid
+open(pidfile,'w').write(json.dumps(record))
+if kind in ('mid-stream','normal','wait-stall'):
+ data=open(datafile,'rb').read()
+ os.write(1,data[:516] if kind=='mid-stream' else data)
+if kind=='mid-stream':sys.exit(0)
+if kind=='normal':sys.exit(0)
+if kind=='wait-stall':os.close(1)
+time.sleep(60)
+"""
+  datafile=root/'inert.tar';datafile.write_bytes(payload)
+  def spawn(args,**kwargs):
+   assert args[:2]==['dpkg-deb','--fsys-tarfile']
+   isolated=kwargs.get('start_new_session') is True
+   # 初始旧代码没有session，仅探针加保护，产品缺失仍由最终断言留红。
+   child=real_popen([sys.executable,'-u','-c',source,kind,str(pidfile),str(datafile)],**{**kwargs,'start_new_session':True})
+   children.append((child,isolated))
+   def emergency():
+    watchdog.append(True)
+    try:os.killpg(child.pid,signal.SIGKILL)
+    except ProcessLookupError:pass
+   timer=threading.Timer(16.5,emergency);timer.daemon=True;timer.start();timers.append(timer)
+   return child
+  subprocess.Popen=spawn
+  error=None;result=None;started=time.monotonic()
+  try:
+   if hasattr(m,'extract_private_font_process'):
+    result=m.extract_private_font_process(deb,root/'fonts',409600)
+   else:
+    # 原代码实际同步read+wait块直接执行，保留first-red而不是仅测函数缺失。
+    tree=ast.parse(pathlib.Path(m.__file__).read_text());fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='prepare_private_fonts')
+    block=next(n for n in fn.body if isinstance(n,ast.With) and 'subprocess.Popen' in ast.unparse(n))
+    namespace={**m.__dict__,'deb':deb,'root':root,'package':{'unpackedLimit':409600}}
+    exec(compile(ast.Module(body=[block],type_ignores=[]),m.__file__,'exec'),namespace);result=namespace['extracted']
+  except Exception as caught:error=caught
+  finally:
+   elapsed=time.monotonic()-started;subprocess.Popen=real_popen
+   for timer in timers:timer.cancel()
+   identities=json.loads(pidfile.read_text()) if pidfile.exists() else {}
+   direct_reaped=False
+   if children:
+    child=children[0][0]
+    try:os.waitpid(child.pid,os.WNOHANG)
+    except ChildProcessError:direct_reaped=True
+    descendant=identities.get('descendant');descendant_stopped=not descendant
+    if descendant:
+     limit=time.monotonic()+.1
+     while time.monotonic()<limit:
+      stat=pathlib.Path('/proc')/str(descendant)/'stat'
+      if not stat.exists() or stat.read_text().split(') ',1)[1][0]=='Z':descendant_stopped=True;break
+      time.sleep(.005)
+    try:os.killpg(child.pid,signal.SIGKILL)
+    except ProcessLookupError:pass
+    child.wait(timeout=1)
+   descendant=identities.get('descendant');descendant_reaped=not descendant
+   if descendant:
+    until=time.monotonic()+1
+    while time.monotonic()<until:
+     try:
+      if os.waitpid(descendant,os.WNOHANG)[0]==descendant:descendant_reaped=True;break
+     except ChildProcessError:descendant_reaped=True;break
+     time.sleep(.005)
+   sentinel_untouched=sentinel.poll() is None;os.killpg(sentinel.pid,signal.SIGKILL);sentinel.wait(timeout=1)
+   report={'case':kind,'elapsedSeconds':elapsed,'errorType':type(error).__name__ if error else None,'error':str(error),'watchdogUsed':bool(watchdog),'productionNewSession':bool(children and children[0][1]),'directReapedBeforeProbeCleanup':direct_reaped,'descendantStoppedBeforeProbeCleanup':descendant_stopped,'descendantReapedByProbeSubreaper':descendant_reaped,'unrelatedSentinelUntouched':sentinel_untouched,'identities':identities,'aptOrFontInstallOrGUI':False}
+   print(json.dumps(report),flush=True)
+  assert elapsed<15.3 and not watchdog, '原15秒总deadline未覆盖读/等候'
+  assert children and children[0][1] and direct_reaped and descendant_stopped and descendant_reaped and sentinel_untouched, '自有进程组清理/回收失败'
+  if kind=='normal':assert error is None and len(result['fonts'])==4
+  else:assert isinstance(error,TimeoutError), '停滞必须明确deadline失败，不能靠tar错误补绿'
+`
+
+test('解包接线必须整段15秒期限+非阻塞pipe+自有进程组，无无界context wait',()=>{
+ const source=fs.readFileSync(runner,'utf8');assert.ok(source.includes('def extract_private_font_process('));assert.ok(source.includes('start_new_session=True'));assert.ok(source.includes('os.killpg('));assert.ok(source.includes('selectors.DefaultSelector'));assert.ok(source.includes('extract_private_font_process(deb,'));assert.ok(!/with subprocess\.Popen\(/.test(source))
+})
+if(process.platform==='linux')for(const kind of ['first-byte','mid-stream','wait-stall','normal'])test('真实自有Linux解包进程E2E '+kind,()=>{py(OWN_CHILD_PROBE+`
+run_case(${JSON.stringify(kind)})
 `)})

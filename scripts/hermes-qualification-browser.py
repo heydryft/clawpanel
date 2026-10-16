@@ -11,6 +11,8 @@ import re
 import sys
 import subprocess
 import shlex
+import selectors
+import signal
 import tarfile
 from xml.sax.saxutils import escape
 import time
@@ -179,6 +181,46 @@ def extract_private_font_tar(stream, destination, unpacked_limit):
     return {'members': members, 'fonts': fonts, 'unpackedBytes': total}
 
 
+def extract_private_font_process(deb, destination, unpacked_limit):
+    # 原15秒覆盖启动、首字节/中途读取、wait与清理；预留250ms用于本组kill/reap。
+    deadline = time.monotonic() + 15
+    read_deadline = deadline - 0.25
+    child = subprocess.Popen(['dpkg-deb', '--fsys-tarfile', str(deb)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
+    def remaining():
+        value = read_deadline - time.monotonic()
+        if value <= 0: raise TimeoutError('deb data读取/等待超过15秒总期限')
+        return value
+    try:
+        fd = child.stdout.fileno(); os.set_blocking(fd, False)
+        with selectors.DefaultSelector() as ready:
+            ready.register(fd, selectors.EVENT_READ)
+            class DeadlinePipe:
+                def read(self, size=-1):
+                    assert size >= 0, 'deb data无界读取'
+                    if size == 0: return b''
+                    while True:
+                        if not ready.select(remaining()): raise TimeoutError('deb data读取超过15秒总期限')
+                        try: data = os.read(fd, min(size, 65536))
+                        except BlockingIOError: continue
+                        remaining()
+                        return data
+            extracted = extract_private_font_tar(DeadlinePipe(), destination, unpacked_limit)
+            assert child.wait(timeout=remaining()) == 0, 'deb data解包失败'
+            return extracted
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError('deb data等待超过15秒总期限') from error
+    finally:
+        # 即使leader已退出也清理本次setsid进程组，禁止等持管道的后代自行退出。
+        child.stdout.close()
+        try: os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        try: child.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError('deb data自有进程回收未在15秒总期限内完成') from error
+        if time.monotonic() > deadline: raise TimeoutError('deb data超过15秒总期限')
+
+
 def verify_private_fonts(proof):
     root = Path(proof['root'])
     assert root.is_absolute() and root.resolve() == root and not any(p.is_symlink() for p in [root, *root.parents])
@@ -255,12 +297,7 @@ def prepare_private_fonts(evidence, private_root):
     control = deb822(command('control', ['dpkg-deb', '--field', str(deb)]))
     assert len(control) == 1 and all(control[0].get(k) == package['metadata'][k] for k in ('Package', 'Version', 'Architecture', 'Installed-Size')), 'deb实际control与索引不同'
     # dpkg-deb只向pipe解包data，不安装、不执行maintainer scripts。
-    with subprocess.Popen(['dpkg-deb', '--fsys-tarfile', str(deb)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
-        try:
-            extracted = extract_private_font_tar(child.stdout, root / 'fonts', package['unpackedLimit'])
-            assert child.wait(timeout=15) == 0, 'deb data解包失败'
-        finally:
-            if child.poll() is None: child.kill()
+    extracted = extract_private_font_process(deb, root / 'fonts', package['unpackedLimit'])
     config = root / 'fonts.conf'
     config.write_text('<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd"><fontconfig>'
                       '<dir>' + escape(str(root / 'fonts')) + '</dir><cachedir>' + escape(str(root / 'cache')) + '</cachedir>'

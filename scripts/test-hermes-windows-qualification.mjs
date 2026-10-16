@@ -328,6 +328,96 @@ export function qualificationStatus(r) {
   return 'passed-web-native-missing'
 }
 
+// 固定old/new进程HERMES_HOME路径；仅本轮已准入的home/.hermes，不枚举HOME或跟随record中的路径。
+// 三件并非原子快照；不探测/获取文件锁。任何缺失、拒绝、读取冲突或不稳定均明确不完整。
+export function captureHermesGatewayStateFiles(home, phase) {
+  assert.ok(['before-status', 'after-status'].includes(phase), '未知status文件取证阶段')
+  const limits = { perFileBytes: 65536, totalBytes: 131072 }
+  const names = ['gateway.pid', 'gateway.lock', 'gateway_state.json']
+  const r = { schemaVersion: 1, phase, status: 'incomplete', atomic: false, lockProbe: 'not-performed', limits, bytesRead: 0, startedAt: new Date().toISOString(), files: [] }
+  const fail = code => { throw Object.assign(new Error('status file read rejected'), { code }) }
+  const canonical = p => process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p)
+  const directory = p => {
+    physical(p)
+    const s = fs.lstatSync(p, { bigint: true })
+    if (!s.isDirectory() || s.isSymbolicLink() || canonical(fs.realpathSync.native(p)) !== canonical(p)) fail('UNSAFE_PATH')
+    return s
+  }
+  const sameNode = (a, b) => a.dev === b.dev && a.ino === b.ino
+  const sameFile = (a, b) => sameNode(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.birthtimeNs === b.birthtimeNs && a.nlink === b.nlink
+  const identity = s => ({ device: String(s.dev), inode: String(s.ino), links: Number(s.nlink), createdNs: String(s.birthtimeNs), modifiedNs: String(s.mtimeNs) })
+  const reason = error => ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'EAGAIN', 'EIO', 'EINVAL', 'ELOOP', 'ENOTDIR', 'UNSAFE_PATH', 'FILE_CHANGED', 'SHORT_READ'].includes(error?.code) ? error.code : 'READ_ERROR'
+  let root, owner, base
+  try {
+    if (typeof home !== 'string' || !path.isAbsolute(home) || home.includes('\0') || home.split(/[\\/]/).includes('..')) fail('UNSAFE_PATH')
+    home = path.resolve(home); owner = directory(home); root = path.join(home, '.hermes'); base = directory(root)
+  } catch (error) {
+    r.files = names.map(file => ({ file, status: error.code === 'ENOENT' ? 'missing' : 'rejected', reason: reason(error), bytesRead: 0 }))
+    r.finishedAt = new Date().toISOString(); return r
+  }
+  // 仅输出typed身份与枚举；自由字符串/完整argv/privatecode/凭据不导出，不使用异常message。
+  const project = (value, file) => {
+    if (Number.isSafeInteger(value) && value > 0 && file !== 'gateway_state.json') return { format: 'bare-pid', pid: value }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail('RECORD_TYPE')
+    const record = { format: 'json-object' }, positive = x => typeof x === 'number' && Number.isFinite(x) && x > 0
+    if (Number.isSafeInteger(value.pid) && value.pid > 0) record.pid = value.pid
+    if (value.kind === 'hermes-gateway') record.kind = value.kind
+    else if (Object.hasOwn(value, 'kind')) record.kindSha256 = digest(JSON.stringify(value.kind))
+    if (positive(value.start_time)) record.startTime = value.start_time
+    if (Object.hasOwn(value, 'argv')) { record.argvSha256 = digest(JSON.stringify(value.argv)); if (Array.isArray(value.argv)) record.argvCount = value.argv.length }
+    if (typeof value.hermes_home === 'string') record.hermesHome = { sha256: digest(value.hermes_home), matchesPrivateHome: !value.hermes_home.includes('\0') && path.isAbsolute(value.hermes_home) && canonical(value.hermes_home) === canonical(root) }
+    const legacy = value.clawpanel_legacy_identity
+    if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
+      const p = {}
+      if (positive(legacy.create_time)) p.createTime = legacy.create_time
+      if (typeof legacy.script_sha256 === 'string' && /^[a-f0-9]{64}$/.test(legacy.script_sha256)) p.scriptSha256 = legacy.script_sha256
+      if (['f97608f178d1ffeca59860195ab7da295f7c8e5f', 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'].includes(legacy.pin)) p.pin = legacy.pin
+      record.legacyIdentity = p
+    }
+    if (['starting', 'running', 'stopped', 'startup_failed', 'degraded', 'stopping', 'shutting_down'].includes(value.gateway_state)) record.gatewayState = value.gateway_state
+    if (['running', 'stopped'].includes(value.desired_state)) record.desiredState = value.desired_state
+    if (typeof value.updated_at === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)$/.test(value.updated_at) && Number.isFinite(Date.parse(value.updated_at))) record.updatedAt = value.updated_at
+    return record
+  }
+  for (const file of names) {
+    const row = { file, status: 'read-failed', bytesRead: 0 }; r.files.push(row)
+    const target = path.join(root, file)
+    try {
+      if (!sameNode(owner, directory(home)) || !sameNode(base, directory(root))) fail('FILE_CHANGED')
+      const before = fs.lstatSync(target, { bigint: true })
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.ino <= 0n) { row.status = 'rejected'; fail('UNSAFE_PATH') }
+      physical(target)
+      if (!within(root, fs.realpathSync.native(target))) { row.status = 'rejected'; fail('UNSAFE_PATH') }
+      row.fileIdentity = identity(before); row.declaredBytes = String(before.size)
+      if (before.size > BigInt(limits.perFileBytes) || before.size > BigInt(limits.totalBytes - r.bytesRead)) {
+        row.status = 'over-budget'; row.reason = before.size > BigInt(limits.perFileBytes) ? 'FILE_BYTES' : 'TOTAL_BYTES'; continue
+      }
+      const fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0))
+      let bytes
+      try {
+        const opened = fs.fstatSync(fd, { bigint: true })
+        if (!opened.isFile() || !sameFile(before, opened) || !sameNode(owner, directory(home)) || !sameNode(base, directory(root)) || canonical(fs.realpathSync.native(target)) !== canonical(target)) fail('FILE_CHANGED')
+        bytes = Buffer.alloc(Number(before.size))
+        while (row.bytesRead < bytes.length) {
+          const n = fs.readSync(fd, bytes, row.bytesRead, bytes.length - row.bytesRead, row.bytesRead)
+          if (!n) fail('SHORT_READ')
+          row.bytesRead += n; r.bytesRead += n
+        }
+        const after = fs.fstatSync(fd, { bigint: true }), current = fs.lstatSync(target, { bigint: true })
+        if (!sameFile(before, after) || !sameFile(before, current) || current.isSymbolicLink() || !sameNode(owner, directory(home)) || !sameNode(base, directory(root)) || canonical(fs.realpathSync.native(target)) !== canonical(target)) fail('FILE_CHANGED')
+      } finally { fs.closeSync(fd) }
+      row.bytes = bytes.length; row.sha256 = digest(bytes)
+      try {
+        if (!bytes.length) fail('EMPTY_FILE')
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+        row.record = project(JSON.parse(text), file); row.status = 'captured'
+      } catch { row.status = 'invalid-record'; row.reason = 'INVALID_RECORD' }
+    } catch (error) { if (error.code === 'ENOENT') row.status = 'missing'; else if (error.code === 'UNSAFE_PATH') row.status = 'rejected'; row.reason = reason(error) }
+  }
+  r.status = r.files.every(f => f.status === 'captured') ? 'complete' : 'incomplete'
+  r.finishedAt = new Date().toISOString(); return r
+}
+
 function physical(file) {
   for (let p = path.resolve(file);; p = path.dirname(p)) {
     if (fs.existsSync(p)) assert.ok(!fs.lstatSync(p).isSymbolicLink(), `路径含 reparse/symlink: ${p}`)
@@ -920,8 +1010,14 @@ async function execute(o) {
       const readAudit = () => fs.readFileSync(path.join(output, 'spawn-audit.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
       let statusAuditCursor
       try { statusAuditCursor = readAudit().length } catch { /* 缺原观察仍调用原status并判红，不遮住后续UI。 */ }
-      r.gatewayStatusReadback = await collectGatewayStatusReadback({ request: () => api('hermes_gateway_action', { action: 'status' }), apiReceipts, readExecEvents: () => { assert.ok(Number.isInteger(statusAuditCursor), 'STATUS_AUDIT_BASELINE_MISSING'); return readAudit().slice(statusAuditCursor) } })
-      write('gateway-status-readback.json', r.gatewayStatusReadback); save()
+      r.gatewayStatusFiles = { before: captureHermesGatewayStateFiles(home, 'before-status') }
+      try {
+        r.gatewayStatusReadback = await collectGatewayStatusReadback({ request: () => api('hermes_gateway_action', { action: 'status' }), apiReceipts, readExecEvents: () => { assert.ok(Number.isInteger(statusAuditCursor), 'STATUS_AUDIT_BASELINE_MISSING'); return readAudit().slice(statusAuditCursor) } })
+        write('gateway-status-readback.json', r.gatewayStatusReadback)
+      } finally {
+        r.gatewayStatusFiles.after = captureHermesGatewayStateFiles(home, 'after-status')
+        write('gateway-status-files.json', r.gatewayStatusFiles); save()
+      }
       if (diagnostic) { r.diagnostic.gatewayReadyWithinBudget = true; await capturePids(); return { scope: r.diagnostic.scope, gatewayReadyWithinBudget: true } }
       const dash = await api('hermes_dashboard_start'); assert.equal(dash.started, true); assert.equal((await api('hermes_dashboard_probe')).running, true); await capturePids()
       // 官方40747修复Node24.16与旧zip stream的死锁；固定测试工具版本，不降Node或扩安装预算。
