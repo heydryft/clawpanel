@@ -587,15 +587,20 @@ function Get-ClawPanelPathFingerprint($p,$trace=$null,$defer=$false){
     return [ordered]@{kind='file';sha256=$sha256;bytes=[int64]$item.Length;attributes=[int64]$a}
   }catch{Write-ClawPanelFingerprintStage $trace $k 'failed' $z;throw}
 }
-function New-ClawHashPool{@{p=[runspacefactory]::CreateRunspacePool(1,2);j=@();c=('param($p,$e,$t);function Write-ClawPanelFingerprintStage{'+${'$'}{function:Write-ClawPanelFingerprintStage}+'};function fp{'+${'$'}{function:Get-ClawPanelPathFingerprint}+'};function stamp($i=$(Get-Item -LiteralPath $p -Force -ea Stop)){if($i.PSIsContainer -or ([int]$i.Attributes -band 1024)){throw "Changed"};@([int]$i.Attributes,$i.Length,$i.CreationTimeUtc.Ticks,$i.LastWriteTimeUtc.Ticks)-join ","};$ErrorActionPreference="Stop";$e=stamp $e;if((stamp)-ne $e){throw "Changed"};$r=fp $p $t;if((stamp)-ne $e){throw "Changed"};$r.sha256')}}
+function New-ClawHashPool{@{p=[runspacefactory]::CreateRunspacePool(1,2);j=@();q=@();c=('param($p,$e,$t);function Write-ClawPanelFingerprintStage{'+${'$'}{function:Write-ClawPanelFingerprintStage}+'};function fp{'+${'$'}{function:Get-ClawPanelPathFingerprint}+'};function stamp($i=$(Get-Item -LiteralPath $p -Force -ea Stop)){if($i.PSIsContainer -or ([int]$i.Attributes -band 1024)){throw "Changed"};@([int]$i.Attributes,$i.Length,$i.CreationTimeUtc.Ticks,$i.LastWriteTimeUtc.Ticks)-join ","};$ErrorActionPreference="Stop";$e=stamp $e;if((stamp)-ne $e){throw "Changed"};$r=fp $p $t;if((stamp)-ne $e){throw "Changed"};$r.sha256')}}
 function Close-ClawDir($d){if(--$d.n -eq 0){Write-ClawPanelLauncherDirectory $d.i 'fingerprinted' $d.c $d.b}}
 function Step-ClawPanelHash($s,$r,$f,$t){
+  if($null-ne$s.q){
+    if($r){$c=$t.Clone();$c.budget=$t;$s.q+=,@($r,$f,$c);$t.dir.n++;return}
+    $q=@($s.q|Sort-Object {-$_[1].Length},{$s.q.IndexOf($_)});$s.q=$null
+    foreach($e in $q){Step-ClawPanelHash $s @e}
+  }
   if($s.j.Count -eq 2 -or (!$r -and $s.j.Count)){
     $n=[Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($s.j|%{$_.a.AsyncWaitHandle}));$j=$s.j[$n]
     try{try{$h=@($j.p.EndInvoke($j.a))}catch{$e=$_.Exception.InnerException;if($e.ErrorRecord){throw $e.ErrorRecord};throw};if($j.p.HadErrors -or $h.Count -ne 1 -or $h[0] -isnot [string] -or $h[0] -notmatch '^[a-f0-9]{64}$'){throw 'Invalid hash'};$j.r.sha256=$j.r.fingerprint.sha256=$h[0];Close-ClawDir $j.d}
     finally{$j.a.AsyncWaitHandle.Close();$j.p.Dispose();$s.j=@($s.j|?{$_ -ne $j})}
   }
-  if($r){$p=[powershell]::Create();try{$p.RunspacePool=$s.p;$c=$t.Clone();$c.budget=$t;[void]$p.AddScript($s.c).AddArgument($f.FullName).AddArgument($f).AddArgument($c);$s.j+=@{p=$p;a=$p.BeginInvoke();r=$r;d=$t.dir};$t.dir.n++;$p=$null}finally{if($p){$p.Dispose()}}}
+  if($r){$p=[powershell]::Create();try{$p.RunspacePool=$s.p;$c=$t.Clone();$c.budget=$t.budget;[void]$p.AddScript($s.c).AddArgument($f.FullName).AddArgument($f).AddArgument($c);$s.j+=@{p=$p;a=$p.BeginInvoke();r=$r;d=$t.dir};$p=$null}finally{if($p){$p.Dispose()}}}
 }
 `.replace(/^ +/gm, '')
 }
@@ -617,19 +622,20 @@ $shells=@();$paths=@($PROFILE.AllUsersAllHosts,$PROFILE.AllUsersCurrentHost,$PRO
 foreach($p in ($paths|Sort-Object -Unique)){$fingerprint=Get-ClawPanelPathFingerprint $p;$shells+=@{path=$p;exists=($fingerprint.kind -ne 'absent');sha256=$fingerprint.sha256;fingerprint=$fingerprint}}
 Write-ClawPanelHostPhase 'launchers'
 $launchers=@();$dirs=@(($env:PATH -split ';')+@("$real\\AppData\\Roaming\\npm","$real\\.local\\bin","$real\\.hermes\\bin"))|Sort-Object -Unique
-$launcherPrefixes=@('hermes','uv','node','npm','python','git');$launcherDirectoryIndex=0
+$launcherPrefixes=@('hermes','uv','node','npm','python','git');$di=0
 $launcherFingerprintTrace=@{directoryIndex=0;fileIndex=0;records=0;clock=$hostClock;process=[Diagnostics.Process]::GetCurrentProcess()}
 $hw=New-ClawHashPool
 function Write-ClawPanelLauncherDirectory($index,$event,$count,$bytes){if($index -le 64){[Console]::Error.WriteLine('CLAWPANEL_LAUNCHER_DIRECTORY {"index":'+$index+',"event":"'+$event+'","count":'+$count+',"bytes":'+$bytes+',"elapsedMs":'+$hostClock.ElapsedMilliseconds+'}')}}
 try{$hw.p.Open()
 foreach($d in $dirs){if($d -and (Test-Path -LiteralPath $d)){
-  $launcherDirectoryIndex++;Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'begin' 0 0
-  $launcherFiles=@(@(foreach($prefix in $launcherPrefixes){Get-ChildItem -LiteralPath $d -Filter ($prefix+'*') -File -ErrorAction Stop})|Where-Object {$_.Name -match '^(hermes|uv|node|npm|python|git)([.-].*|[0-9.]*\\.exe|\\.cmd|\\.ps1)?$'}|Sort-Object FullName)
-  $launcherBytes=0L;foreach($f in $launcherFiles){$launcherBytes+=$f.Length};Write-ClawPanelLauncherDirectory $launcherDirectoryIndex 'enumerated' $launcherFiles.Count $launcherBytes
-  $t=$launcherFingerprintTrace;$t.directoryIndex=$launcherDirectoryIndex;$t.fileIndex=0;$t.dir=@{n=1;i=$launcherDirectoryIndex;c=$launcherFiles.Count;b=$launcherBytes}
-  foreach($f in $launcherFiles){$t.fileIndex++;$fingerprint=Get-ClawPanelPathFingerprint $f.FullName $launcherFingerprintTrace $true;$row=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint};$launchers+=$row;if($fingerprint.kind -eq 'file'){Step-ClawPanelHash $hw $row $f $t}}
+  $di++;Write-ClawPanelLauncherDirectory $di 'begin' 0 0
+  $lf=@(@(foreach($prefix in $launcherPrefixes){Get-ChildItem -LiteralPath $d -Filter ($prefix+'*') -File -ErrorAction Stop})|Where-Object {$_.Name -match '^(hermes|uv|node|npm|python|git)([.-].*|[0-9.]*\\.exe|\\.cmd|\\.ps1)?$'}|Sort-Object FullName)
+  $lb=0L;foreach($f in $lf){$lb+=$f.Length};Write-ClawPanelLauncherDirectory $di 'enumerated' $lf.Count $lb
+  $t=$launcherFingerprintTrace;$t.directoryIndex=$di;$t.fileIndex=0;$t.dir=@{n=1;i=$di;c=$lf.Count;b=$lb}
+  foreach($f in $lf){$t.fileIndex++;$fingerprint=Get-ClawPanelPathFingerprint $f.FullName $launcherFingerprintTrace $true;$row=@{path=$f.FullName;bytes=$f.Length;sha256=$fingerprint.sha256;fingerprint=$fingerprint};$launchers+=$row;if($fingerprint.kind -eq 'file'){Step-ClawPanelHash $hw $row $f $t}}
   Close-ClawDir $t.dir
 }}
+Step-ClawPanelHash $hw
 while($hw.j.Count){Step-ClawPanelHash $hw}
 }finally{foreach($j in $hw.j){$j.p.Stop();$j.a.AsyncWaitHandle.Close();$j.p.Dispose()};$hw.p.Dispose()}
 Write-ClawPanelHostPhase 'execution-policy'

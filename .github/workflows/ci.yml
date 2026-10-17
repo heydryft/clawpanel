@@ -127,3 +127,14 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: false
           retention-days: 7
+
+      # 独立保留原gate前自有PID回执；材料缺失仅告警，不代表检查通过。
+      - name: 保留 CLI 清理门禁前自有回执
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hermes-cli-cleanup-before-gate-${{ runner.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/hermes-bounds-ci/cleanup-own-node-before-gate.json
+          if-no-files-found: warn
+          include-hidden-files: false
+          retention-days: 7

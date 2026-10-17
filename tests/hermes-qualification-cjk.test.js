@@ -173,6 +173,20 @@ with tempfile.TemporaryDirectory() as d:
  r=json.loads((out/'fontconfig-after.json').read_text());assert r['private']['archiveSha256']==sha and len(r['private']['fonts'])==4;env=m.read_font_environment(out)['childEnv'];assert env['FONTCONFIG_FILE']==str(private/'fonts.conf')
  tree=ET.fromstring((private/'fonts.conf').read_text());assert [e.text for e in tree.findall('cachedir')]==[str(private/'cache')] and [e.text for e in tree.findall('dir')]==[str(private/'fonts')] and not tree.findall('include');assert not (private/'etc').exists() and not (out/'browser-round1').exists();assert dict(os.environ)==parent
  reject(lambda:m.prepare_private_fonts(out,private))
+ # 同一实际准备入口的mirror成功/下载中漂移；只有外部APT/系统文件是明确隔离依赖。
+ mirror_text='http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\n'
+ mirror_proof={'path':'/etc/apt/apt-mirrors.txt','sha256':hashlib.sha256(mirror_text.encode()).hexdigest(),'bytes':len(mirror_text),'content':mirror_text,'mirrors':m.parse_official_font_mirrors(mirror_text)}
+ base='http://archive.ubuntu.com/ubuntu';wrapper='mirror+file:/etc/apt/apt-mirrors.txt'
+ meta+='Origin: Ubuntu\n';index=index.replace(base,wrapper)+'Component: main\nSourcesentry: /etc/apt/sources.list.d/ubuntu.sources:1\n';uri=uri.replace(base,wrapper)
+ mirror_reads=[]
+ def fixed_mirror():mirror_reads.append(True);return copy.deepcopy(mirror_proof)
+ m.read_fixed_apt_mirror=fixed_mirror;mirror_out=root/'mirror-evidence';mirror_out.mkdir();m.prepare_private_fonts(mirror_out,root/'mirror-private')
+ stored=json.loads((mirror_out/'font-package.json').read_text());assert len(mirror_reads)==2 and stored['proof']['package']['mirrorSource']==stored['proof']['package']['mirrorSourceAfter']==mirror_proof
+ mirror_reads.clear()
+ def changed_mirror():mirror_reads.append(True);return {**mirror_proof,'sha256':mirror_proof['sha256'] if len(mirror_reads)==1 else 'f'*64}
+ m.read_fixed_apt_mirror=changed_mirror;changed_out=root/'changed-evidence';changed_out.mkdir();count=len(processes);reject(lambda:m.prepare_private_fonts(changed_out,root/'changed-private'));assert len(processes)==count and not (changed_out/'fontconfig-after.json').exists()
+ # 归档篡改原断言继续：先恢复相同mirror，再测试归档SHA失败。
+ m.read_fixed_apt_mirror=fixed_mirror
  tamper=True;out2=root/'evidence2';out2.mkdir();before=len(processes);reject(lambda:m.prepare_private_fonts(out2,root/'bad-private'));assert len(processes)==before and not (out2/'fontconfig-after.json').exists()
 print(json.dumps({'isolatedPreparationE2E':True,'actualAPT':False,'actualFontOrGUIInstall':False}))
 `)})
@@ -274,3 +288,39 @@ test('解包接线必须整段15秒期限+非阻塞pipe+自有进程组，无无
 if(process.platform==='linux')for(const kind of ['first-byte','mid-stream','wait-stall','normal'])test('真实自有Linux解包进程E2E '+kind,()=>{py(OWN_CHILD_PROBE+`
 run_case(${JSON.stringify(kind)})
 `)})
+
+// R25真实APT原件的metadata/单个匹配index/URI；原JSON SHA256固定，非下载成功或VM证明。
+const ACTUAL_R25_APT = {
+  "version": "1:20230817+repack1-3",
+  "metadata": "Package: fonts-noto-cjk\nArchitecture: all\nVersion: 1:20230817+repack1-3\nMulti-Arch: foreign\nPriority: optional\nSection: fonts\nOrigin: Ubuntu\nMaintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>\nOriginal-Maintainer: Debian Fonts Team <debian-fonts@lists.debian.org>\nBugs: https://bugs.launchpad.net/ubuntu/+filebug\nInstalled-Size: 90994\nSuggests: fonts-noto-cjk-extra\nFilename: pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20230817+repack1-3_all.deb\nSize: 61229778\nMD5sum: 6d2b2c3dc717b8f8a1db0df79b34e628\nSHA1: 8bdbac876dd4314c90f1e2dcf92b299a0318ada4\nSHA256: 7d64b985f6fe128c99eae5610d5c047338e572bdcfb2bb09736be01b824a7f6c\nSHA512: 5c9e5d817477e8f858bfd06469e2eb86c5c62a562a9593732bd8578378720cd1b0cd4146333a21aa86546a374660e88276420e1f8ba965f33dd6dd5d6bda0941\nHomepage: https://github.com/notofonts/noto-cjk\nDescription-en: \"No Tofu\" font families with large Unicode coverage (CJK regular and bold)\n Noto is a collection of font families, each visually harmonized across\n scripts.\n .\n This package contains Noto font families for Traditional Chinese,\n Simplified Chinese, Japanese and Korean:\n .\n  * Noto Sans CJK JP\n  * Noto Sans CJK KR\n  * Noto Sans CJK SC\n  * Noto Sans CJK TC\n  * Noto Sans Mono CJK JP\n  * Noto Sans Mono CJK KR\n  * Noto Sans Mono CJK SC\n  * Noto Sans Mono CJK TC\n  * Noto Serif CJK JP\n  * Noto Serif CJK KR\n  * Noto Serif CJK SC\n  * Noto Serif CJK TC\n .\n These fonts are derived from the font family Source Han Sans.\n .\n The name \"Noto\" is short for \"No Tofu\", describing the aim of covering\n all living Unicode scripts.\n .\n Tofu (豆腐) is Japanese jargon for unicode replacement character \"�\"\n (U+FFFD) often displayed as replacement for unassigned or unknown\n characters.\n .\n This package contains regular and bold fonts.\nDescription-md5: 0ca861bf5dc90003c5a480427ee7d985\nTask: ubuntu-desktop-minimal, ubuntu-desktop, ubuntu-desktop-raspi, kubuntu-desktop, xubuntu-minimal, xubuntu-desktop, lubuntu-desktop, ubuntustudio-desktop-core, ubuntustudio-desktop, ubuntukylin-desktop, ubuntukylin-desktop-minimal, ubuntu-mate-core, ubuntu-mate-desktop, ubuntu-budgie-desktop-minimal, ubuntu-budgie-desktop, ubuntu-budgie-desktop-raspi, ubuntu-unity-desktop, edubuntu-desktop-gnome-minimal, edubuntu-desktop-gnome-raspi, ubuntucinnamon-desktop-minimal, ubuntucinnamon-desktop-raspi\n\n",
+  "indexes": "MetaKey: main/binary-amd64/Packages\nShortDesc: Packages\nDescription: mirror+file:/etc/apt/apt-mirrors.txt noble/main amd64 Packages\nURI: mirror+file:/etc/apt/apt-mirrors.txt/dists/noble/main/binary-amd64/Packages\nFilename: /var/lib/apt/lists/_etc_apt_apt-mirrors.txt_dists_noble_main_binary-amd64_Packages\nOptional: no\nKeepCompressed: no\nCodename: noble\nLabel: Ubuntu\nOrigin: Ubuntu\nSuite: noble\nTrusted: yes\nVersion: 24.04\nArchitecture: amd64\nBase-URI: mirror+file:/etc/apt/apt-mirrors.txt/dists/noble/\nBy-Hash: yes\nComponent: main\nCompressionTypes: xz bz2 lzma gz lz4 zst uncompressed\nCreated-By: Packages\nDefaultEnabled: yes\nFallback-Of: \nIdentifier: Packages\nKeepCompressedAs: lz4 zst gz xz bz2 lzma uncompressed\nPDiffs: yes\nRelease: noble\nRepo-URI: mirror+file:/etc/apt/apt-mirrors.txt/\nSite: mirror+file:/etc/apt/apt-mirrors.txt\nSourcesentry: /etc/apt/sources.list.d/ubuntu.sources:1\nTarget-Of: deb\n",
+  "uris": "'mirror+file:/etc/apt/apt-mirrors.txt/pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20230817%2brepack1-3_all.deb' fonts-noto-cjk_1%3a20230817+repack1-3_all.deb 61229778 SHA256:7d64b985f6fe128c99eae5610d5c047338e572bdcfb2bb09736be01b824a7f6c\n",
+  "rawReceiptSha256": "53319149a82d6fbefa294b5f40ebe13d42af94a1d2fad6710da855f93b70acef"
+}
+
+test('R25真实mirror+file下载前误拒：固定系统列表、signed index及原SHA不可放宽',()=>{py(String.raw`
+actual=json.loads(${JSON.stringify(JSON.stringify(ACTUAL_R25_APT))})
+mirrorText=${JSON.stringify('http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\nhttps://security.ubuntu.com/ubuntu/\tpriority:3\n')}
+# 仅隔离本机不存在的root-owned GHA文件；生产默认读取固定系统路径，绝非VM通过。
+m.read_fixed_apt_mirror=lambda:{'path':'/etc/apt/apt-mirrors.txt','sha256':'b'*64,'content':mirrorText,'mirrors':m.parse_official_font_mirrors(mirrorText)}
+p=m.validate_font_download(actual['metadata'],actual['indexes'],actual['uris'],actual['version'])
+assert p['sourceURL'].startswith('mirror+file:/etc/apt/apt-mirrors.txt/pool/') and p['sha256']=='7d64b985f6fe128c99eae5610d5c047338e572bdcfb2bb09736be01b824a7f6c' and p['bytes']==61229778 and p['mirrorSource']['path']=='/etc/apt/apt-mirrors.txt'
+for before,after in [('mirror+file:','file:'),('mirror+file:','mirror+http:'),('/etc/apt/apt-mirrors.txt','/tmp/apt-mirrors.txt'),('/etc/apt/apt-mirrors.txt','/etc/apt/../apt/apt-mirrors.txt'),('mirror+file:','mirror+file://attacker.invalid'),("_all.deb'","_all.deb?x=1'"),("_all.deb'","_all.deb#x'")]:
+ bad=actual['uris'].replace(before,after);reject(lambda:m.validate_font_download(actual['metadata'],actual['indexes'],bad,actual['version']))
+for bad in [actual['indexes'].replace('Trusted: yes','Trusted: no'),actual['indexes'].replace('Origin: Ubuntu','Origin: other'),actual['indexes'].replace('/etc/apt/sources.list.d/ubuntu.sources:1','/tmp/sources:1'),actual['indexes'].replace('Site: mirror+file:','Site: file:')]:reject(lambda:m.validate_font_download(actual['metadata'],bad,actual['uris'],actual['version']))
+print(json.dumps({'actualRawURIRegression':True,'realVMDownload':False}))
+`)})
+test('固定mirrorfile只接官方端点，root/普通文件/权限/单链接/有界内容逐项拒绝',()=>{py(String.raw`
+import stat,types
+text=${JSON.stringify('http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\nhttps://security.ubuntu.com/ubuntu/\tpriority:3\n')}
+assert len(m.parse_official_font_mirrors(text))==3
+for bad in ['file:/tmp/mirror\n','mirror+file:/etc/apt/other\n','https://attacker.invalid/ubuntu/\n','https://archive.ubuntu.com/ubuntu/?a=b\n',text+'https://archive.ubuntu.com/ubuntu/\tpriority:2\n',text.replace('priority:1','priority:99'),'# no endpoints\n','x'*4097]:reject(lambda:m.parse_official_font_mirrors(bad))
+good=types.SimpleNamespace(st_uid=0,st_mode=stat.S_IFREG|0o644,st_nlink=1,st_size=200)
+m.check_fixed_mirror_stat(good)
+for key,value in [('st_uid',1000),('st_mode',stat.S_IFLNK|0o644),('st_mode',stat.S_IFIFO|0o644),('st_mode',stat.S_IFREG|0o664),('st_mode',stat.S_IFREG|0o646),('st_nlink',2),('st_size',4097),('st_size',0)]:
+ bad=copy.copy(good);setattr(bad,key,value);reject(lambda:m.check_fixed_mirror_stat(bad))
+print(json.dumps({'rootFileFacts':'isolated stat fixtures','hostFileReadOrWrite':False}))
+`)})
+test('mirror分支实际准备调用必须前后固定路径回读，原tar/15秒/非root门禁保持',()=>{
+ const s=fs.readFileSync(runner,'utf8');assert.ok(s.includes('def read_fixed_apt_mirror():'));assert.ok(s.includes("Path('/etc/apt/apt-mirrors.txt')"));assert.ok(s.includes('O_NOFOLLOW'));assert.ok(s.includes("package['mirrorSource']"));assert.ok(s.includes('mirrorSourceAfter'));assert.ok(s.includes('extract_private_font_process(deb,'));assert.ok(s.includes('read_deadline = deadline - 0.25'));assert.ok(s.includes('APT::Get::AllowUnauthenticated=false'));assert.ok(s.includes('os.geteuid() != 0'))
+})

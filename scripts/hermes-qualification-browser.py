@@ -13,6 +13,7 @@ import subprocess
 import shlex
 import selectors
 import signal
+import stat
 import tarfile
 from xml.sax.saxutils import escape
 import time
@@ -98,6 +99,44 @@ def deb822(text):
     return rows
 
 
+# 固定GHA配置来源Git blob b3f5b2b180df8eb39fcbba034f616e03a69e775c；不接收调用方路径。
+def parse_official_font_mirrors(text):
+    assert isinstance(text, str) and 0 < len(text.encode('utf-8')) <= 4096 and '\0' not in text, 'mirror列表大小/格式'
+    allowed = {'http://azure.archive.ubuntu.com/ubuntu/': 'priority:1',
+               'https://archive.ubuntu.com/ubuntu/': 'priority:2',
+               'https://security.ubuntu.com/ubuntu/': 'priority:3'}
+    mirrors, seen = [], set()
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith('#'): continue
+        words = line.split(); assert len(words) in (1, 2), '未知mirror元数据'
+        url = words[0]; assert url in allowed and url not in seen, '非固定官方mirror/重复端点'
+        assert len(words) == 1 or words[1] == allowed[url], '未知mirror优先级'
+        seen.add(url); mirrors.append({'url': url, 'priority': words[1] if len(words) == 2 else None})
+    assert mirrors, 'mirror列表为空'
+    return mirrors
+
+
+def check_fixed_mirror_stat(info):
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'mirror文件类型/所有权/写权限'
+    assert info.st_nlink == 1 and 0 < info.st_size <= 4096, 'mirror文件链接/大小'
+
+
+def read_fixed_apt_mirror():
+    file = Path('/etc/apt/apt-mirrors.txt')
+    assert not file.is_symlink() and file.resolve(strict=True) == file, '固定mirror路径为链接'
+    for parent in file.parents:
+        info = parent.lstat()
+        assert stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'mirror父目录不受信'
+    identity = lambda i: [i.st_dev, i.st_ino, i.st_uid, i.st_mode, i.st_nlink, i.st_size, i.st_mtime_ns]
+    with os.fdopen(os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), 'rb') as stream:
+        before = os.fstat(stream.fileno()); check_fixed_mirror_stat(before)
+        raw = stream.read(4097); after = os.fstat(stream.fileno()); check_fixed_mirror_stat(after)
+        assert identity(before) == identity(after) == identity(file.lstat()) and len(raw) == before.st_size, 'mirror读取期间漂移'
+    text = raw.decode('utf-8')
+    return {'path': str(file), 'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw),
+            'identity': identity(before), 'content': text, 'mirrors': parse_official_font_mirrors(text)}
+
+
 def validate_font_download(metadata, indexes, uris, version):
     records = deb822(metadata)
     assert len(records) == 1, '字体包索引非唯一'
@@ -112,15 +151,26 @@ def validate_font_download(metadata, indexes, uris, version):
     lines = uris.strip().splitlines(); assert len(lines) == 1, '字体下载URI非唯一'
     uri, archive, stated_size, stated_hash = shlex.split(lines[0])
     url = urlsplit(uri)
-    assert url.scheme in ('https', 'http') and not (url.username or url.password or url.query or url.fragment)
-    assert url.hostname in ('archive.ubuntu.com', 'azure.archive.ubuntu.com', 'security.ubuntu.com', 'ports.ubuntu.com') or re.fullmatch(r'[a-z]{2}\.archive\.ubuntu\.com', url.hostname or '')
+    assert not (url.username or url.password or url.query or url.fragment)
+    mirror_source = None
+    if url.scheme == 'mirror+file':
+        assert not url.netloc and unquote(url.path) == '/etc/apt/apt-mirrors.txt/' + unquote(name), '非固定mirror wrapper路径'
+        assert record.get('Origin') == 'Ubuntu', 'mirror包缺Ubuntu来源'
+        mirror_source = read_fixed_apt_mirror()
+    else:
+        assert url.scheme in ('https', 'http')
+        assert url.hostname in ('archive.ubuntu.com', 'azure.archive.ubuntu.com', 'security.ubuntu.com', 'ports.ubuntu.com') or re.fullmatch(r'[a-z]{2}\.archive\.ubuntu\.com', url.hostname or '')
     assert unquote(url.path).endswith('/' + unquote(name)) and int(stated_size) == size and stated_hash == 'SHA256:' + record['SHA256']
     assert re.fullmatch(r'fonts-noto-cjk_[a-zA-Z0-9+_.:%~-]+_all\.deb', archive), '字体下载文件名'
     trusted = [i for i in deb822(indexes) if i.get('Identifier') == 'Packages' and i.get('Origin') == i.get('Label') == 'Ubuntu'
                and i.get('Trusted') == 'yes' and uri.startswith(i.get('Site', '').rstrip('/') + '/') and i.get('Site')]
+    if mirror_source:
+        trusted = [i for i in trusted if i['Site'] == 'mirror+file:/etc/apt/apt-mirrors.txt' and i.get('Component') == 'main'
+                   and re.fullmatch(r'/etc/apt/sources\.list\.d/ubuntu\.sources:[1-9][0-9]*', i.get('Sourcesentry', ''))]
     assert trusted, '没有相应已签名Ubuntu索引'
     return {'version': version, 'sha256': record['SHA256'], 'bytes': size, 'unpackedLimit': unpacked,
-            'sourceURL': uri, 'archiveName': archive, 'metadata': record, 'indexes': trusted}
+            'sourceURL': uri, 'archiveName': archive, 'metadata': record, 'indexes': trusted,
+            **({'mirrorSource': mirror_source} if mirror_source else {})}
 
 
 def fingerprint_font_file(file, directory='/usr/share/fonts'):
@@ -277,10 +327,10 @@ def prepare_private_fonts(evidence, private_root):
     started = time.monotonic()
     (out / 'fontconfig-before.json').write_text(json.dumps(font_environment('before'), ensure_ascii=False, indent=2))
     root.mkdir(mode=0o700); download = root / 'download'; download.mkdir(); (root / 'cache').mkdir()
-    receipts = {}
+    receipts, package = {}, None
     def command(label, args, **kwargs):
         value = font_command(args, **kwargs); receipts[label] = value
-        (out / 'font-package.json').write_text(json.dumps({'status': 'preparing', 'commands': receipts}, ensure_ascii=False, indent=2))
+        (out / 'font-package.json').write_text(json.dumps({'status': 'preparing', 'commands': receipts, **({'package': package} if package else {})}, ensure_ascii=False, indent=2))
         assert value['exitCode'] == 0, '字体准备失败: ' + label
         return value['stdout']
     policy = command('policy', ['apt-cache', 'policy', 'fonts-noto-cjk'])
@@ -291,6 +341,10 @@ def prepare_private_fonts(evidence, private_root):
     uris = command('uris', ['apt-get', *APT_FONT_FLAGS, '--print-uris', 'download', spec], cwd=download)
     package = validate_font_download(metadata, indexes, uris, candidate[1])
     command('download', ['apt-get', *APT_FONT_FLAGS, 'download', spec], cwd=download, timeout=120)
+    if 'mirrorSource' in package:
+        after_mirror = read_fixed_apt_mirror()
+        assert after_mirror == package['mirrorSource'], '下载期间固定mirror文件漂移'
+        package['mirrorSourceAfter'] = after_mirror
     deb = download / package['archiveName']; assert list(download.iterdir()) == [deb], '字体下载出现额外文件'
     actual = fingerprint_font_file(deb, download)
     assert actual['sha256'] == package['sha256'] and actual['bytes'] == package['bytes'], '字体归档SHA/大小漂移'
