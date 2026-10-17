@@ -113,9 +113,13 @@ with tempfile.TemporaryDirectory(prefix='cp-old-identity-') as tmp:
         passed=5
     elif group=='negative':
         assert accepted(),'正对照失败'
+        # 用真实独立物理同bytes文件作foreign负例；合法canonical base不再充当反例。
+        foreign_python=base.with_name('foreign-python.exe');foreign_python.write_bytes(base.read_bytes())
+        assert foreign_python.is_file() and not foreign_python.is_symlink() and not getattr(foreign_python.lstat(),'st_file_attributes',0)&0x400
+        assert not foreign_python.samefile(base) and foreign_python.read_bytes()==base.read_bytes()
         baseline=copy.deepcopy(target);saved=copy.deepcopy(record)
         mutations=[
-          ('venv',lambda:target['argv'].__setitem__(0,str(base))),('base',lambda:target.__setitem__('exe',str(venv))),
+          ('foreign-argv0',lambda:target['argv'].__setitem__(0,str(foreign_python))),('base',lambda:target.__setitem__('exe',str(venv))),
           ('other-private-base',lambda:target.__setitem__('exe',str(base.parent/'other/python.exe'))),
           ('source',lambda:target['argv'].__setitem__(5,str(home))),('home',lambda:target['argv'].__setitem__(6,str(root))),
           ('pin',lambda:target['argv'].__setitem__(7,'0'*40)),('mode',lambda:target['argv'].__setitem__(8,'--')),
