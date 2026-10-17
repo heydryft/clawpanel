@@ -571,7 +571,17 @@ export function hermesCliPresence(home, source) {
 }
 
 export function hermesDetectionState(probe, present) {
-  const token = probe.ok && String(probe.stdout || '').split(/\s+/).find(s => /^v?\d+\.\d+\.\d+(?:[-+][a-z0-9.-]+)?$/i.test(s))
+  const raw = probe.ok ? String(probe.stdout || '').trim() : ''
+  const version = '[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?'
+  const hex = '[a-f0-9]{7,40}'
+  // 固定d923的_startup_fast/banner：首行标识Hermes，依赖版本行不是安装证明。
+  const dated = ' \\([0-9]{4}\\.[0-9]{1,2}\\.[0-9]{1,2}\\)(?: · (?:(?:stable|canary)(?: · local ' + hex + ')?|upstream ' + hex + '(?: · local ' + hex + ' \\(\\+[1-9][0-9]* carried commits?\\))?))?'
+  const desktop = ' · (?:stable|canary|installer|commit-build · ' + hex + ')'
+  const lines = raw.split(/\r?\n/)
+  const bare = new RegExp('^v?(' + version + ')$', 'i').exec(raw)
+  const header = lines.filter(line => /^\s*Hermes Agent\b/i.test(line)).length === 1
+    ? new RegExp('^Hermes Agent v(' + version + ')(?:' + dated + '|' + desktop + ')?$').exec(lines[0]) : null
+  const token = (bare || header)?.[1]
   if (token && token.length <= 128 && redactPluginOutput(token) === token) return { installed: true, version: token.replace(/^v/i, ''), detectionError: null }
   if (!probe.ok && probe.cliMissing === true && present === false) return { installed: false, version: null, detectionError: null }
   // 固定代码不包含CLI输出、HOME、私有脚本或凭据。

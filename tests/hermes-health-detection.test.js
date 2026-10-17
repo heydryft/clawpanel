@@ -15,6 +15,53 @@ function fn(name, globals = {}) {
   return vm.runInNewContext('(' + source.slice(start, source.indexOf('\n}', start) + 2).replace('export ', '') + ')', { fs, path, isWindows: process.platform === 'win32', redactPluginOutput, ...globals })
 }
 
+for (const [name, stdout] of [
+  ['Python单独版本', 'Python: 3.14.7'],
+  ['SDK单独版本', 'OpenAI SDK: 2.38.0'],
+  ['Hermes版本未知但Python/SDK可读', 'Hermes Agent vunknown\nInstall directory: <owned-fixture>\nPython: 3.14.7\nOpenAI SDK: 2.38.0'],
+]) test('R1不能用依赖版本代替Hermes确认：' + name, () => {
+  const state = fn('hermesDetectionState')({ ok: true, stdout }, true)
+  assert.equal(state.installed, null)
+  assert.equal(state.version, null)
+  assert.equal(state.detectionError, 'CLI_PROBE_FAILED')
+})
+
+test('R1完整裸版本或唯一官方Hermes首行，保留实际多行metadata且不采依赖版本', () => {
+  const classify = fn('hermesDetectionState')
+  const headers = [
+    'Hermes Agent v0.22.2',
+    'Hermes Agent v0.22.2 (2026.9.24)',
+    'Hermes Agent v0.22.2 (2026.9.24) · stable · local d923a5eb487a',
+    'Hermes Agent v0.22.2 (2026.9.24) · upstream d923a5eb',
+    'Hermes Agent v0.22.2 (2026.9.24) · upstream d923a5eb · local a923a5eb (+1 carried commit)',
+    'Hermes Agent v0.22.2 · stable',
+    'Hermes Agent v0.22.2 · commit-build · d923a5eb487a',
+    'Hermes Agent v0.22.2 · installer',
+  ]
+  for (const stdout of ['0.21.5', 'v0.21.5', '0.22.2-rc.1', ...headers.map(h => h + '\r\nInstall directory: <owned-fixture>\r\nInstall method: git\r\nPython: 3.14.7\r\nOpenAI SDK: 2.24.0\r\n')]) {
+    const state = classify({ ok: true, stdout }, true)
+    assert.equal(state.installed, true, stdout)
+    assert.equal(state.version, stdout.startsWith('Hermes Agent') ? '0.22.2' : stdout.replace(/^v/, ''))
+  }
+})
+
+test('R1歧义标题、正文捞版本、未知后缀和敏感/超长token保持unknown', () => {
+  const classify = fn('hermesDetectionState')
+  for (const stdout of [
+    'Python: 3.14.7\n0.21.5', '0.21.5\nOpenAI SDK: 2.38.0', 'wrapper 0.21.5',
+    'Hermes Agent v0.22.2\nHermes Agent v0.22.2',
+    'Hermes Agent v0.22.2\nHermes Agent v0.21.5',
+    'Hermes Agent vunknown\nHermes Agent v0.22.2',
+    'Hermes Agent v0.22.2 garbage', 'Python: 3.14.7\nHermes Agent v0.22.2', 'Hermes V0.22.2',
+    'Hermes Agent v1.0.0-sk-ownedKey', '1.0.0-sk-ownedKey',
+    'Hermes Agent v1.0.0+' + 'a'.repeat(2000),
+  ]) {
+    const state = classify({ ok: true, stdout }, true)
+    assert.equal(state.installed, null, stdout.slice(0, 100))
+    assert.equal(state.version, null)
+  }
+})
+
 test('P1检测失败不遍历全局PATH，UNC/映射盘/超长PATH不引入同步FS', () => {
   const own = path.resolve(os.tmpdir(), 'hermes-health-owned-presence')
   for (const PATH of ['\\\\offline\\share;Z:\\remote', 'relative;' + 'x'.repeat(100000)]) {
@@ -168,7 +215,7 @@ test('PATH空段/相对目录/重复键都不确认缺失，版本前缀规范�
     assert.equal(fn('hermesDetectionState')({ ok: false }, presence(home, sourceDir, { PATH })).installed, null, '没有真实spawn缺失收据仍未知')
   }
   assert.equal(presence(home, sourceDir, { PATH: root, Path: root }), false)
-  assert.equal(fn('hermesDetectionState')({ ok: true, stdout: 'Hermes V0.22.2' }, true).version, '0.22.2')
+  assert.equal(fn('hermesDetectionState')({ ok: true, stdout: 'V0.22.2' }, true).version, '0.22.2')
 })
 
 function actualEngine(api) {

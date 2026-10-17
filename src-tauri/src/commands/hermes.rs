@@ -1906,9 +1906,29 @@ fn hermes_cli_presence_at(home: &Path, source: &Path) -> Result<bool, String> {
 
 fn hermes_detection_state(version: Result<String, String>, present: Result<bool, String>) -> Value {
     if let Ok(raw) = &version {
-        let pattern = regex::Regex::new(r"(?i)^v?\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$")
-            .expect("static version pattern");
-        if let Some(token) = raw.split_whitespace().find(|s| pattern.is_match(s)) {
+        let raw = raw.trim();
+        let release = r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?";
+        let hex = "[a-f0-9]{7,40}";
+        // 与Web同固定官方首行契约；不从Python/SDK等后续正文采版本。
+        let dated = format!(
+            r" \([0-9]{{4}}\.[0-9]{{1,2}}\.[0-9]{{1,2}}\)(?: · (?:(?:stable|canary)(?: · local {hex})?|upstream {hex}(?: · local {hex} \(\+[1-9][0-9]* carried commits?\))?))?"
+        );
+        let desktop = format!(" · (?:stable|canary|installer|commit-build · {hex})");
+        let bare = regex::Regex::new(&format!(r"(?i)^v?({release})$")).expect("固定裸版本模式");
+        let header = regex::Regex::new(&format!(
+            "^Hermes Agent v({release})(?:{dated}|{desktop})?$"
+        ))
+        .expect("固定官方版本首行模式");
+        let marker = regex::Regex::new(r"(?i)^\s*Hermes Agent\b").expect("固定版本标题模式");
+        let token = bare.captures(raw).or_else(|| {
+            if raw.lines().filter(|line| marker.is_match(line)).count() == 1 {
+                header.captures(raw.lines().next().unwrap_or(""))
+            } else {
+                None
+            }
+        });
+        if let Some(captures) = token {
+            let token = captures.get(1).expect("固定版本捕获组").as_str();
             // 复用状态输出redactor的key模式；拒绝污染token，不公开改写后的伪版本。
             let credential = regex::Regex::new(r"\bsk-[a-zA-Z0-9_-]+").expect("固定脱敏模式");
             if token.len() <= 128 && !credential.is_match(token) {
@@ -27893,6 +27913,75 @@ mod hermes_provider_sync_tests {
 #[cfg(test)]
 mod health_detection_regression {
     use super::*;
+    #[test]
+    fn python_release_is_not_hermes_release() {
+        let state = hermes_detection_state(Ok("Python: 3.14.7".into()), Ok(true));
+        assert!(state["installed"].is_null());
+        assert!(state["version"].is_null());
+        assert_eq!(state["detectionError"], "CLI_PROBE_FAILED");
+    }
+    #[test]
+    fn sdk_release_is_not_hermes_release() {
+        let state = hermes_detection_state(Ok("OpenAI SDK: 2.38.0".into()), Ok(true));
+        assert!(state["installed"].is_null());
+        assert!(state["version"].is_null());
+        assert_eq!(state["detectionError"], "CLI_PROBE_FAILED");
+    }
+    #[test]
+    fn unknown_hermes_header_cannot_borrow_dependency_release() {
+        let state = hermes_detection_state(Ok("Hermes Agent vunknown\nInstall directory: <owned-fixture>\nPython: 3.14.7\nOpenAI SDK: 2.38.0".into()), Ok(true));
+        assert!(state["installed"].is_null());
+        assert!(state["version"].is_null());
+        assert_eq!(state["detectionError"], "CLI_PROBE_FAILED");
+    }
+    #[test]
+    fn canonical_header_or_single_bare_release_retains_real_metadata() {
+        for header in [
+            "Hermes Agent v0.22.2",
+            "Hermes Agent v0.22.2 (2026.9.24)",
+            "Hermes Agent v0.22.2 (2026.9.24) · stable · local d923a5eb487a",
+            "Hermes Agent v0.22.2 (2026.9.24) · upstream d923a5eb",
+            "Hermes Agent v0.22.2 (2026.9.24) · upstream d923a5eb · local a923a5eb (+1 carried commit)",
+            "Hermes Agent v0.22.2 · stable",
+            "Hermes Agent v0.22.2 · commit-build · d923a5eb487a",
+            "Hermes Agent v0.22.2 · installer",
+        ] {
+            let raw = format!("{header}\r\nInstall directory: <owned-fixture>\r\nInstall method: git\r\nPython: 3.14.7\r\nOpenAI SDK: 2.24.0\r\n");
+            let state = hermes_detection_state(Ok(raw), Ok(true));
+            assert_eq!(state["installed"], true, "{header}");
+            assert_eq!(state["version"], "0.22.2");
+        }
+        for raw in ["0.21.5", "v0.21.5", "V0.21.5", "0.22.2-rc.1"] {
+            let state = hermes_detection_state(Ok(raw.into()), Ok(true));
+            assert_eq!(state["installed"], true, "{raw}");
+            assert_eq!(state["version"], raw.trim_start_matches(['v', 'V']));
+        }
+    }
+    #[test]
+    fn ambiguous_or_unattributed_release_is_unknown() {
+        for raw in [
+            "Python: 3.14.7\n0.21.5".to_string(),
+            "0.21.5\nOpenAI SDK: 2.38.0".to_string(),
+            "wrapper 0.21.5".to_string(),
+            "Hermes Agent v0.22.2\nHermes Agent v0.22.2".to_string(),
+            "Hermes Agent v0.22.2\nHermes Agent v0.21.5".to_string(),
+            "Hermes Agent vunknown\nHermes Agent v0.22.2".to_string(),
+            "Hermes Agent v0.22.2 garbage".to_string(),
+            "Hermes V0.22.2".to_string(),
+            "Python: 3.14.7\nHermes Agent v0.22.2".to_string(),
+            "Hermes Agent v1.0.0-sk-ownedKey".to_string(),
+            "1.0.0-sk-ownedKey".to_string(),
+            format!("Hermes Agent v1.0.0+{}", "a".repeat(2000)),
+        ] {
+            let state = hermes_detection_state(Ok(raw.clone()), Ok(true));
+            assert!(
+                state["installed"].is_null(),
+                "{}",
+                &raw[..raw.len().min(100)]
+            );
+            assert!(state["version"].is_null());
+        }
+    }
     #[test]
     fn probe_failure_is_unknown_unless_cli_absence_is_confirmed() {
         let x = hermes_detection_state(Err("timeout secret".into()), Ok(true));
