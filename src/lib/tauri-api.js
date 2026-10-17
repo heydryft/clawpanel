@@ -111,11 +111,14 @@ function cachedInvoke(cmd, args = {}, ttl = CACHE_TTL) {
     return _inflight.get(key)
   }
   const p = invoke(cmd, args).then(val => {
-    _cache.set(key, { val, ts: Date.now() })
-    _inflight.delete(key)
+    // 失效后的旧请求仍交付原caller，但不能覆盖缓存或删除后来的请求。
+    if (_inflight.get(key) === p) {
+      _cache.set(key, { val, ts: Date.now() })
+      _inflight.delete(key)
+    }
     return val
   }).catch(err => {
-    _inflight.delete(key)
+    if (_inflight.get(key) === p) _inflight.delete(key)
     throw err
   })
   _inflight.set(key, p)

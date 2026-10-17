@@ -15,6 +15,15 @@ const deps=path.dirname(args.vite), pkg=JSON.parse(fs.readFileSync(path.join(roo
 const report={scope:'isolated real headless page + fake loopback API; not real Hermes qualification',scenario:args.scenario||'round-trip',node:process.version,source:root,chatSha256:createHash('sha256').update(fs.readFileSync(path.join(root,'src/engines/hermes/pages/chat.js'))).digest('hex'),storeSha256:createHash('sha256').update(fs.readFileSync(path.join(root,'src/engines/hermes/lib/chat-store.js'))).digest('hex'),harnessSha256:createHash('sha256').update(fs.readFileSync(fileURLToPath(import.meta.url))).digest('hex'),fakeGatewayAlwaysRunning:true,requests:[],steps:[],errors:[],external:[]}
 let browser, context, server, page, profile='default', model='model-A', hold=true, pending=[], stream, turn=0
 const saved=[]
+const cachePending=[],cacheWaiters=[]
+function waitCacheRequests(count){
+ if(cachePending.length>=count)return Promise.resolve()
+ return new Promise((resolve,reject)=>{const row={count,resolve:()=>{clearTimeout(timer);resolve()}},timer=setTimeout(()=>reject(new Error('owned HTTP request barrier timeout')),30000);cacheWaiters.push(row)})
+}
+function releaseCache(index,marker,error=false){
+ const row=cachePending[index];assert.ok(row&&!row.served);row.served=true;row.record.response={status:error?500:200,marker,error}
+ row.res.statusCode=error?500:200;row.res.setHeader('Content-Type','application/json');row.res.end(JSON.stringify(error?{error:marker}:{...data('check_hermes',{}),cacheMarker:marker}))
+}
 function data(cmd,body){
  switch(cmd){
  case 'health':return {ok:true,backendVersion:pkg.version,apiContractVersion:1}
@@ -122,12 +131,49 @@ async function attachmentBoundaryScenario(){
  assert.ok(report.readerEvidence.selections.every(x=>x.completed&&!x.error))
 }
 
+async function cacheBoundaryScenario(){
+ report.cacheScope='actual public tauri-api module in own headless browser + response-barrier HTTP; not Hermes/runtime/VM qualification'
+ report.tauriApiSha256=createHash('sha256').update(fs.readFileSync(path.join(root,'src/lib/tauri-api.js'))).digest('hex');report.cacheCases=[]
+ await page.waitForFunction(()=>window.__cacheModule)
+ for(const variant of ['old-success-before-new','old-error-before-new','old-success-after-new','old-error-after-new','normal-dedupe-cache']){
+  const start=cachePending.length,before=variant.includes('-before-'),oldError=variant.includes('-error-'),normal=variant==='normal-dedupe-cache',oldMarker=variant+':OLD',current=variant+':CURRENT',errorMarker=variant+':OLD_ERROR'
+  await page.evaluate(()=>{const m=window.__cacheModule;m.invalidate();const r=window.__cacheRace={states:{}};r.capture=(name,p)=>{r[name+'P']=p;p.then(value=>r.states[name]={ok:true,value},error=>r.states[name]={ok:false,error:error.message})};r.capture('old',m.api.checkHermes())})
+  await waitCacheRequests(start+1)
+  const oldNewSame=await page.evaluate(({normal,oldError})=>{const m=window.__cacheModule,r=window.__cacheRace;if(!normal){if(oldError)m.invalidate();else m.invalidate('check_hermes')}r.capture('new',m.api.checkHermes());return r.oldP===r.newP},{normal,oldError})
+  let probe
+  if(normal){releaseCache(start,current);await page.waitForFunction(()=>window.__cacheRace.states.old&&window.__cacheRace.states.new)}
+  else{
+   await waitCacheRequests(start+2)
+   if(before){releaseCache(start,oldError?errorMarker:oldMarker,oldError);await page.waitForFunction(()=>window.__cacheRace.states.old)}
+   else{releaseCache(start+1,current);await page.waitForFunction(()=>window.__cacheRace.states.new);releaseCache(start,oldError?errorMarker:oldMarker,oldError);await page.waitForFunction(()=>window.__cacheRace.states.old)}
+  }
+  probe=await page.evaluate(()=>{const r=window.__cacheRace;r.capture('third',window.__cacheModule.api.checkHermes());return {thirdIsNew:r.thirdP===r.newP,newPending:!r.states.new}})
+  // 原错误路径会发出第三次真实HTTP；保留它，不abort/重试或用测试兜底去重。
+  if(before&&oldError&&!probe.thirdIsNew)await waitCacheRequests(start+3)
+  if(before){releaseCache(start+1,current);for(let i=start+2;i<cachePending.length;i++)releaseCache(i,variant+':UNEXPECTED_EXTRA')}
+  await page.waitForFunction(()=>window.__cacheRace.states.old&&window.__cacheRace.states.new&&window.__cacheRace.states.third)
+  const observed=await page.evaluate(()=>window.__cacheRace.states)
+  const row={variant,before,oldError,normal,oldNewSame,probe,expectedOld:normal?current:oldError?errorMarker:oldMarker,expectedCurrent:current,requestCount:cachePending.length-start,observed};report.cacheCases.push(row);report.steps.push({label:'cache-'+variant,...row})
+  await page.evaluate(rows=>{document.querySelector('#owned-cache-evidence').textContent=JSON.stringify(rows,null,2)},report.cacheCases)
+ }
+ for(const row of report.cacheCases){
+  assert.equal(row.observed.old.ok,!row.oldError,row.variant+' original caller settle kind')
+  assert.equal(row.oldError?row.observed.old.error:row.observed.old.value.cacheMarker,row.expectedOld,row.variant+' original caller keeps own result')
+  assert.equal(row.observed.new.ok,true);assert.equal(row.observed.new.value.cacheMarker,row.expectedCurrent)
+  assert.equal(row.observed.third.ok,true);assert.equal(row.observed.third.value.cacheMarker,row.expectedCurrent,row.variant+' stale result must not overwrite current cache')
+  assert.equal(row.requestCount,row.normal?1:2,row.variant+' no additional HTTP')
+  if(row.normal)assert.equal(row.oldNewSame,true,'original inflight dedup remains')
+  if(row.before){assert.equal(row.probe.newPending,true);assert.equal(row.probe.thirdIsNew,true,row.variant+' old completion must not remove new inflight owner')}
+ }
+}
+
 try{
  server=await createServer({root,configFile:false,cacheDir:path.join(out,'vite-cache'),define:{__APP_VERSION__:JSON.stringify(pkg.version)},resolve:{alias:[...['@tauri-apps/api','@tauri-apps/plugin-shell','@tauri-apps/plugin-autostart','yaml'].map(find=>({find,replacement:path.join(deps,find)}))]},optimizeDeps:{noDiscovery:true,include:[]},server:{host:'127.0.0.1',port:0,hmr:false,fs:{allow:[root,deps]}},plugins:[{name:'owned-fake-api',configureServer(s){s.middlewares.use((req,res,next)=>{
-  const url=new URL(req.url,'http://127.0.0.1');if(!url.pathname.startsWith('/__api/'))return next()
+  const url=new URL(req.url,'http://127.0.0.1');if(args.scenario==='cache-inflight'&&url.pathname==='/__owned-cache'){res.setHeader('Content-Type','text/html');res.end('<!doctype html><meta charset="utf-8"><title>Owned cache boundary</title><h1>Owned cache HTTP boundary</h1><pre id="owned-cache-evidence"></pre><script type="module">import * as m from "/src/lib/tauri-api.js";window.__cacheModule=m;</script>');return}if(!url.pathname.startsWith('/__api/'))return next()
   const cmd=url.pathname.slice(7);let raw='';req.on('data',b=>{raw+=b;assert.ok(raw.length<65536)});req.on('end',()=>{
    const body=JSON.parse(raw||'{}');report.requests.push({cmd,body,profileAtReceive:profile,at:Date.now()})
    if(/install|uninstall|upgrade/.test(cmd)){report.errors.push('forbidden installer '+cmd);res.statusCode=500;return res.end('{}')}
+   if(args.scenario==='cache-inflight'&&cmd==='check_hermes'){const record=report.requests.at(-1);record.cacheOrdinal=cachePending.length;cachePending.push({res,record,served:false});for(let i=cacheWaiters.length-1;i>=0;i--)if(cachePending.length>=cacheWaiters[i].count)cacheWaiters.splice(i,1)[0].resolve();return}
    if(cmd==='hermes_agent_run_stream'){turn++;stream=res;res.setHeader('Content-Type','application/x-ndjson');res.write(JSON.stringify({event:'run.started',run_id:'own-'+turn})+'\n');saved.push({id:body.sessionId,profile,title:body.input,source:'cli',messages:[{role:'user',content:body.input}]});return}
    if(hold&&['hermes_sessions_list','hermes_profiles_list','check_hermes'].includes(cmd))pending.push({cmd,body,res});else respond(cmd,body,res)
   })
@@ -140,8 +186,10 @@ try{
  await context.addInitScript(()=>{window.__draftEvents=[];for(const event of ['input','focus','blur'])document.addEventListener(event,e=>{if(e.target.id==='hm-chat-input')window.__draftEvents.push({event,value:e.target.value,connected:e.target.isConnected,at:performance.now()})},true)})
  if(args.scenario?.startsWith('attachment-'))await context.addInitScript(installAttachmentBarrier)
  page=await context.newPage();page.on('pageerror',e=>report.errors.push(e.message))
- await page.goto(origin+'/#/h/chat',{waitUntil:'domcontentloaded',timeout:30000})
- if(args.scenario==='focus-gap'){
+ await page.goto(origin+(args.scenario==='cache-inflight'?'/__owned-cache':'/#/h/chat'),{waitUntil:'domcontentloaded',timeout:30000})
+ if(args.scenario==='cache-inflight'){
+  await cacheBoundaryScenario()
+ }else if(args.scenario==='focus-gap'){
   await page.locator('#hm-chat-input').waitFor({state:'visible',timeout:30000})
   await page.locator('#hm-chat-new-chat').click({timeout:30000})
   await page.locator('#hm-chat-input').focus()
@@ -184,6 +232,7 @@ try{
 }catch(e){report.passed=false;report.failure={message:e.message,stack:e.stack};if(page){await state('failure').catch(()=>{});await page.screenshot({path:path.join(out,'failure.png')}).catch(()=>{})}}
 finally{
  for(const x of pending){x.res.destroy()}pending=[];stream?.destroy()
+ for(const x of cachePending)if(!x.served)x.res.destroy()
  if(context)await context.tracing.stop({path:path.join(out,'trace.zip')});await context?.close();await browser?.close();await server?.close()
  report.cleanup={browserDisconnected:!browser?.isConnected(),loopbackServerClosed:!server?.httpServer?.listening,installerCalls:report.requests.filter(r=>/install|uninstall|upgrade/.test(r.cmd)).length}
  fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2)+'\n')
