@@ -9,15 +9,18 @@ const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => i
 for (const k of ['root', 'output', 'vite', 'playwright', 'browser']) assert.ok(args[k], k)
 const root = path.resolve(args.root), out = path.resolve(args.output), scenario = args.scenario || 'recovery'
 const consumer = /^consumer-(setup|services|about|dashboard)-(unknown|error|absent)$/.exec(scenario)
+const sendEntry = /^sendguard-(unknown|absent|down|config|healthy|active-controls)$/.exec(scenario)
 fs.mkdirSync(out, { recursive: true })
 const { createServer } = await import(pathToFileURL(path.join(args.vite, 'dist/node/index.js')))
 const { chromium } = await import(pathToFileURL(args.playwright))
 const deps = path.dirname(args.vite)
-const report = { scope: 'actual existing headless Chrome + owned HTTP fault inputs; not Hermes VM', scenario, node: process.version, sourceHashes: Object.fromEntries(['src/engines/hermes/index.js', 'src/engines/hermes/pages/chat.js', 'src/lib/tauri-api.js', 'tests/hermes-chat-health.e2e.mjs'].map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')])), requests: [], steps: [], errors: [], violations: [], external: [] }
-let server, browser, context, page, pending, profile = 'default', checks = 0
+const report = { scope: 'actual existing headless Chrome + owned HTTP fault inputs; not Hermes VM', scenario, node: process.version, sourceHashes: Object.fromEntries(['src/engines/hermes/index.js', 'src/engines/hermes/pages/chat.js', 'src/engines/hermes/lib/chat-store.js', 'src/lib/tauri-api.js', 'tests/hermes-chat-health.e2e.mjs'].map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')])), requests: [], steps: [], errors: [], violations: [], external: [] }
+let server, browser, context, page, pending, activeStream, profile = 'default', checks = 0
 const healthy = { installed: true, version: '0.22.2', configExists: true, gatewayRunning: true, model: 'own-model', detectionError: null }
-const fault = scenario === 'absent' ? { ...healthy, installed: false, version: null } : scenario === 'down' ? { ...healthy, gatewayRunning: false } : scenario === 'config' ? { ...healthy, configExists: false } : { ...healthy, installed: null, version: null, detectionError: 'Bearer ownedBearer sk-ownedKey password=ownedPassword', cmd: 'private argv ownedPassword', env: { PASSWORD: 'ownedPassword' } }
-const terminal = ['absent', 'down', 'config'].includes(scenario) ? fault : healthy
+const unknownFault = { ...healthy, installed: null, version: null, detectionError: 'Bearer ownedBearer sk-ownedKey password=ownedPassword', cmd: 'private argv ownedPassword', env: { PASSWORD: 'ownedPassword' } }
+const faultKind = sendEntry?.[1] || scenario
+const fault = faultKind === 'absent' ? { ...healthy, installed: false, version: null } : faultKind === 'down' ? { ...healthy, gatewayRunning: false } : faultKind === 'config' ? { ...healthy, configExists: false } : ['healthy', 'active-controls'].includes(faultKind) ? healthy : unknownFault
+const terminal = sendEntry ? faultKind === 'active-controls' ? unknownFault : healthy : ['absent', 'down', 'config'].includes(scenario) ? fault : healthy
 const chatHtml = `<!doctype html><html><head><meta charset="utf-8"></head><body><div id="mount"></div><script type="module">
 import '/src/style/variables.css';import '/src/style/reset.css';import '/src/style/components.css';import '/src/engines/hermes/style/hermes.css';
 import {initI18n} from '/src/lib/i18n.js';import engine from '/src/engines/hermes/index.js';import {render} from '/src/engines/hermes/pages/chat.js';import {getChatStore} from '/src/engines/hermes/lib/chat-store.js';
@@ -39,10 +42,80 @@ const defaults = (cmd, body) => ({
   hermes_sessions_list: [], hermes_session_detail: { messages: [] }, hermes_models_list: [],
 }[cmd] || {})
 async function state(label) {
-  const s = await page.evaluate(() => ({ route: location.href, input: document.querySelector('#hm-chat-input')?.value, disabled: document.querySelector('#hm-chat-send')?.disabled, banner: document.querySelector('.hm-chat-health-banner')?.textContent || '', profile: window.healthFixture?.store.state.activeProfile, subscriptions: window.healthFixture?.active.size, mounted: !!document.querySelector('#hm-chat-input') }))
+  const s = await page.evaluate(() => {
+    const input = document.querySelector('#hm-chat-input'), store = window.healthFixture?.store
+    return { route: location.href, input: input?.value, selection: input ? { start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection } : null, attachments: [...document.querySelectorAll('.hm-chat-attach-chip img')].map(i => ({ name: i.alt, dataUrl: i.src })), messageCount: store?.activeSession()?.messages.length, userMessages: store?.activeSession()?.messages.filter(m => m.role === 'user').map(m => ({ content: m.content, attachments: m.attachments?.map(a => ({ name: a.name, dataUrl: a.dataUrl })) })), disabled: document.querySelector('#hm-chat-send')?.disabled, banner: document.querySelector('.hm-chat-health-banner')?.textContent || '', profile: store?.state.activeProfile, subscriptions: window.healthFixture?.active.size, mounted: !!input }
+  })
   report.steps.push({ label, ...s }); return s
 }
 const expect = (ok, label) => { if (!ok) report.violations.push(label) }
+async function sendEntryScenario() {
+  const settle = () => page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))))
+  const sends = () => report.requests.filter(x => x.cmd === 'hermes_agent_run_stream')
+  const text = 'owned send guard 中文 café é Ω🙂'
+  await page.locator('#hm-chat-input').waitFor({ state: 'visible', timeout: 30000 })
+  await page.locator('#hm-chat-new-chat').click({ timeout: 30000 })
+  await page.locator('#hm-chat-input').fill(text)
+  expect((await state('initial-unknown')).disabled === true, 'initial unknown must not enable Send')
+  assert.ok(pending, 'actual chat initial check must be pending')
+  const bResponse = page.waitForResponse(r => r.url().endsWith('/__api/check_hermes') && r.status() === 200, { timeout: 30000 })
+  json(pending, fault); pending = null; await (await bResponse).finished(); await settle()
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  const image = path.join(out, 'owned-health-attachment.png'); fs.writeFileSync(image, png)
+  await page.locator('#hm-chat-attach-input').setInputFiles(image)
+  await page.waitForFunction(() => document.querySelectorAll('.hm-chat-attach-chip').length === 1, null, { timeout: 30000 })
+  await page.locator('#hm-chat-send').scrollIntoViewIfNeeded()
+  await page.locator('#hm-chat-input').evaluate(input => { input.focus(); input.setSelectionRange(6, 17, 'backward') })
+  const before = await state('B-before-keyboard'); const beforeSends = sends().length
+  const blocked = ['unknown', 'absent', 'down', 'config'].includes(sendEntry[1])
+  if (blocked) {
+    expect(before.disabled === true, 'B must disable Send')
+    await page.locator('#hm-chat-input').press('Enter')
+    await page.waitForFunction(() => window.healthFixture.store.state.streaming === false, null, { timeout: 30000 }); await settle()
+    const after = await state('B-after-real-Enter')
+    expect(sends().length === beforeSends, 'blocked Enter must issue zero actual HTTP sends')
+    expect(after.input === before.input, 'blocked Enter must preserve draft')
+    expect(JSON.stringify(after.attachments) === JSON.stringify(before.attachments), 'blocked Enter must preserve PNG attachments')
+    expect(JSON.stringify(after.selection) === JSON.stringify(before.selection), 'blocked Enter must preserve selected range and direction')
+    expect(after.messageCount === before.messageCount && JSON.stringify(after.userMessages) === JSON.stringify(before.userMessages), 'blocked Enter must not write user messages')
+    const box = await page.locator('#hm-chat-send').boundingBox(); assert.ok(box)
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2); await settle()
+    const afterButton = await state('B-after-real-disabled-button-click')
+    expect(sends().length === beforeSends, 'blocked button must issue zero actual HTTP sends')
+    expect(afterButton.input === before.input && JSON.stringify(afterButton.attachments) === JSON.stringify(before.attachments), 'blocked button must preserve composer')
+    expect(JSON.stringify(afterButton.selection) === JSON.stringify(before.selection), 'blocked button must preserve selected range')
+    expect(afterButton.messageCount === before.messageCount, 'blocked button must not write user messages')
+    // C只来自原15秒engine poll；不重填正文/附件、不改路由、不手动检测。
+    const cResponse = await page.waitForResponse(r => r.url().endsWith('/__api/check_hermes'), { timeout: 20000 }); await cResponse.finished(); await settle()
+    const c = await state('C-existing-poll-recovered')
+    expect(c.disabled === false, 'C must restore keyboard/button send')
+    expect(c.input === text && JSON.stringify(c.attachments) === JSON.stringify(before.attachments), 'C must retain unsent text and PNG without refill')
+    expect(c.route === before.route, 'C must not navigate')
+    expect(checks === 3, 'C must use only existing boot/chat/poll probes')
+    if (c.input !== text) return
+  }
+  await page.locator('#hm-chat-input').press('Enter')
+  if (sendEntry[1] === 'active-controls') {
+    await page.waitForFunction(() => window.healthFixture.store.state.pendingApproval?.runId === 'owned-health-run', null, { timeout: 30000 })
+    const cResponse = await page.waitForResponse(r => r.url().endsWith('/__api/check_hermes'), { timeout: 20000 }); await cResponse.finished(); await settle()
+    expect(/检测失败|detection failed/i.test((await state('C-unknown-during-task')).banner), 'health must actually become unknown during live task')
+    // 原页面未渲染审批按钮：仅检验真实公共store与HTTP，不冒充审批GUI资格。
+    await page.evaluate(() => window.healthFixture.store.respondApproval('once'))
+    expect(report.requests.filter(x => x.cmd === 'hermes_run_approval' && x.body.runId === 'owned-health-run' && x.body.choice === 'once').length === 1, 'unknown must not block existing approval API')
+    await page.locator('#hm-chat-stop').click({ timeout: 30000 })
+    await page.waitForFunction(() => window.healthFixture.store.state.streaming === false, null, { timeout: 30000 })
+    report.taskControlsScope = 'actual STOP UI/local abort and public-store approval HTTP; no rendered approval button or actual kernel STOP qualification'
+    expect(sends().length === 1, 'task controls must not replay user sends')
+  } else {
+    await page.waitForFunction(() => document.body.textContent.includes('owned health reply') && !window.healthFixture.store.state.streaming, null, { timeout: 30000 }); await settle()
+    const accepted = await state('accepted-real-Enter-once')
+    expect(sends().length === 1 && sends()[0].body.input === text, 'verified Enter must send exactly once with unchanged text')
+    expect(accepted.input === '' && accepted.attachments.length === 0, 'verified send clears only submitted composer')
+    expect(accepted.userMessages.length === 1 && accepted.userMessages[0].content === text && accepted.userMessages[0].attachments?.length === 1, 'accepted Enter must keep one user message with original PNG')
+    expect(accepted.userMessages[0]?.attachments?.[0]?.dataUrl === 'data:image/png;base64,' + png.toString('base64'), 'accepted message attachment bytes must match')
+    report.webAttachmentTransportObserved = Object.hasOwn(sends()[0]?.body || {}, 'attachments')
+  }
+}
 try {
   server = await createServer({ root, configFile: false, cacheDir: path.join(out, 'vite-cache'), define: { __APP_VERSION__: '"owned-health-fixture"' }, resolve: { alias: ['@tauri-apps/api', '@tauri-apps/plugin-shell', '@tauri-apps/plugin-autostart', 'yaml'].map(find => ({ find, replacement: path.join(deps, find) })) }, optimizeDeps: { noDiscovery: true, include: [] }, server: { host: '127.0.0.1', port: 0, hmr: false, fs: { allow: [root, deps] } }, plugins: [{ name: 'own-health-http', configureServer(s) { s.middlewares.use((req, res, next) => {
     const u = new URL(req.url, 'http://127.0.0.1')
@@ -63,7 +136,11 @@ try {
         return json(res, checks === 1 ? healthy : terminal)
       }
       if (cmd === 'hermes_profile_use') profile = body.name
-      if (cmd === 'hermes_agent_run_stream') { res.setHeader('content-type', 'application/x-ndjson'); return res.end(JSON.stringify({ event: 'run.completed', output: 'owned health reply' }) + '\n') }
+      if (cmd === 'hermes_agent_run_stream') {
+        res.setHeader('content-type', 'application/x-ndjson')
+        if (sendEntry?.[1] === 'active-controls') { activeStream = res; return res.write(JSON.stringify({ event: 'approval.request', run_id: 'owned-health-run', request_id: 'owned-health-approval', tool: 'owned-tool', choices: ['once', 'deny'] }) + '\n') }
+        return res.end(JSON.stringify({ event: 'run.completed', output: 'owned health reply' }) + '\n')
+      }
       json(res, defaults(cmd, body))
     })
   }) } }] })
@@ -98,7 +175,7 @@ try {
     for (const secret of ['ownedBearer', 'ownedKey', 'ownedPassword']) expect(!body.includes(secret), 'consumer must not render raw credential')
     expect(report.requests.every(x => !/^(install_hermes|update_hermes|uninstall_hermes|configure_hermes|hermes_gateway_action)$/.test(x.cmd)), 'consumer must not auto-write')
     report.consumer = { page: consumer[1], response: consumer[2], checks, enabledInstalls, setupLinks, textSha256: createHash('sha256').update(body).digest('hex') }
-  } else {
+  } else if (sendEntry) { await sendEntryScenario() } else {
   await page.locator('#hm-chat-input').waitFor({ state: 'visible', timeout: 30000 }); await page.locator('#hm-chat-new-chat').click({ timeout: 30000 })
   const text = 'owned health draft 中文 café é Ω🙂'; await page.locator('#hm-chat-input').fill(text)
   expect((await state('initial-unknown')).disabled === true, 'initial unknown must not enable Send')
@@ -126,5 +203,5 @@ try {
   await page.screenshot({ path: path.join(out, 'final.png') }); assert.deepEqual(report.errors, []); assert.deepEqual(report.external, []); assert.deepEqual(report.violations, [])
   report.passed = true
 } catch (e) { report.passed = false; report.failure = { message: e.message, stack: e.stack }; if (page) { await state('failure').catch(() => {}); await page.screenshot({ path: path.join(out, 'failure.png') }).catch(() => {}) } }
-finally { pending?.destroy(); await page?.evaluate(() => { window.healthFixture?.unmount(); window.healthFixture?.engine.cleanup() }).catch(() => {}); if (context) await context.tracing.stop({ path: path.join(out, 'trace.zip') }); await context?.close(); await browser?.close(); await server?.close(); report.cleanup = { browserDisconnected: !browser?.isConnected(), serverClosed: !server?.httpServer?.listening, forbiddenWrites: report.requests.filter(x => /install|uninstall|upgrade/.test(x.cmd)).length }; fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2) + '\n') }
+finally { pending?.destroy(); activeStream?.destroy(); await page?.evaluate(() => { window.healthFixture?.unmount(); window.healthFixture?.engine.cleanup() }).catch(() => {}); if (context) await context.tracing.stop({ path: path.join(out, 'trace.zip') }); await context?.close(); await browser?.close(); await server?.close(); report.cleanup = { browserDisconnected: !browser?.isConnected(), serverClosed: !server?.httpServer?.listening, forbiddenWrites: report.requests.filter(x => /install|uninstall|upgrade/.test(x.cmd)).length }; fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2) + '\n') }
 console.log(JSON.stringify({ passed: report.passed, violations: report.violations, checks, steps: report.steps, output: out }, null, 2)); process.exitCode = report.passed ? 0 : 1

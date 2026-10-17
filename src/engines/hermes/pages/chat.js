@@ -1454,6 +1454,8 @@ export function render() {
     }
 
     // Normal user message → start agent run.
+    // 键盘与按钮共用远程发送门禁；拒绝时不改正文、附件、选区或消息。
+    if (hermesInstalled !== true || healthConfigExists !== true || !gwOnline) return
     forceScrollBottom = true
     // Batch 3 §K: 在 resetInput 前先把 attachments 复制下来再清空
     const sendAttachments = pendingAttachments.slice()
