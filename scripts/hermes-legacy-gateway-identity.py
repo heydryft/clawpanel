@@ -91,6 +91,8 @@ def _legacy_identity_base_physical(value, root, facts, *, slot):
         collector, resolver = globals().get('_runtime_facts'), globals().get('_legacy_managed_base_physical')
         _legacy_identity_require(all(type(fn) is types.FunctionType and fn.__globals__ is globals()
             for fn in (collector, resolver)), 'trusted entry runtime resolver unavailable')
+        if facts is None:
+            facts = _legacy_identity_runtime_facts()
         full = collector()
         keys = ('executable', 'prefix', 'base_executable', 'base_prefix', 'platform', 'os_name',
                 'native_machine', 'process_machine', 'bits', 'isolated', 'dont_write_bytecode')
@@ -185,8 +187,10 @@ def _install_legacy_gateway_identity(status, root, home, venv, base, launch_scri
             argv = process.cmdline()
             if argv[3:5] == ['-X', 'importtime']:
                 argv = argv[:3] + argv[5:]
+            # Windows redirector的argv0可为私有base；两处alias均重走既有完整fresh事实准入，通用守卫不变。
             if (argv[1:4] != ['-I', '-B', '-c'] or decode_clawpanel_private_script_bytes(argv[4], LEGACY_IDENTITY_PIN) != body or
-                _legacy_identity_physical(argv[0]) != venv or _legacy_identity_physical(process.exe()) != base or
+                _legacy_identity_base_physical(argv[0], root, None, slot='facts.base-executable') not in (venv, base) or
+                _legacy_identity_base_physical(process.exe(), root, None, slot='facts.base-executable') != base or
                 _legacy_identity_physical(argv[5]) != root or _legacy_identity_physical(argv[6]) != home or
                 argv[7:10] != [LEGACY_IDENTITY_PIN, 'console', '--'] or
                 _legacy_identity_physical(process.environ().get('HERMES_HOME', '')) != active):
