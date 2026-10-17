@@ -48,7 +48,10 @@ class IdentityAlias(scope['Alias']):
                 if self.pid != state['pid']: raise ProcessLookupError(pid)
                 self.birth = state['birth']
             def create_time(self): return self.birth
-            def exe(self): return state['exe']
+            def exe(self):
+                hook = state.get('before_exe')
+                if hook: hook()
+                return state['exe']
             def cmdline(self): return state['argv'][:]
             def environ(self): return state['env'].copy()
             def username(self):
@@ -204,7 +207,8 @@ class IdentityAlias(scope['Alias']):
                 self.assertTrue(match(record))
                 for field in ['create_time', 'script_sha256', 'pin']:
                     r = copy.deepcopy(record); r['clawpanel_legacy_identity'].pop(field); self.assertFalse(match(r), field)
-                for index, value in [(0, str(self.exe)), (4, wire+'\nprint(1)'), (5, str(self.home)), (6, str(self.root)), (7, '0'*40), (11, 'stop')]:
+                # canonical base现为合法redirector argv0；此处仍保留真正foreign argv0的原拒绝断言。
+                for index, value in [(0, str(self.store/'foreign.exe')), (4, wire+'\nprint(1)'), (5, str(self.home)), (6, str(self.root)), (7, '0'*40), (11, 'stop')]:
                     self.target_process['argv'][index] = value; self.assertFalse(match(record), str(index)); self.target_process.update(copy.deepcopy(saved))
                 self.target_process['birth'] += 0.001; self.assertFalse(match(record)); self.target_process.update(copy.deepcopy(saved))
                 self.target_process['reused_late'] = True; self.assertFalse(match(record)); self.target_process.update(copy.deepcopy(saved))
@@ -252,9 +256,138 @@ class IdentityAlias(scope['Alias']):
                 finder.close(); sys.path[:] = saved_path; sys.meta_path[:] = saved_meta
 
 
+class GatewayExecutableAlias(IdentityAlias):
+    @contextlib.contextmanager
+    def live_match(self, active=None):
+        active = self.home if active is None else active
+        active.mkdir(parents=True, exist_ok=True)
+        os.environ['HERMES_HOME'] = str(active)
+        self.target_process['env']['HERMES_HOME'] = str(active)
+        self.status._get_process_hermes_home = lambda: active
+        with self.admission():
+            close = m.install_legacy_gateway_identity(self.root, self.home, wire)
+            try:
+                record = self.status._build_pid_record()
+                self.assertEqual(record['clawpanel_legacy_identity']['script_sha256'], sample['bodySha256'])
+                yield record, lambda r=record: self.status._record_matches_live_gateway_pid(r, self.target_process['pid'], expected_home=active)
+            finally:
+                close()
+                self.assertIs(self.status._record_matches_live_gateway_pid, self.original)
+                self.assertIs(self.status._build_pid_record, self.factory)
+
+    def retarget_owned_alias(self, destination):
+        # 只操作setUp新建的精确junction；不递归删除目标，不接受外部目录。
+        self.assertEqual(self.alias.parent.resolve(), self.store.resolve())
+        self.assertTrue(destination.resolve().is_relative_to(Path(self.temp.name).resolve()))
+        if os.name == 'nt':
+            self.assertEqual(self.alias.lstat().st_reparse_tag, 0xa0000003)
+            os.rmdir(self.alias)
+            r = subprocess.run([os.environ.get('ComSpec', 'cmd.exe'), '/d', '/c', 'mklink', '/J', str(self.alias), str(destination)],
+                capture_output=True, timeout=5, creationflags=0x08000000)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        else:
+            self.alias.unlink(); self.alias.symlink_to(destination, target_is_directory=True)
+
+    def test_gateway_00_current_production_wire_accepts_redirector_executables(self):
+        original_facts = dict(self.facts); cases = []
+        for name in ['default', 'work']:
+            active = self.home if name == 'default' else self.home/'profiles'/name
+            self.target_process['argv'][10:] = ['gateway', 'run'] if name == 'default' else ['--profile', name, 'gateway', 'run']
+            with self.live_match(active) as (record, match):
+                for argv0, exe in [(self.root/'venv/Scripts/python.exe', self.exe), (self.root/'venv/Scripts/python.exe', self.alias/'python.exe'),
+                                   (self.exe, self.exe), (self.exe, self.alias/'python.exe'),
+                                   (self.alias/'python.exe', self.exe), (self.alias/'python.exe', self.alias/'python.exe')]:
+                    with self.subTest(profile=name, argv0=str(argv0), exe=str(exe)):
+                        self.target_process['argv'][0], self.target_process['exe'] = str(argv0), str(exe)
+                        self.assertTrue(match(), 'legal private redirector executable rejected')
+                        cases.append(dict(profile=name, argv0Role='venv' if argv0 == self.root/'venv/Scripts/python.exe' else 'base',
+                            argv0Alias=argv0 == self.alias/'python.exe', exeAlias=exe == self.alias/'python.exe'))
+        self.assertEqual(self.facts, original_facts)
+        with self.assertRaises(SystemExit): m._legacy_identity_physical(self.alias/'python.exe')
+        receipts.append(dict(case='gateway-current-wire-redirector-matrix', cases=cases, productionBodySha256=sample['bodySha256'],
+            nativeJunction=os.name == 'nt', rawFactsUnchanged=True, qualificationPass=False))
+
+    def test_gateway_each_alias_executable_uses_full_fresh_resolver_without_cache(self):
+        with self.live_match() as (_, match):
+            # 原纯物理路径不需要alias事实；已完成公开布局准入后，不应额外调用Windows alias探针。
+            with patch.object(m, '_legacy_identity_runtime_facts', side_effect=AssertionError('physical path must not query alias facts')):
+                self.assertTrue(match())
+            self.target_process['argv'][0] = self.target_process['exe'] = str(self.alias/'python.exe')
+            self.provider_calls.clear()
+            self.assertTrue(match())
+            self.assertEqual([x['slot'] for x in self.provider_calls], ['facts.base-executable'] * 2)
+            self.assertTrue(all(x['facts'] == self.facts for x in self.provider_calls))
+            for key in ['process_id', 'process_create_time_filetime_100ns', 'process_executable']:
+                changed = dict(self.facts); changed[key] = None
+                with self.subTest(key=key), patch.object(m, '_test_fresh_entry_facts', changed):
+                    self.assertFalse(match(), 'previous alias success must not hide missing fresh native facts')
+            self.assertTrue(match())
+        receipts.append(dict(case='gateway-fresh-executable-admission', exactSlots=2, cachedSuccess=False, qualificationPass=False))
+
+    def test_gateway_wrong_root_foreign_binary_or_junction_is_rejected(self):
+        with self.live_match() as (_, match):
+            self.assertTrue(match())
+            original = copy.deepcopy(self.target_process)
+            foreign = self.store/'owned-foreign'; foreign.mkdir(); (foreign/'python.exe').write_bytes(self.exe.read_bytes())
+            link = self.store/'foreign-junction'
+            if os.name == 'nt':
+                r = subprocess.run([os.environ.get('ComSpec', 'cmd.exe'), '/d', '/c', 'mklink', '/J', str(link), str(self.target)],
+                    capture_output=True, timeout=5, creationflags=0x08000000)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.addCleanup(lambda: os.rmdir(link) if os.path.lexists(link) else None)
+            else:
+                link.symlink_to(self.target, target_is_directory=True)
+            for field, value in [('argv0', str(foreign/'python.exe')), ('exe', str(foreign/'python.exe')),
+                                 ('argv0', str(link/'python.exe')), ('exe', str(link/'python.exe')), ('root', str(self.home))]:
+                with self.subTest(field=field, value=value):
+                    if field == 'argv0': self.target_process['argv'][0] = value
+                    elif field == 'exe': self.target_process['exe'] = value
+                    else: self.target_process['argv'][5] = value
+                    self.assertFalse(match())
+                    self.target_process.update(copy.deepcopy(original))
+
+    def test_gateway_venv_remains_invalid_as_live_base_executable(self):
+        with self.live_match() as (_, match):
+            self.assertTrue(match())
+            self.target_process['exe'] = str(self.root/'venv/Scripts/python.exe')
+            for argv0 in [self.root/'venv/Scripts/python.exe', self.exe, self.alias/'python.exe']:
+                self.target_process['argv'][0] = str(argv0)
+                self.assertFalse(match(), 'venv executable must not be accepted as native base image')
+
+    def test_gateway_late_real_alias_drift_between_executable_fields_rejects(self):
+        with self.live_match() as (_, match):
+            self.target_process['argv'][0] = self.target_process['exe'] = str(self.alias/'python.exe')
+            self.assertTrue(match())
+            foreign = self.store/'owned-late-foreign'; foreign.mkdir(); (foreign/'python.exe').write_bytes(self.exe.read_bytes())
+            calls = []
+            def drift():
+                if not calls:
+                    calls.append('before-exe'); self.retarget_owned_alias(foreign)
+            self.target_process['before_exe'] = drift
+            self.assertFalse(match())
+            self.assertEqual(calls, ['before-exe'])
+        receipts.append(dict(case='gateway-real-late-junction-drift', rejected=True, cachedSuccess=False, qualificationPass=False))
+
+    def test_gateway_current_body_digest_rejects_other_well_formed_wire(self):
+        with self.live_match() as (record, match):
+            self.assertTrue(match())
+            different = body + b'\n# different adapter body is not the current executed body\n'
+            payload = __import__('re').search(r"_cp_b\.b64decode\('([A-Za-z0-9+/=]+)',validate=True\)", wire)[1]
+            other_sha = hashlib.sha256(different).hexdigest()
+            other_wire = wire.replace(sample['bodySha256'], other_sha).replace(payload, base64.b64encode(zlib.compress(different, 9)).decode())
+            self.assertEqual(m.decode_clawpanel_private_script_bytes(other_wire, m.LEGACY_PIN), different)
+            self.target_process['argv'][4] = other_wire
+            self.assertFalse(match(record))
+            changed = copy.deepcopy(record); changed['clawpanel_legacy_identity']['script_sha256'] = other_sha
+            self.assertFalse(match(changed), 'matching older wire and record still must not bypass current body digest')
+
+
 result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(IdentityAlias))
+additional = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(
+    GatewayExecutableAlias(name) for name in sorted(GatewayExecutableAlias.__dict__) if name.startswith('test_gateway_')))
 report = dict(scope='real-owned-junction-composed-source-isolated-facts-not-Hermes-VM', testsRun=result.testsRun,
     failures=len(result.failures), errors=len(result.errors), skips=len(result.skipped), qualificationPass=False,
+    gatewayExecutable=dict(testsRun=additional.testsRun, failures=len(additional.failures), errors=len(additional.errors), skips=len(additional.skipped)),
     productionBodySha256=sample['bodySha256'], maxCompleteUtf16IncludingNul=max_utf16, receipts=receipts)
 output.write_text(json.dumps(report, indent=2)+'\n', encoding='utf-8')
-raise SystemExit(not result.wasSuccessful())
+raise SystemExit(not (result.wasSuccessful() and additional.wasSuccessful()))
