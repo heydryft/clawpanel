@@ -1233,7 +1233,8 @@ export function render() {
     attachBtn?.addEventListener('click', () => attachInput?.click())
     attachInput?.addEventListener('change', async (e) => {
       const files = Array.from(e.target.files || [])
-      for (const f of files) await addAttachmentFromFile(f)
+      const context = attachmentContext()
+      for (const f of files) await addAttachmentFromFile(f, context)
       e.target.value = ''  // reset 让用户能重选同一张图
     })
     // 移除附件
@@ -1261,19 +1262,21 @@ export function render() {
         e.preventDefault()
         dropZone.classList.remove('hm-chat-input-wrap--dragover')
         if (store.state.streaming) return
+        const context = attachmentContext()
         for (const f of e.dataTransfer.files || []) {
-          if (f.type.startsWith('image/')) await addAttachmentFromFile(f)
+          if (f.type.startsWith('image/')) await addAttachmentFromFile(f, context)
         }
       })
       // 粘贴图片
       dropZone.addEventListener('paste', async (e) => {
         if (store.state.streaming) return
+        const context = attachmentContext()
         const items = e.clipboardData?.items || []
         let handled = false
         for (const it of items) {
           if (it.kind === 'file' && it.type.startsWith('image/')) {
             const f = it.getAsFile()
-            if (f) { await addAttachmentFromFile(f); handled = true }
+            if (f) { await addAttachmentFromFile(f, context); handled = true }
           }
         }
         if (handled) e.preventDefault()
@@ -1443,8 +1446,17 @@ export function render() {
     })
   }
 
-  async function addAttachmentFromFile(file) {
-    if (!file) return
+  // 整个选择/拖放/粘贴批次固定原 profile 代次，旧批次后续文件也不迁入新 profile。
+  function attachmentContext() {
+    return { profile: store.state.activeProfile, generation: store.state.profileGeneration }
+  }
+
+  function isAttachmentContextCurrent(context) {
+    return context.profile === store.state.activeProfile && context.generation === store.state.profileGeneration
+  }
+
+  async function addAttachmentFromFile(file, context) {
+    if (!file || !isAttachmentContextCurrent(context)) return
     if (!file.type.startsWith('image/')) {
       toast(t('engine.chatAttachOnlyImage'), 'error')
       return
@@ -1459,6 +1471,7 @@ export function render() {
     }
     try {
       const data_base64 = await fileToBase64(file)
+      if (!isAttachmentContextCurrent(context)) return
       pendingAttachments.push({
         kind: 'image',
         mime: file.type,
@@ -1467,7 +1480,7 @@ export function render() {
       })
       draw()
     } catch (err) {
-      toast(t('engine.chatAttachReadFailed'), 'error')
+      if (isAttachmentContextCurrent(context)) toast(t('engine.chatAttachReadFailed'), 'error')
     }
   }
 
