@@ -151,6 +151,7 @@ export function render() {
     }
 
     const gwRunning = info?.gatewayRunning
+    const installUnknown = info?.installed !== true && info?.installed !== false
     const port = info?.gatewayPort || 8642
     const version = info?.version || '-'
     const modelName = formModel || hermesConfig?.model || health?.model || info?.model || ''
@@ -186,6 +187,7 @@ export function render() {
       </div>
 
       <!-- KPI grid: 5 cards with tone indicators -->
+      ${installUnknown ? `<div class="hm-chat-health-banner is-error" role="status">${esc(t('engine.hermesDetectionFailed'))}</div>` : ''}
       <div class="hm-kpi-grid">
         <div class="hm-kpi" data-tone="${gwRunning ? 'success' : 'error'}">
           <div class="hm-kpi-label">${t('engine.dashGatewayStatus')}</div>
@@ -805,14 +807,14 @@ export function render() {
 
   async function refresh() {
     try {
-      info = await api.checkHermes()
+      info = { ...await api.checkHermes() }
       if (info?.gatewayRunning) {
         try { health = await api.hermesHealthCheck() } catch (_) {}
       } else {
         health = null
       }
       try { hermesConfig = await api.hermesReadConfig() } catch (_) {}
-    } catch (_) {}
+    } catch (_) { info = { installed: null, gatewayRunning: null, detectionError: 'CLI_PROBE_FAILED' }; health = null }
     loading = false
     // 首次加载时用 hermesConfig 初始化表单
     if (!formInited && hermesConfig) {
@@ -878,11 +880,11 @@ export function render() {
       try {
         const newInfo = await api.checkHermes()
         if (newInfo && info) {
-          const changed = newInfo.gatewayRunning !== info.gatewayRunning
-          info = newInfo
+          const changed = newInfo.gatewayRunning !== info.gatewayRunning || newInfo.installed !== info.installed || newInfo.detectionError !== info.detectionError
+          info = { ...newInfo }
           if (changed) draw()
         }
-      } catch (_) {}
+      } catch (_) { info = { installed: null, gatewayRunning: null, detectionError: 'CLI_PROBE_FAILED' }; health = null; draw() }
     }, 15000)
   }
   setupListeners()

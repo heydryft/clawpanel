@@ -355,6 +355,10 @@ export default {
   chatGatewayOfflineShort: _('离线', 'Offline', '離線'),
   chatGatewayOnlineShort: _('在线', 'Online', '線上'),
   // 健康检查 banner（聊天页顶部）
+  hermesDetectionFailed: _('Hermes 状态检测失败，安装状态未知。请重新检测。', 'Hermes status detection failed; installation state is unknown. Check again.'),
+  chatHealthDetectionFailed: _('Hermes 检测失败。请查看仪表盘；后续状态检测成功后自动恢复。', 'Hermes detection failed. Check the dashboard; chat recovers after the next successful status check.'),
+  chatHealthConfigMissing: _('Hermes 尚未完成配置，请先完成设置。', 'Hermes configuration is incomplete. Finish setup first.'),
+  chatHealthChecking: _('正在检测 Hermes 状态…', 'Checking Hermes status…'),
   chatHealthInstallMissing: _(
     '未检测到 Hermes Agent 安装。请在仪表盘完成安装后再开始对话。',
     'Hermes Agent is not installed. Please complete installation on the dashboard before chatting.',

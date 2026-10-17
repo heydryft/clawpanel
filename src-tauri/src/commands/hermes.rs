@@ -1577,6 +1577,34 @@ fn run_at_path(program: &str, args: &[&str], path: &str) -> Result<String, Strin
     }
 }
 
+fn run_at_path_observed(
+    program: &str,
+    args: &[&str],
+    path: &str,
+    missing: &mut bool,
+) -> Result<String, String> {
+    *missing = false;
+    let mut cmd = if program == "hermes" {
+        hermes_command()?
+    } else {
+        Command::new(command_program(program)?)
+    };
+    cmd.args(args);
+    apply_hermes_runtime_env(&mut cmd, path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let bare_cli = cmd.get_program() == std::ffi::OsStr::new("hermes");
+    let output = cmd.output().map_err(|e| {
+        *missing = bare_cli && e.kind() == std::io::ErrorKind::NotFound;
+        format!("{program}: {e}")
+    })?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 fn hermes_version_at_path(path: &str) -> Result<String, String> {
     if HERMES_STABLE_VERSION == "0.22.2" {
         if let Some(environment) = hermes_pm_environment_at(&hermes_home(), &hermes_source_dir())? {
@@ -1612,6 +1640,45 @@ fn hermes_version_at_path(path: &str) -> Result<String, String> {
     // 新版 metadata 入口不运行 source completion；旧子命令只作失败回退。
     run_at_path("hermes", &["--version"], path)
         .or_else(|_| run_at_path("hermes", &["version"], path))
+}
+
+fn hermes_version_observed_at_path(path: &str, missing: &mut bool) -> Result<String, String> {
+    *missing = false;
+    if HERMES_STABLE_VERSION == "0.22.2" {
+        if let Some(environment) = hermes_pm_environment_at(&hermes_home(), &hermes_source_dir())? {
+            let python = if cfg!(target_os = "windows") {
+                environment.join("Scripts").join("python.exe")
+            } else {
+                environment.join("bin").join("python3")
+            };
+            let script = HERMES_PM_RUNTIME_SOURCE
+                .split_once("export const HERMES_PRIVATE_METADATA_SCRIPT = String.raw`")
+                .and_then(|(_, source)| source.split_once('`'))
+                .map(|(script, _)| script)
+                .ok_or("Hermes 共享 metadata 脚本缺失")?;
+            return run_at_path_observed(
+                &python.to_string_lossy(),
+                &[
+                    "-I",
+                    "-B",
+                    "-c",
+                    script,
+                    &hermes_source_dir().to_string_lossy(),
+                    HERMES_STABLE_COMMIT,
+                    if crate::commands::portable::portable_context().is_some() {
+                        "--portable"
+                    } else {
+                        "--managed"
+                    },
+                ],
+                path,
+                missing,
+            );
+        }
+    }
+    // 新版 metadata 入口不运行 source completion；旧子命令只作失败回退。
+    run_at_path_observed("hermes", &["--version"], path, missing)
+        .or_else(|_| run_at_path_observed("hermes", &["version"], path, missing))
 }
 
 /// 解析 Python 版本号 "Python X.Y.Z" → (X, Y, Z)
@@ -1796,9 +1863,68 @@ fn current_platform_key() -> &'static str {
 // check_hermes — 检测 Hermes Agent 安装状态
 // ---------------------------------------------------------------------------
 
+// 只读取候选文件存在性；不追加where/which或第二次CLI探测。
+fn hermes_cli_presence_at(home: &Path, source: &Path) -> Result<bool, String> {
+    for p in [home, source] {
+        let raw = p.to_string_lossy();
+        if !p.is_absolute() || raw.len() > 4096 || raw.starts_with(r"\\") || raw.starts_with("//") {
+            return Err("nonlocal private path unknown".into());
+        }
+    }
+    let exists = |p: &Path| -> Result<bool, String> {
+        match std::fs::symlink_metadata(p) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err("presence unknown".into()),
+        }
+    };
+    if exists(source)? {
+        return Ok(true);
+    }
+    // 与原卸载保留历史的契约一致；正常历史目录不代表当前CLI存在。
+    match std::fs::symlink_metadata(home.join("installs")) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+            return Err("private history unknown".into())
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err("private history unknown".into())
+        }
+        _ => {}
+    }
+    match std::fs::symlink_metadata(home) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+            return Err("private home unknown".into())
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err("private home unknown".into())
+        }
+        _ => {}
+    }
+    // 不访问全局PATH：缺失证明来自原实际spawn的结构化NotFound。
+    Ok(false)
+}
+
+fn hermes_detection_state(version: Result<String, String>, present: Result<bool, String>) -> Value {
+    if let Ok(raw) = &version {
+        let pattern = regex::Regex::new(r"(?i)^v?\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$")
+            .expect("static version pattern");
+        if let Some(token) = raw.split_whitespace().find(|s| pattern.is_match(s)) {
+            // 复用状态输出redactor的key模式；拒绝污染token，不公开改写后的伪版本。
+            let credential = regex::Regex::new(r"\bsk-[a-zA-Z0-9_-]+").expect("固定脱敏模式");
+            if token.len() <= 128 && !credential.is_match(token) {
+                return serde_json::json!({"installed": true, "version": token.trim_start_matches(['v', 'V']), "detectionError": null});
+            }
+        }
+    } else if matches!(present, Ok(false)) {
+        return serde_json::json!({"installed": false, "version": null, "detectionError": null});
+    }
+    // 仅固定错误代码，不向事件/界面传播子进程输出及私有路径。
+    serde_json::json!({"installed": null, "version": null, "detectionError": "CLI_PROBE_FAILED"})
+}
+
 #[tauri::command]
 pub fn check_hermes() -> Result<Value, String> {
-    hermes_pm_environment_at(&hermes_home(), &hermes_source_dir())?;
+    let layout = hermes_pm_environment_at(&hermes_home(), &hermes_source_dir());
     let enhanced = hermes_enhanced_path();
     let mut result = serde_json::Map::new();
     let home = hermes_home();
@@ -1853,36 +1979,29 @@ pub fn check_hermes() -> Result<Value, String> {
         result.insert("portable".into(), Value::Bool(false));
     }
 
-    // 1. 检测 hermes CLI
-    let hermes_version = hermes_version_at_path(&enhanced);
-
-    match hermes_version {
-        Ok(ver_raw) => {
-            // 提取版本号（格式可能是 "Hermes Agent v0.8.0" 或 "0.8.0"）
-            let version = ver_raw
-                .split_whitespace()
-                .find(|s| {
-                    s.starts_with('v') || s.chars().next().is_some_and(|c| c.is_ascii_digit())
-                })
-                .unwrap_or(&ver_raw)
-                .trim_start_matches('v')
-                .to_string();
-            result.insert("installed".into(), Value::Bool(true));
-            result.insert("version".into(), Value::String(version));
-
-            // 获取 hermes 路径
-            let path = find_executable_path("hermes", &enhanced);
-            result.insert(
-                "path".into(),
-                path.map(Value::String).unwrap_or(Value::Null),
-            );
-        }
-        Err(_) => {
-            result.insert("installed".into(), Value::Bool(false));
-            result.insert("version".into(), Value::Null);
-            result.insert("path".into(), Value::Null);
-        }
+    // 原PM准入失败仍禁止CLI执行；仅将只读检测投影为unknown，不绕过guard。
+    let mut cli_missing = false;
+    let hermes_version =
+        layout.and_then(|_| hermes_version_observed_at_path(&enhanced, &mut cli_missing));
+    let presence = if cli_missing {
+        hermes_cli_presence_at(&home, &hermes_source_dir())
+    } else {
+        Err("CLI absence not confirmed".into())
+    };
+    let state = hermes_detection_state(hermes_version, presence);
+    for key in ["installed", "version", "detectionError"] {
+        result.insert(key.into(), state[key].clone());
     }
+    result.insert(
+        "path".into(),
+        if state["installed"] == true {
+            find_executable_path("hermes", &enhanced)
+                .map(Value::String)
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        },
+    );
 
     // 2. 检测安装方式（managed）
     let managed = if let Ok(raw) = std::env::var("HERMES_MANAGED") {
@@ -27768,5 +27887,74 @@ mod hermes_provider_sync_tests {
         assert!(env.contains("ANTHROPIC_API_KEY=sk-ant"));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod health_detection_regression {
+    use super::*;
+    #[test]
+    fn probe_failure_is_unknown_unless_cli_absence_is_confirmed() {
+        let x = hermes_detection_state(Err("timeout secret".into()), Ok(true));
+        assert!(x["installed"].is_null());
+        assert_eq!(x["detectionError"], "CLI_PROBE_FAILED");
+        assert_eq!(
+            hermes_detection_state(Err("ENOENT".into()), Ok(false))["installed"],
+            false
+        );
+        assert!(
+            hermes_detection_state(Err("bad PM".into()), Err("permission".into()))["installed"]
+                .is_null()
+        );
+        assert_eq!(
+            hermes_detection_state(Ok("Hermes Agent v0.22.2".into()), Ok(true))["version"],
+            "0.22.2"
+        );
+        assert!(hermes_detection_state(Ok("warning only".into()), Ok(true))["installed"].is_null());
+        assert!(!x.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn detection_never_publishes_raw_credentials() {
+        let raw = "Bearer ownedBearer sk-ownedKey password=ownedPassword".repeat(20000);
+        for version in [
+            Err(raw.clone()),
+            Ok(raw),
+            Ok("Hermes 1.0.0-sk-ownedKey".into()),
+            Ok(format!("1.0.0+{}", "a".repeat(2000))),
+        ] {
+            let state = hermes_detection_state(version, Ok(true));
+            assert!(state["installed"].is_null());
+            assert!(state["detectionError"].as_str().unwrap().len() <= 160);
+            let wire = state.to_string();
+            for secret in ["ownedBearer", "ownedKey", "ownedPassword", "argv", "env"] {
+                assert!(!wire.contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn presence_preserves_uninstall_history_but_rejects_broken_layout() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("hermes-health-owned-{}-{id}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let home = root.join("home");
+        let source = home.join("hermes-agent");
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir_all(home.join("installs")).unwrap();
+        assert_eq!(hermes_cli_presence_at(&home, &source), Ok(false));
+        std::fs::write(&source, "broken current source").unwrap();
+        assert_eq!(hermes_cli_presence_at(&home, &source), Ok(true));
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_dir(home.join("installs")).unwrap();
+        std::fs::write(home.join("installs"), "broken history directory").unwrap();
+        assert!(hermes_cli_presence_at(&home, &source).is_err());
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

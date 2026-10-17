@@ -21,6 +21,7 @@ import { showConfirm } from '../../../components/modal.js'
 import { getChatStore, getSourceLabel } from '../lib/chat-store.js'
 import { svgIcon } from '../lib/svg-icons.js'
 import { t } from '../../../lib/i18n.js'
+import hermesEngine, { projectHermesHealth, healthObservationApplies } from '../index.js'
 
 // ----------------------------------------------------------- helpers
 
@@ -290,6 +291,13 @@ export function render() {
   let gatewayStarting = false
   // null = 仍在加载首次 check，先不显示 banner 防首屏闪烁
   let hermesInstalled = null
+  let healthConfigExists = null
+  let healthError = null
+  let healthDisposed = false
+  let healthScopeSince = performance.now()
+  let healthLastApplied = -Infinity
+  let healthProfile = store.state.activeProfile || 'default'
+  let healthGeneration = store.state.profileGeneration
   let currentModel = ''
   const mobileQuery = window.matchMedia('(max-width: 720px)')
 
@@ -328,15 +336,33 @@ export function render() {
   // 强制刷新安装/Gateway 状态缓存，避免用户刚在仪表盘启动 Gateway 后
   // 进聊天页看到 30s 过期的「未启动」误判。
   invalidate('check_hermes')
+  const healthRequestStarted = performance.now()
+  const healthRequestGeneration = store.state.profileGeneration
+  function syncHealthScope() {
+    const profile = store.state.activeProfile || 'default'
+    if (healthProfile === profile && healthGeneration === store.state.profileGeneration) return
+    healthProfile = profile; healthGeneration = store.state.profileGeneration
+    healthScopeSince = performance.now(); healthLastApplied = -Infinity
+    hermesInstalled = null; healthConfigExists = null; healthError = null; gwOnline = false; currentModel = ''
+  }
+  function applyHealth(info, startedAt, observedGeneration) {
+    syncHealthScope()
+    if (!healthObservationApplies(startedAt, healthScopeSince, healthLastApplied, healthDisposed, observedGeneration, observedGeneration === undefined ? undefined : store.state.profileGeneration)) return
+    healthLastApplied = startedAt
+    const health = projectHermesHealth(info)
+    hermesInstalled = health.installed
+    healthConfigExists = health.configExists
+    gwOnline = health.gatewayRunning === true
+    healthError = health.detectionError
+    draw()
+  }
+  const unsubscribeHealth = hermesEngine.onStateChange(event => applyHealth(event.info, event.startedAt))
   api.checkHermes().then(info => {
-    hermesInstalled = !!info?.installed
-    gwOnline = !!info?.gatewayRunning
-    currentModel = info?.model || ''
-    draw()
+    syncHealthScope()
+    if (healthObservationApplies(healthRequestStarted, healthScopeSince, healthLastApplied, healthDisposed, healthRequestGeneration, store.state.profileGeneration)) currentModel = info?.model || ''
+    applyHealth(info, healthRequestStarted, healthRequestGeneration)
   }).catch(() => {
-    hermesInstalled = false
-    gwOnline = false
-    draw()
+    applyHealth({ installed: null, detectionError: 'CLI_PROBE_FAILED' }, healthRequestStarted, healthRequestGeneration)
   })
 
   // ----------------------------------------------------------- subscription
@@ -653,7 +679,7 @@ export function render() {
 
   function updateSendButton() {
     const button = el.querySelector('#hm-chat-send')
-    if (button) button.disabled = !store.activeSession() || (!inputValue.trim() && !pendingAttachments.length) || hermesInstalled === false || !gwOnline || store.state.streaming
+    if (button) button.disabled = !store.activeSession() || (!inputValue.trim() && !pendingAttachments.length) || hermesInstalled !== true || healthConfigExists !== true || !gwOnline || store.state.streaming
   }
 
   function renderInput() {
@@ -725,8 +751,8 @@ export function render() {
                    ${ICONS.stop}
                  </button>`
               : `<button class="hm-chat-send-btn" id="hm-chat-send"
-                         ${(!active || (!inputValue.trim() && !pendingAttachments.length) || hermesInstalled === false || !gwOnline) ? 'disabled' : ''}
-                         title="${escHtml(hermesInstalled === false ? t('engine.chatHealthInstallMissing') : !gwOnline ? t('engine.chatHealthGatewayDown') : t('engine.chatSend'))}">
+                         ${(!active || (!inputValue.trim() && !pendingAttachments.length) || hermesInstalled !== true || healthConfigExists !== true || !gwOnline) ? 'disabled' : ''}
+                         title="${escHtml(hermesInstalled === null ? t(healthError ? 'engine.chatHealthDetectionFailed' : 'engine.chatHealthChecking') : hermesInstalled === false ? t('engine.chatHealthInstallMissing') : !gwOnline ? t('engine.chatHealthGatewayDown') : t('engine.chatSend'))}">
                    ${ICONS.send}
                  </button>`}
           </div>
@@ -784,7 +810,7 @@ export function render() {
   // 健康状态 banner：未装/未启动 → 在输入区上方显示警告和可执行操作。
   // 首次 fetch 完成前返回空字符串，避免首屏闪烁。
   function renderHealthBanner() {
-    if (hermesInstalled === null) return ''
+    if (hermesInstalled === null) return healthError ? `<div class="hm-chat-health-banner is-error" role="status"><span class="hm-chat-health-msg">${escHtml(t('engine.chatHealthDetectionFailed'))}</span><a class="hm-chat-health-action" href="#/h/dashboard">${escHtml(t('engine.chatHealthGoDashboard'))}</a></div>` : ''
     if (hermesInstalled === false) {
       return `
         <div class="hm-chat-health-banner is-error">
@@ -794,6 +820,7 @@ export function render() {
         </div>
       `
     }
+    if (healthConfigExists !== true) return `<div class="hm-chat-health-banner is-warn" role="status"><span class="hm-chat-health-msg">${escHtml(t('engine.chatHealthConfigMissing'))}</span><a class="hm-chat-health-action" href="#/h/setup">${escHtml(t('engine.chatHealthGoDashboard'))}</a></div>`
     if (!gwOnline) {
       return `
         <div class="hm-chat-health-banner is-warn">
@@ -813,6 +840,7 @@ export function render() {
 
   function draw() {
     const profile = store.state.activeProfile || 'default'
+    syncHealthScope()
     // innerHTML移除旧输入框会同步触发blur；先保存焦点，避免初始回包抢走正在输入的目标。
     const restoreInputFocus = inputFocused && inputProfile === profile
     if (inputProfile !== profile) {
@@ -894,22 +922,26 @@ export function render() {
 
   async function startGateway() {
     if (gatewayStarting) return
+    const actionProfile = store.state.profileGeneration
     gatewayStarting = true
     draw()
     try {
       await api.hermesGatewayAction('start')
+      if (healthDisposed || actionProfile !== store.state.profileGeneration) return
       invalidate('check_hermes')
-      const info = await api.checkHermes()
+      const startedAt = performance.now()
+      const info = await api.checkHermes().catch(() => ({ installed: null, detectionError: 'CLI_PROBE_FAILED' }))
+      if (healthDisposed || actionProfile !== store.state.profileGeneration) return
+      applyHealth(info, startedAt, actionProfile)
+      if (info?.installed !== true || info?.configExists !== true) return
       if (!info?.gatewayRunning) throw new Error(t('engine.gatewayStartFailed'))
-      hermesInstalled = !!info?.installed
-      gwOnline = true
       currentModel = info?.model || currentModel
       toast(t('engine.gatewayRunning', { port: info?.gatewayPort || 8642 }), 'success')
     } catch (e) {
       toast(humanizeError(e, t('engine.gatewayStartFailed')), 'error')
     } finally {
       gatewayStarting = false
-      draw()
+      if (!healthDisposed) draw()
     }
   }
 
@@ -1407,7 +1439,7 @@ export function render() {
           `- ${t('engine.chatSlashModel')}: \`${model}\``,
         ].join('\n'))
       } catch (e) {
-        store.pushLocalAssistant('⚠️ ' + (e?.message || e))
+        store.pushLocalAssistant('⚠️ ' + t('engine.hermesDetectionFailed'))
       }
       resetInput(); draw(); return
     }
@@ -1672,6 +1704,9 @@ export function render() {
   // MutationObserver watches our parent; when `el` is detached, we run the
   // full teardown (stream listeners, subscription, search modal, keydown).
   const teardown = () => {
+    if (healthDisposed) return
+    healthDisposed = true
+    unsubscribeHealth()
     document.removeEventListener('keydown', onGlobalKey)
     document.removeEventListener('click', onGlobalClick)
     closeSearch()
@@ -1683,6 +1718,7 @@ export function render() {
   })
   requestAnimationFrame(() => {
     if (el.parentNode) mountObserver.observe(el.parentNode, { childList: true })
+    else teardown()
   })
 
   // Seed the initial draw (before store load resolves).

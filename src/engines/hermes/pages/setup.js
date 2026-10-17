@@ -142,13 +142,15 @@ export function render() {
       }
       // Hermes
       if (hermesInfo) {
-        if (hermesInfo.installed) {
+        if (hermesInfo.installed === true) {
           rows.push(`<div class="hermes-detect-row ok">${ICONS.check} <span>${t('engine.hermesFound', { version: hermesInfo.version })}</span></div>`)
           if (hermesInfo.gatewayRunning) {
             rows.push(`<div class="hermes-detect-row ok">${ICONS.check} <span>${t('engine.hermesReady')}</span></div>`)
           }
-        } else {
+        } else if (hermesInfo.installed === false) {
           rows.push(`<div class="hermes-detect-row">${ICONS.warn} <span>${t('engine.hermesNotFound')}</span></div>`)
+        } else {
+          rows.push(`<div class="hermes-detect-row warn" role="status">${ICONS.warn} <span>${t('engine.hermesDetectionFailed')}</span><button class="btn btn-secondary hermes-detect-retry">${t('common.retry')}</button></div>`)
         }
       }
     }
@@ -389,6 +391,7 @@ export function render() {
 
   // --- 事件绑定 ---
   function bind() {
+    el.querySelector('.hermes-detect-retry')?.addEventListener('click', detect)
     // 点击已完成的阶段指示器，跳回该步骤
     el.querySelectorAll('[data-goto-phase]').forEach(dot => {
       dot.addEventListener('click', () => {
@@ -503,6 +506,13 @@ export function render() {
       pyInfo = py
       hermesInfo = hm
 
+      // 未知不是缺失：保留检测页，重试仅由用户点击触发。
+      if (hm?.installed !== true && hm?.installed !== false) {
+        detectDone = false
+        draw()
+        return
+      }
+
       // 计算目标阶段
       let target
       if (hm.installed && hm.gatewayRunning) target = 'complete'
@@ -530,8 +540,10 @@ export function render() {
       phase = target
       draw()
     } catch (e) {
-      logs.push(`[detect error] ${e?.message || e}`)
-      phase = 'install'
+      hermesInfo = { installed: null, detectionError: 'CLI_PROBE_FAILED' }
+      logs.push(t('engine.hermesDetectionFailed'))
+      phase = 'detect'
+      detectDone = false
       draw()
     }
   }
@@ -567,6 +579,9 @@ export function render() {
   // --- 安装流程 ---
   async function doInstall() {
     if (installing) return
+    if (hermesInfo?.installed !== true && hermesInfo?.installed !== false) {
+      phase = 'detect'; draw(); return
+    }
     const pypiSel = el.querySelector('#hm-pypi-mirror')
     const pypiMirror = pypiSel?.value === 'custom'
       ? (el.querySelector('#hm-pypi-custom')?.value?.trim() || '')
@@ -789,7 +804,10 @@ export function render() {
   // --- 刷新 hermes 状态 ---
   async function refreshHermes() {
     invalidate('check_hermes')
-    try { hermesInfo = await api.checkHermes() } catch (_) {}
+    try { hermesInfo = await api.checkHermes() } catch (_) { hermesInfo = { installed: null, detectionError: 'CLI_PROBE_FAILED' } }
+    if (hermesInfo?.installed !== true && hermesInfo?.installed !== false) {
+      phase = 'detect'; detectDone = false; draw(); return
+    }
     // 已安装且 Gateway 在运行 → 更新引擎状态并跳转仪表盘
     if (hermesInfo?.installed && hermesInfo?.gatewayRunning) {
       phase = 'complete'

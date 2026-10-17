@@ -7,20 +7,46 @@ import { api, invalidate } from '../../lib/tauri-api.js'
 // Hermes 状态
 let _ready = false
 let _running = false
+let _installed = null
 let _listeners = []
 let _pollTimer = null
+let _probeSequence = 0
+
+// 仅广播独立、不可变的安装/服务primitive；不传播模型、路径、缓存对象或凭据。
+export function projectHermesHealth(info) {
+  const boolean = value => typeof value === 'boolean' ? value : null
+  const installed = boolean(info?.installed)
+  return Object.freeze({
+    installed, configExists: boolean(info?.configExists), gatewayRunning: boolean(info?.gatewayRunning),
+    version: installed === true && typeof info?.version === 'string' && info.version.length <= 128 && !/\bsk-[a-zA-Z0-9_-]+/.test(info.version) && /^\d+\.\d+\.\d+(?:[-+][a-z0-9.-]+)?$/i.test(info.version) ? info.version : null,
+    detectionError: installed === null && info ? 'CLI_PROBE_FAILED' : null,
+  })
+}
+
+export function healthObservationApplies(startedAt, scopeSince, lastApplied, disposed, observedGeneration, currentGeneration) {
+  return !disposed && Number.isFinite(startedAt) && startedAt >= scopeSince && startedAt >= lastApplied && observedGeneration === currentGeneration
+}
 
 async function detectHermesStatus() {
+  const sequence = ++_probeSequence, startedAt = performance.now()
+  let info
   try {
     invalidate('check_hermes')
-    const info = await api.checkHermes()
-    _ready = !!info?.installed && !!info?.configExists
-    _running = !!info?.gatewayRunning
+    info = await api.checkHermes()
+    if (sequence !== _probeSequence) return _ready
+    const health = projectHermesHealth(info)
+    _installed = health.installed
+    _ready = health.installed === true && health.configExists === true
+    _running = health.gatewayRunning === true
   } catch (_) {
+    if (sequence !== _probeSequence) return _ready
+    info = { installed: null, detectionError: 'CLI_PROBE_FAILED' }
+    _installed = null
     _ready = false
     _running = false
   }
-  _listeners.forEach(fn => { try { fn({ ready: _ready, running: _running }) } catch (_) {} })
+  // 同步抛错与异步拒绝分别隔离；不等待消费者，不触发额外状态查询。
+  _listeners.forEach(fn => { try { Promise.resolve(fn(Object.freeze({ ready: _ready, running: _running, startedAt, info: projectHermesHealth(info) }))).catch(() => {}) } catch (_) {} })
   return _ready
 }
 
@@ -41,7 +67,7 @@ export default {
 
   async detect() {
     await detectHermesStatus()
-    return { installed: _ready, ready: _ready }
+    return { installed: _installed, ready: _ready }
   },
 
   async boot() {
@@ -50,6 +76,7 @@ export default {
   },
 
   cleanup() {
+    _probeSequence++
     stopPoll()
   },
 

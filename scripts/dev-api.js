@@ -519,6 +519,8 @@ async function runHermesSilent(program, args) {
       killed: result.error.killed === true,
       // execFile 只有原 deadline / maxBuffer 会主动 kill；后者有独立错误 code。
       timedOut: result.error.killed === true && result.error.signal === 'SIGTERM' && result.error.code == null,
+      // 只接受原真实execFile的bare CLI NotFound；不解释stderr或私有解释器错误。
+      cliMissing: spec.program === 'hermes' && result.error.code === 'ENOENT',
     }
   } catch (e) {
     return { ok: false, stderr: String(e) }
@@ -552,6 +554,28 @@ export async function runHermesVersionSilent() {
   // 新版 metadata 入口不运行 source completion；旧子命令只作失败回退。
   const metadata = await runHermesSilent('hermes', ['--version'])
   return metadata.ok ? metadata : await runHermesSilent('hermes', ['version'])
+}
+
+// 只读存在证据，不用where/which追加CLI，也不把损坏布局当成未安装。
+export function hermesCliPresence(home, source) {
+  try {
+    if (![home, source].every(p => typeof p === 'string' && p.length <= 4096 && path.isAbsolute(p) && !/^(?:\\\\|\/\/)/.test(p))) return null
+    const exists = file => { try { fs.lstatSync(file); return true } catch (e) { if (e.code === 'ENOENT') return false; throw e } }
+    if (exists(source)) return true
+    // 卸载按原契约保留installs历史；目录本身不是当前CLI存在证据。
+    try { const stat = fs.lstatSync(path.join(home, 'installs')); if (stat.isSymbolicLink() || !stat.isDirectory()) return null } catch (e) { if (e.code !== 'ENOENT') throw e }
+    try { const stat = fs.lstatSync(home); if (stat.isSymbolicLink() || !stat.isDirectory()) return null } catch (e) { if (e.code !== 'ENOENT') throw e }
+    // 这里只核对固定受管布局；全局PATH由原spawn解析，绝不额外逐项stat。
+    return false
+  } catch { return null }
+}
+
+export function hermesDetectionState(probe, present) {
+  const token = probe.ok && String(probe.stdout || '').split(/\s+/).find(s => /^v?\d+\.\d+\.\d+(?:[-+][a-z0-9.-]+)?$/i.test(s))
+  if (token && token.length <= 128 && redactPluginOutput(token) === token) return { installed: true, version: token.replace(/^v/i, ''), detectionError: null }
+  if (!probe.ok && probe.cliMissing === true && present === false) return { installed: false, version: null, detectionError: null }
+  // 固定代码不包含CLI输出、HOME、私有脚本或凭据。
+  return { installed: null, version: null, detectionError: 'CLI_PROBE_FAILED' }
 }
 
 function parseHermesDashboardStatus(output) {
@@ -17209,13 +17233,11 @@ const handlers = {
     const result = {}
     // 1. 检测 hermes CLI
     const r = await runHermesVersionSilent()
-    if (r.ok) {
-      const verMatch = r.stdout.split(/\s+/).find(s => /^v?\d/.test(s)) || r.stdout
-      result.installed = true
-      result.version = verMatch.replace(/^v/, '')
+    Object.assign(result, hermesDetectionState(r, r.cliMissing === true ? hermesCliPresence(home, hermesSourceDir()) : null))
+    if (result.installed === true) {
       result.path = findCommandPath('hermes', buildHermesRuntimeEnv())
     } else {
-      result.installed = false; result.version = null; result.path = null
+      result.path = null
     }
     // 2. managed
     const managed = process.env.HERMES_MANAGED

@@ -182,7 +182,8 @@ export function render() {
     const installType = info?.portable
       ? t('engine.servicesInstallTypePortable')
       : (info?.managed || (info?.installed ? 'uv-tool' : t('engine.servicesUnknown')))
-    const installState = info?.installed ? t('engine.servicesInstalled') : t('engine.servicesMissing')
+    const installUnknown = info?.installed !== true && info?.installed !== false
+    const installState = installUnknown ? t('common.unknown') : info.installed ? t('engine.servicesInstalled') : t('engine.servicesMissing')
     const llmBaseUrl = config?.base_url || t('engine.servicesNotSet')
     const configModel = config?.model_raw || config?.model || info?.model || t('engine.dashNoModel')
     const targetLabel = targetMode === 'local'
@@ -223,9 +224,10 @@ export function render() {
       </div>
 
       <div class="hm-services-desc">${esc(t('engine.servicesDesc'))}</div>
+      ${installUnknown ? `<div class="hm-chat-health-banner is-error" role="status">${esc(t('engine.hermesDetectionFailed'))}</div>` : ''}
 
       <div class="hm-kpi-grid">
-        ${renderKpi(t('engine.servicesInstallState'), installState, `${t('engine.servicesInstallType')} · ${installType}`, info?.installed ? 'success' : 'error')}
+        ${renderKpi(t('engine.servicesInstallState'), installState, `${t('engine.servicesInstallType')} · ${installType}`, installUnknown ? 'warning' : info.installed ? 'success' : 'error')}
         ${renderKpi(t('engine.dashGatewayStatus'), gwRunning ? t('engine.dashRunning') : t('engine.dashStopped'), `:${port}`, gwRunning ? 'success' : 'error')}
         ${renderKpi(t('engine.dashModel'), model, provider, 'accent')}
         ${renderKpi(t('engine.dashConnectTarget'), targetLabel, gatewayUrl, 'info')}
@@ -377,7 +379,7 @@ export function render() {
         <div class="hm-panel-body">
           <div class="hm-services-action-grid">
             <button class="hm-btn hm-btn--primary hm-btn--sm hm-services-upgrade" ${maintenanceBusy || !info?.installed ? 'disabled' : ''}>${ICONS.upload}<span>${esc(t('engine.servicesUpgrade'))}</span></button>
-            <button class="hm-btn hm-btn--sm hm-services-install" ${maintenanceBusy ? 'disabled' : ''}>${ICONS.package}<span>${esc(info?.installed ? t('engine.servicesRepairInstall') : t('engine.servicesInstall'))}</span></button>
+            <button class="hm-btn hm-btn--sm hm-services-install" ${maintenanceBusy || installUnknown ? 'disabled' : ''}>${ICONS.package}<span>${esc(installUnknown ? t('common.unknown') : info.installed ? t('engine.servicesRepairInstall') : t('engine.servicesInstall'))}</span></button>
             <button class="hm-btn hm-btn--sm hm-services-uninstall" ${maintenanceBusy || !info?.installed ? 'disabled' : ''}>${ICONS.trash}<span>${esc(t('engine.servicesUninstall'))}</span></button>
             <button class="hm-btn hm-btn--danger hm-btn--sm hm-services-uninstall-clean" ${maintenanceBusy || !info?.installed ? 'disabled' : ''}>${ICONS.trash}<span>${esc(t('engine.servicesUninstallClean'))}</span></button>
           </div>
@@ -400,7 +402,7 @@ export function render() {
     }
     invalidate('check_hermes')
     try {
-      info = await api.checkHermes()
+      info = { ...await api.checkHermes() }
       if (info?.gatewayRunning) {
         try {
           health = await api.hermesHealthCheck()
@@ -418,7 +420,9 @@ export function render() {
       }
       syncTargetFromInfo()
     } catch (error) {
-      setPageMessage(stripError(error), 'error')
+      info = { installed: null, gatewayRunning: null, detectionError: 'CLI_PROBE_FAILED' }
+      health = null
+      setPageMessage(t('engine.hermesDetectionFailed'), 'error')
     } finally {
       loading = false
       refreshBusy = false
@@ -525,6 +529,7 @@ export function render() {
 
   async function runMaintenance(kind) {
     if (maintenanceBusy) return
+    if (info?.installed !== true && info?.installed !== false) return
 
     const confirmText = kind === 'install'
       ? (info?.installed ? t('engine.servicesConfirmRepairInstall') : t('engine.servicesConfirmInstall'))
@@ -619,7 +624,7 @@ export function render() {
       setPageMessage(result, 'success')
       invalidate('check_hermes')
       await refresh(false)
-      if (kind !== 'upgrade' && !info?.installed) {
+      if (kind !== 'upgrade' && info?.installed === false) {
         window.location.hash = '#/h/setup'
       }
     } catch (error) {

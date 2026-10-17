@@ -125,7 +125,8 @@ async function loadHermesData(page) {
     let panelUpdateHtml = `<span style="color:var(--text-tertiary)">${t('about.checkingUpdate')}</span>`
     checkNewVersion(cards, panelVersion)
 
-    const installed = !!hermesInfo?.installed
+    const installed = hermesInfo?.installed === true
+    const detectionUnknown = hermesInfo?.installed !== true && hermesInfo?.installed !== false
     const gwRunning = !!hermesInfo?.gatewayRunning
     const version = hermesInfo?.hermesVersion || hermesInfo?.version || ''
     const model = hermesInfo?.model || ''
@@ -145,13 +146,14 @@ async function loadHermesData(page) {
       </div>
       <div class="stat-card">
         <div class="stat-card-header"><span class="stat-card-label">Hermes Agent</span></div>
-        <div class="stat-card-value">${installed ? (version || t('about.installed')) : t('about.notInstalled')}</div>
+        <div class="stat-card-value">${detectionUnknown ? t('common.unknown') : installed ? (version || t('about.installed')) : t('about.notInstalled')}</div>
+        ${detectionUnknown ? `<div class="stat-card-meta" role="status">${t('engine.hermesDetectionFailed')}</div>` : ''}
         <div class="stat-card-meta" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           ${gwRunning
             ? `<span style="color:var(--success)">● Gateway ${t('engine.dashRunning')} · :${port}</span>`
             : `<span style="color:var(--text-tertiary)">○ Gateway ${t('engine.dashStopped')}</span>`}
           ${model ? `<span style="color:var(--text-secondary)">${t('engine.dashModel')}: ${esc(model)}</span>` : ''}
-          ${!installed ? `<a class="btn btn-primary btn-sm" href="#/h/setup" style="${btnSm}">${t('about.hermesSetup')}</a>` : ''}
+          ${hermesInfo?.installed === false ? `<a class="btn btn-primary btn-sm" href="#/h/setup" style="${btnSm}">${t('about.hermesSetup')}</a>` : ''}
           ${installed ? `
             <button class="btn btn-secondary btn-sm" id="btn-hermes-config" style="${btnSm}">${t('about.hermesConfig')}</button>
             <button class="btn btn-primary btn-sm" id="btn-hermes-services" style="${btnSm}">${t('engine.hermesServicesTitle')}</button>
