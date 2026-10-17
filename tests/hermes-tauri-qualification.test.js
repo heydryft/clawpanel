@@ -587,3 +587,115 @@ test('R9 child env提交收据清理三冲突键且非app实际env证据',async(
  const child=spawnSync(process.execPath,['-e',`const keys=${JSON.stringify(keys)};process.stdout.write(JSON.stringify(Object.fromEntries(keys.map(k=>[k,process.env[k]??null]))))`],{env,encoding:'utf8',windowsHide:true,timeout:10000});
  assert.equal(child.status,0,child.stderr);assert.deepEqual(JSON.parse(child.stdout),receipt.submitted);assert.deepEqual(parent,before);assert.deepEqual({...process.env},hostBefore);t.diagnostic(JSON.stringify({scope:'own Node child only; not actual driver/app/runtime env',receipt,childObserved:JSON.parse(child.stdout)}));
 });
+
+// 标记为source-derived：只用固定官方title合同生成native nonce/model，不是实际VM抓包。
+const nativeTitleFixture = JSON.parse(fs.readFileSync(new URL('./fixtures/hermes-title-contracts.json', import.meta.url), 'utf8'))
+const nativeTitleBody = (nonce, model = 'native-one') => {
+  const body = JSON.parse(nativeTitleFixture.rawCases[0].rawBody); body.messages[1].content = nonce; body.model = model; return body
+}
+const nativeChatBody = (nonce, model = 'native-one', stream = true, known = true) => ({ model, stream, messages: [...(known ? [{ role: 'system', content: 'You are Hermes, an AI assistant.' }] : []), { role: 'user', content: nonce }] })
+
+test('native标题source-derived：真实factory HTTP先chat后title，双pin模型且中文SSE不变', { timeout: 30000 }, async t => {
+  const { createNativeProvider } = await load(), observations = []
+  const out = process.env.HERMES_NATIVE_TITLE_EVIDENCE_DIR || fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hermes-native-title-'))
+  fs.mkdirSync(out, { recursive: true }); const proof = { scope: 'source-derived fixed-upstream title input + actual factory loopback HTTP; NOT native VM observation', observedNativeVM: false, upstream: nativeTitleFixture.upstream.map(({ pin, gitBlobSha1 }) => ({ pin, gitBlobSha1 })), observations }
+  try {
+    for (const pin of nativeTitleFixture.upstream.map(x => x.pin)) {
+      const report = { provider: [], metadata: [] }, server = await createNativeProvider({ report, runtimePin: pin })
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+      try {
+        for (const [i, model] of ['native-one', 'native-two'].entries()) {
+          const nonce = `native-acceptance-12345678-1234-1234-1234-123456789ab${i}`
+          const post = async body => { const raw = JSON.stringify(body), response = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, { method: 'POST', headers: { authorization: 'Bearer qualification-native-no-secret', 'content-type': 'application/json' }, body: raw, signal: AbortSignal.timeout(5000) }); return { status: response.status, text: await response.text(), rawSha256: crypto.createHash('sha256').update(raw).digest('hex') } }
+          const chat = await post(nativeChatBody(nonce, model)); assert.equal(chat.status, 200)
+          const text = `原生完整回复：${nonce}；模型：${model}。`
+          const expected = [{ role: 'assistant', content: '' }, { content: text }, {}].map(delta => 'data: ' + JSON.stringify({ id: 'native-qualification', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta, finish_reason: Object.keys(delta).length ? null : 'stop' }] }) + '\n\n').join('') + 'data: [DONE]\n\n'
+          assert.equal(chat.text, expected)
+          const title = await post(nativeTitleBody(nonce, model)); assert.equal(title.status, 200)
+          const envelope = JSON.parse(title.text), content = envelope.choices[0].message.content; assert.deepEqual(envelope.usage, { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 })
+          const row = { inputKind: 'source-derived-not-capture', runtimePinArgument: pin, model, nonce, titleRawSha256: title.rawSha256, content, providerRows: structuredClone(report.provider.filter(p => p.nonce === nonce)), nonTitle: report.provider.filter(p => !p.title && p.nonce === nonce && p.model === model).length, titles: report.provider.filter(p => p.title && p.nonce === nonce).length }
+          try { row.jsonTitle = JSON.parse(content) } catch (error) { row.parseError = String(error) }
+          observations.push(row)
+        }
+        assert.equal(report.providerError, undefined)
+      } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); assert.equal(server.listening, false) }
+    }
+    for (const row of observations) {
+      assert.equal(row.nonTitle, 1, '固定title不能被算为第二个nonTitle chat')
+      assert.ok(row.titles <= 1); assert.equal(row.titles, 1)
+      assert.deepEqual(row.providerRows.map(p => p.purpose), ['chat', 'title'])
+      assert.deepEqual(row.jsonTitle, { title: `Hermes qualification ${row.nonce} ${row.model}` })
+      assert.ok(row.providerRows.every(p => p.method === 'POST' && p.path === '/v1/chat/completions' && p.authenticated))
+    }
+    proof.passed = true
+  } catch (error) { proof.passed = false; proof.error = String(error); throw error }
+  finally { proof.allOwnedServersClosed = true; fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(proof, null, 2) + '\n', { flag: 'wx' }); t.diagnostic('source-derived native HTTP evidence: ' + out) }
+})
+
+test('native标题证据：title:false未知prior不得伪chat，错pin/流/模型/方法及重放拒绝新title', { timeout: 30000 }, async t => {
+  const { createNativeProvider } = await load(), pin = nativeTitleFixture.upstream[1].pin
+  const out = process.env.HERMES_NATIVE_TITLE_EVIDENCE_DIR || fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hermes-native-title-negative-'))
+  fs.mkdirSync(out, { recursive: true }); const proof = { scope: 'source-derived controlled factory HTTP negative evidence; NOT native VM qualification', observations: [], ownedServersClosed: 0 }
+  try {
+  for (const variant of ['unknown-prior', 'nonstream-prior', 'wrong-model-prior', 'wrong-method-prior', 'missing-pin', 'unknown-pin', 'bad-schema', 'wrong-title-method', 'replay']) {
+    const report = { provider: [], metadata: [] }, server = await createNativeProvider({ report, ...(variant === 'missing-pin' ? {} : { runtimePin: variant === 'unknown-pin' ? '0'.repeat(40) : pin }) })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const nonce = 'native-acceptance-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', model = 'native-one'
+      const request = async (body, method = 'POST') => { const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, { method, headers: { authorization: 'Bearer qualification-native-no-secret', 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(5000) }); return { status: response.status, text: await response.text() } }
+      await request(nativeChatBody(nonce, variant === 'wrong-model-prior' ? 'native-two' : model, variant !== 'nonstream-prior', variant !== 'unknown-prior'), variant === 'wrong-method-prior' ? 'PUT' : 'POST')
+      assert.equal(report.provider[0].purpose, variant === 'unknown-prior' ? 'unattributed' : 'chat', 'purpose须来自真实请求classifier，不能从title:false合成')
+      assert.equal(report.provider[0].title, false)
+      const title = nativeTitleBody(nonce, model); if (variant === 'bad-schema') title.response_format.json_schema.strict = false
+      if (variant === 'replay') { const first = await request(title); assert.deepEqual(JSON.parse(JSON.parse(first.text).choices[0].message.content), { title: `Hermes qualification ${nonce} ${model}` }); assert.equal(report.provider.at(-1).purpose, 'title') }
+      const result = await request(title, variant === 'wrong-title-method' ? 'PUT' : 'POST')
+      proof.observations.push({ variant, status: result.status, content: JSON.parse(result.text).choices[0].message.content, providerRows: structuredClone(report.provider) })
+      assert.equal(result.status, 200); assert.equal(report.provider.at(-1).purpose, 'unattributed'); assert.equal(report.provider.at(-1).title, false)
+      assert.equal(JSON.parse(result.text).choices[0].message.content, `原生完整回复：${nonce}；模型：${model}。`)
+      assert.ok(report.provider.filter(p => p.title && p.nonce === nonce).length <= 1)
+    } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); assert.equal(server.listening, false); proof.ownedServersClosed++ }
+  }
+  proof.passed = true
+  } catch (error) { proof.passed = false; proof.error = String(error); throw error }
+  finally { fs.writeFileSync(path.join(out, 'negative-report.json'), JSON.stringify(proof, null, 2) + '\n', { flag: 'wx' }); t.diagnostic('native HTTP negative evidence: ' + out) }
+})
+
+test('native标题接线：runtime实际pin与compat旧pin显式传入且复用已绑定Windows合同', () => {
+  const source = fs.readFileSync(new URL('../scripts/test-hermes-tauri-qualification.mjs', import.meta.url), 'utf8')
+  assert.match(source, /createNativeProvider\(\{ report, save, runtimePin: compatibility \? OLD_RUNTIME\.commit : release\.commit \}\)/)
+  assert.match(source, /classifyProviderRequest\(body, evidence\)/)
+  assert.match(source, /nonceFamily: 'native'/)
+  assert.match(source, /scripts\/test-hermes-windows-qualification\.mjs/)
+  assert.doesNotMatch(source, /!\w+\.title\s*\?\s*['"]chat|title\s*\?\s*['"]title['"]\s*:\s*['"]chat/)
+})
+
+test('Native原legacy HTTP语义：不继承两Web前缀，不trim；未知仍触发原nonTitle计数红灯', { timeout: 30000 }, async t => {
+  const { createNativeProvider } = await load(), out = process.env.HERMES_NATIVE_PREFIX_EVIDENCE_DIR || fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hermes-native-prefix-'))
+  fs.mkdirSync(out, { recursive: true }); const proof = { scope: 'controlled own factory HTTP scope regression; NOT actual Native VM observation', observations: [], ownedServersClosed: 0 }
+  try {
+    for (const [kind, system, expectedTitle] of [
+      ['native-original', 'You are a title generator. Keep original Native behavior.', true],
+      ['web-coding-only', 'Create a concise title for an AI coding-assistant session', false],
+      ['web-conversation-only', 'You generate concise chat titles', false],
+      ['native-leading-whitespace', ' You are a title generator. Leading space was not Native title.', false],
+    ]) {
+      const report = { provider: [], metadata: [] }, nonce = 'native-acceptance-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', model = 'native-one', server = await createNativeProvider({ report, runtimePin: nativeTitleFixture.upstream[0].pin })
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+      try {
+        const request = async body => { const raw = JSON.stringify(body), response = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, { method: 'POST', headers: { authorization: 'Bearer qualification-native-no-secret', 'content-type': 'application/json' }, body: raw, signal: AbortSignal.timeout(5000) }); return { status: response.status, text: await response.text(), bodySha256: crypto.createHash('sha256').update(raw).digest('hex') } }
+        assert.equal((await request(nativeChatBody(nonce, model))).status, 200)
+        const response = await request({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: nonce }] })
+        proof.observations.push({ kind, system, expectedTitle, status: response.status, content: JSON.parse(response.text).choices[0].message.content, bodySha256: response.bodySha256, rows: structuredClone(report.provider), nonTitle: report.provider.filter(c => !c.title && c.authenticated && c.nonce === nonce && c.model === model).length, expectedNonTitle: expectedTitle ? 1 : 2, chinese: `原生完整回复：${nonce}；模型：${model}。` })
+      } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); assert.equal(server.listening, false); proof.ownedServersClosed++ }
+    }
+    for (const row of proof.observations) {
+      assert.equal(row.status, 200); assert.equal(row.content, row.chinese); assert.equal(row.rows[0].purpose, 'chat')
+      assert.equal(row.rows[1].title, row.expectedTitle, row.kind + '不得扩大Native原legacy范围')
+      assert.equal(row.rows[1].purpose, row.expectedTitle ? 'title' : 'unattributed', 'unknown不能由!title补chat')
+      assert.equal(row.nonTitle, row.expectedNonTitle)
+      if (!row.expectedTitle) assert.throws(() => assert.equal(row.nonTitle, 1), /2 !== 1/, '原恰好一次计数必须对额外未知请求保持红灯')
+    }
+    proof.passed = true
+  } catch (error) { proof.passed = false; proof.error = String(error); throw error }
+  finally { fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(proof, null, 2) + '\n', { flag: 'wx' }); t.diagnostic('Native original-prefix HTTP: ' + out) }
+})

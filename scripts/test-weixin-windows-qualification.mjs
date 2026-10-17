@@ -49,11 +49,11 @@ export const REQUIRED_CASES=Object.freeze(['prepare-ui-unchecked','cancel-ui','a
 const PHASE_CASES=REQUIRED_CASES.filter(k=>!['wrong-window','scanner-failure'].includes(k))
 export function parseArgs(args){
  const o={},values=new Set(['--root','--sha','--host','--output','--scope'])
- for(let i=0;i<args.length;i++){const k=args[i];assert.ok(!Object.hasOwn(o,k),'重复参数');if(['--execute','--plan'].includes(k))o[k]=true;else{assert.ok(values.has(k)&&args[i+1]&&!args[i+1].startsWith('--'),'未知或缺值参数');o[k]=args[++i]}}
+ for(let i=0;i<args.length;i++){const k=args[i];assert.ok(!Object.hasOwn(o,k),'重复参数');if(['--execute','--plan','--diagnostic-attach'].includes(k))o[k]=true;else{assert.ok(values.has(k)&&args[i+1]&&!args[i+1].startsWith('--'),'未知或缺值参数');o[k]=args[++i]}}
  if(o['--sha'])assert.ok(exactSha(o['--sha']),'SHA 必须完整40位')
  if(o['--host'])assert.ok(Object.hasOwn(HOSTS,o['--host']),'仅固定官方5.12/9.8/10.4')
  if(o['--scope'])assert.ok(['complete','ui-origin'].includes(o['--scope']),'scope无效')
- assert.ok(!(o['--execute']&&o['--plan']),'模式互斥');return o
+ assert.ok(!(o['--execute']&&o['--plan']),'模式互斥');assert.ok(!o['--diagnostic-attach']||!o['--scope'],'attach诊断与正式scope互斥');return o
 }
 export function runnerProofFailures(p={}){
  // 完整复制合取语义，但用本 workflow 精确身份；从不改写 proof 去通过 Hermes 门禁。
@@ -247,6 +247,17 @@ export class W3C{
   this.requestedCapabilities={capabilities:{alwaysMatch:{'tauri:options':{application,webviewOptions:{userDataFolder,additionalBrowserArguments:['remote-debugging-port=0','remote-debugging-address=127.0.0.1']}}}}}
   const v=await this.request('POST','/session',this.requestedCapabilities);assert.ok(v.sessionId);this.session=v.sessionId;this.sessionInfo={sessionId:v.sessionId,capabilities:v.capabilities,application,requestedCapabilities:this.requestedCapabilities};await this.command('POST','/timeouts',{script:120000,pageLoad:60000,implicit:0})
  }
+ async attachVerified(e,deadline,direct){
+  // 只连接既有、已证明的动态端口；不传binary，绝不悄悄回到launch。
+  const expected=assertWebviewDebugger(e)
+  // 使用已经取得的最新direct快照；不能忽略矛盾，也不重新选择owner或另开查询/预算。
+  assertWebviewDebugger({...e,observation:direct,expected:{...expected,port:e.port}});deadline.remaining()
+  this.requestedCapabilities={capabilities:{alwaysMatch:{browserName:'webview2','ms:edgeOptions':{debuggerAddress:`127.0.0.1:${e.port}`}}}}
+  const v=await this.request('POST','/session',this.requestedCapabilities,deadline.remaining())
+  if(typeof v?.sessionId==='string'&&v.sessionId){this.session=v.sessionId;this.sessionInfo={sessionId:v.sessionId,capabilities:v.capabilities,requestedCapabilities:this.requestedCapabilities}}
+  deadline.remaining();assert.ok(this.session,'attach缺真实sessionId');assert.equal(v.capabilities?.browserName,'webview2')
+  await this.command('POST','/timeouts',{script:120000,pageLoad:60000,implicit:0},deadline.remaining());deadline.remaining()
+ }
  script(script,args=[]){return this.command('POST','/execute/sync',{script,args})}
  async ipc(cmd,args={}){const x=await this.command('POST','/execute/async',{script:'const [cmd,args,done]=arguments;window.__TAURI__.core.invoke(cmd,args).then(value=>done({ok:true,value}),error=>done({ok:false,error:String(error)}))',args:[cmd,args]});return x}
  async click(selector){const x=await this.command('POST','/element',{using:'css selector',value:selector}),id=x['element-6066-11e4-a52e-4f735466cecf'];assert.ok(id);await this.command('POST',`/element/${id}/click`,{})}
@@ -259,6 +270,18 @@ function physical(p){p=path.resolve(p);for(let q=p;;q=path.dirname(q)){if(fs.exi
 // Browser参数只经W3C capability提交；子环境清除冲突覆盖，不修改父/宿主环境。
 export function nativeDriverChildEnv(env) {
   return Object.fromEntries(Object.entries(env).filter(([k]) => !/^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k)))
+}
+export function createAttachDeadline(limitMs=60000){
+ assert.ok(Number.isInteger(limitMs)&&limitMs>0&&limitMs<=60000,'attach总预算必须为1..60000ms')
+ const start=performance.now()
+ return {elapsedMs:()=>performance.now()-start,remaining(){const n=Math.ceil(limitMs-(performance.now()-start));assert.ok(n>0,'appspawn→session 60s deadline预算耗尽');return n}}
+}
+export function nativeAttachAppEnv(env,userDataFolder){
+ const paths=path.win32.isAbsolute(userDataFolder)?path.win32:path
+ assert.ok(typeof userDataFolder==='string'&&paths.isAbsolute(userDataFolder)&&paths.resolve(userDataFolder)===userDataFolder,'attach私有UDD必须绝对且正规化')
+ assert.ok(paths!==path.win32||/^[a-z]:\\/i.test(userDataFolder),'attach拒绝网络UDD')
+ const copy=Object.fromEntries(Object.entries(env).filter(([k])=>!/^WEBVIEW2_(?:USER_DATA_FOLDER|ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k)))
+ copy.WEBVIEW2_USER_DATA_FOLDER=userDataFolder;copy.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS='--remote-debugging-port=0 --remote-debugging-address=127.0.0.1';return copy
 }
 // 只记录交给spawn的白名单值；不是driver、应用或WebView实际收到环境的证明。
 export function nativeDriverEnvSubmission(env) {
@@ -278,6 +301,54 @@ export function nativeDriverEnvSubmission(env) {
 const debugPath = value => (path.win32.isAbsolute(value) ? path.win32 : path).normalize(value).toLowerCase()
 const debugIdentity = p => `${p.pid}:${p.creationDate}`
 const debugArgs = (text, key) => [...(text || '').matchAll(new RegExp('(?:^|\\s)--' + key + '=(?:"([^"]+)"|([^\\s"]+))(?=\\s|$)', 'g'))].map(m => m[1] || m[2])
+export function createAttachOwnership({output,application,driver,runtimePath,userDataFolder,pending}){
+ // 仅诊断孩子：spawn时间窗口+精确私有exe+实际出生收据，永不从cleanup的裸PID补身份。
+ const paths=path.win32.isAbsolute(output)?path.win32:path,children=[],owned=new Map()
+ for(const file of [application,driver]){const rel=paths.relative(output,file);assert.ok(rel&&!rel.startsWith('..'+paths.sep)&&rel!=='..'&&!paths.isAbsolute(rel),'attach子进程exe必须在私有output')}
+ const valid=p=>Number.isInteger(p?.pid)&&p.pid>0&&typeof p.exe==='string'&&Number.isFinite(Date.parse(p.creationDate))
+ const same=(a,b)=>valid(a)&&valid(b)&&debugIdentity(a)===debugIdentity(b)&&debugPath(a.exe)===debugPath(b.exe)
+ const runtime=p=>valid(p)&&debugPath(p.exe)===debugPath(runtimePath)&&debugArgs(p.commandLine,'user-data-dir').length===1&&[userDataFolder,paths.join(userDataFolder,'EBWebView')].some(dir=>debugPath(dir)===debugPath(debugArgs(p.commandLine,'user-data-dir')[0]))
+ const remember=p=>{if(![...owned.values()].some(x=>x.pid===p.pid&&!same(x,p)))owned.set(debugIdentity(p),structuredClone(p))}
+ return {
+  start(child,exe,startedAt,returnedAt){
+   assert.ok([application,driver].some(f=>debugPath(f)===debugPath(exe)));assert.ok(Number.isFinite(startedAt)&&Number.isFinite(returnedAt)&&returnedAt>=startedAt)
+   const record={child,pid:child.pid,exe,startedAt,returnedAt,proof:null,terminal:false,event:null};children.push(record)
+   if(Number.isInteger(child.pid)&&child.pid>0)pending.add(child.pid)
+   const retire=event=>{record.terminal=true;record.event=event;pending.delete(record.pid)}
+   child.once('error',()=>retire('error'));child.once('close',()=>retire('close'))
+  },
+  observe(snapshot){
+   for(const record of children){if(record.proof||record.terminal||record.child.exitCode!==null||record.child.signalCode)continue
+    const p=snapshot.processes.find(p=>p.pid===record.pid),birth=Date.parse(p?.creationDate)
+    if(valid(p)&&debugPath(p.exe)===debugPath(record.exe)&&birth>=record.startedAt&&birth<=record.returnedAt){record.proof=structuredClone(p);remember(p)}
+   }
+   const app=children.find(r=>debugPath(r.exe)===debugPath(application))?.proof
+   if(app)for(const p of snapshot.processes)if(runtime(p)&&Date.parse(p.creationDate)>=Date.parse(app.creationDate))remember(p)
+   return this.known()
+  },
+  known(){return [...owned.values()].map(p=>structuredClone(p))},
+  matches(p){const proof=owned.get(debugIdentity(p));return !!proof&&same(proof,p)&&(children.some(r=>r.proof&&same(r.proof,p))||runtime(p))},
+  gaps(){return [...children.filter(r=>!r.proof).map(r=>`spawn ${r.pid??'missing'} 缺本轮出生/owner proof (${r.event||'unobserved'})`),...[...pending].filter(pid=>!children.some(r=>r.pid===pid&&r.proof)).map(pid=>`pending ${pid} 缺出生proof；禁止裸PID升级`)]},
+  receipt(){return children.map(({pid,exe,startedAt,returnedAt,proof,terminal,event})=>({pid,exe,startedAt,returnedAt,proof,terminal,event}))},
+ }
+}
+export async function cleanupAttachProcesses({ownership,ports,snapshot,terminate,receipt,waitUntil}){
+ const result={errors:ownership.gaps(),identities:ownership.known(),ports:[...ports],processes:null,listeners:null}
+ if(!result.identities.length)result.errors.push('diagnostic清理身份集合为空；无owned proof不发送kill')
+ receipt('attach-spawn-ownership',ownership.receipt())
+ const unexpected=s=>{for(const p of s.processes)if(!ownership.matches(p))result.errors.push(`私有观察含未证owner ${p.pid}:${p.creationDate}；不发送kill`)}
+ try{const before=snapshot([...ports],result.identities);receipt('processes-before-cleanup',before);unexpected(before)}catch(e){result.errors.push('cleanup initial observation: '+String(e))}
+ // 缺proof或单项失败不妨碍其它已证owner清理，也不能把当前同号进程变成本轮孩子。
+ for(const p of result.identities)try{
+  const current=snapshot([],[p]),rows=[...current.processes,...current.present].filter(x=>x.pid===p.pid)
+  if(!rows.length)continue
+  assert.ok(rows.every(x=>debugIdentity(x)===debugIdentity(p)&&x.exe&&debugPath(x.exe)===debugPath(p.exe)),'cleanup PID复用/出生或exe矛盾；不发送kill')
+  const exact=current.processes.find(x=>ownership.matches(x))||rows.find(x=>ownership.matches(x))
+  assert.ok(exact,'cleanup缺当前精确owner/privateUDD；不发送kill');terminate(p)
+ }catch(e){result.errors.push(`cleanup owner ${p.pid}: `+String(e))}
+ try{await waitUntil(async()=>{const after=snapshot([...ports],result.identities);Object.assign(result,{processes:after.processes,listeners:after.listeners});receipt('processes-after-cleanup',after);return !after.processes.length&&!after.listeners.length&&!after.present.some(p=>result.identities.some(x=>debugIdentity(x)===debugIdentity(p)))},30000)}catch(e){result.errors.push('cleanup final observation: '+String(e))}
+ return result
+}
 export function assertWebviewDebugger(e) {
   assert.ok(e && Array.isArray(e.observation?.processes) && Array.isArray(e.observation.listeners), 'DevTools缺实际CIM/TCP观察')
   const rows = Object.entries(e.metadata?.files || {}).filter(([, row]) => row.exists)
@@ -372,17 +443,18 @@ export function injectionScripts(){
  return rows
 }
 export function validateInjectionSyntax(){const rows=injectionScripts();assert.ok(rows.length>=18,'注入清单覆盖减少');for(const row of rows)compileInjected(row.script,row.name);return rows.map(r=>({name:r.name,sha256:sha(Buffer.from(r.script))}))}
-function ps(code){
+function ps(code,timeout=30000){
+ assert.ok(Number.isInteger(timeout)&&timeout>0&&timeout<=30000,'PS观察不得扩展原预算')
  const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>k.toLowerCase()!=='psmodulepath'))
- const r=spawnSync('powershell.exe',['-NoProfile','-EncodedCommand',Buffer.from("$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);\n"+code,'utf16le').toString('base64')],{env,encoding:'utf8',windowsHide:true,timeout:30000,maxBuffer:16*1024*1024});assert.equal(r.status,0,'PS5只读观察失败: '+r.stderr);return r.stdout.trim()
+ const r=spawnSync('powershell.exe',['-NoProfile','-EncodedCommand',Buffer.from("$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);\n"+code,'utf16le').toString('base64')],{env,encoding:'utf8',windowsHide:true,timeout,maxBuffer:16*1024*1024});assert.equal(r.status,0,'PS5只读观察失败: '+r.stderr);return r.stdout.trim()
 }
 const psValue=s=>`[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(s).toString('base64')}'))`
 export function processObservationSource(root,ports,tracked=[],controllerPid=process.pid){
  assert.ok(Number.isInteger(controllerPid)&&controllerPid>0&&ports.every(p=>Number.isInteger(p)&&p>0&&p<65536)&&tracked.every(p=>Number.isInteger(p.pid)&&p.pid>0))
  return `$h=${psValue(root)};$ports=@(${ports.join(',')});$ids=@(${tracked.map(x=>x.pid).join(',')});$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$owned=@($all|Where-Object {$_.ProcessId -ne $PID -and $_.ProcessId -ne ${controllerPid} -and (($_.ExecutablePath -and $_.ExecutablePath.StartsWith($h+'\\',[StringComparison]::OrdinalIgnoreCase)) -or ($_.CommandLine -and $_.CommandLine.IndexOf($h+'\\',[StringComparison]::OrdinalIgnoreCase) -ge 0))});function Row($p){if(!$p -or !$p.CreationDate){throw 'Missing CreationDate'};@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath;commandLine=$(if($owned.ProcessId -contains $p.ProcessId){$p.CommandLine}else{$null})}};$listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq 'Listen' -and ($ports -contains [int]$_.LocalPort -or $owned.ProcessId -contains [int]$_.OwningProcess)}|ForEach-Object {$c=$_;$p=$all|Where-Object {$_.ProcessId -eq $c.OwningProcess}|Select-Object -First 1;$r=Row $p;$r.port=[int]$c.LocalPort;$r.localAddress=$c.LocalAddress;$r});@{processes=@($owned|ForEach-Object {Row $_});present=@($all|Where-Object {$ids -contains [int]$_.ProcessId}|ForEach-Object {Row $_});listeners=$listeners}|ConvertTo-Json -Compress -Depth 6`
 }
-function processSnapshot(root,ports,tracked=[]){
- const out=ps(processObservationSource(root,ports,tracked))
+function processSnapshot(root,ports,tracked=[],timeout=30000){
+ const out=ps(processObservationSource(root,ports,tracked),timeout)
  return JSON.parse(out)
 }
 function hostExtra(profile){
@@ -399,7 +471,7 @@ async function execute(o){
  const candidate=physical(o['--root']),output=physical(o['--output']),tempRoot=physical(process.env.RUNNER_TEMP)
  assert.ok(inside(tempRoot,output)&&!fs.existsSync(output),'输出必须RUNNER_TEMP全新physical目录')
  fs.mkdirSync(output);const pub=path.join(output,'public');fs.mkdirSync(pub)
- const artifact=expectedArtifact(o['--host']),scope=o['--scope']||'complete',report={status:'failed',scope,executionMode:'actual-github-hosted-windows-vm-weixin',candidateSha:o['--sha'],hostVersion:o['--host'],artifact,runner:proof,cases:[],commands:[],errors:[],gaps:[],cleanup:{errors:[]}}
+ const artifact=expectedArtifact(o['--host']),scope=o['--diagnostic-attach']?'diagnostic-attach':o['--scope']||'complete',report={status:'failed',scope,executionMode:o['--diagnostic-attach']?'actual-github-hosted-windows-vm-weixin-attach-diagnostic':'actual-github-hosted-windows-vm-weixin',candidateSha:o['--sha'],hostVersion:o['--host'],artifact,runner:proof,cases:[],commands:[],errors:[],gaps:[],cleanup:{errors:[]}}
  const save=()=>fs.writeFileSync(path.join(pub,'report.json'),JSON.stringify(redact(report),null,2))
  const receipt=(name,value)=>{const f=path.join(pub,name+'.json');fs.writeFileSync(f,JSON.stringify(redact(value),null,2));return hash(f)}
  const pass=(id,value)=>{assert.ok(!report.cases.some(x=>x.id===id));report.cases.push({id,status:'passed',evidenceKind:'actual-native',receipts:[receipt('case-'+id,value)]});save()}
@@ -413,7 +485,7 @@ async function execute(o){
  fs.mkdirSync(env.APPDATA,{recursive:true});fs.mkdirSync(env.LOCALAPPDATA,{recursive:true})
  receipt('isolation-env',{...env,policy:'no inherited credentials; no registry/global launcher writes'})
  const npm=path.join(path.dirname(process.execPath),'node_modules/npm/bin/npm-cli.js');assert.ok(fs.statSync(npm).isFile())
- const pending=new Set(),identities=new Map(),ports=new Set(),driverLogs={stdout:[],stderr:[]},driverLogBytes={stdout:0,stderr:0};let client,driver,server,invokeKey,driverOverflow=false
+ const pending=new Set(),identities=new Map(),ports=new Set(),driverLogs={stdout:[],stderr:[]},driverLogBytes={stdout:0,stderr:0},attachAppLogs={stdout:[],stderr:[]};let client,driver,server,invokeKey,attachOwnership,driverOverflow=false
  function recordDebugger(stage){
   try{const evidence=captureWebviewDebugger({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,runtimePath:report.drivers.edge.runtime.path,snapshot:(wanted,tracked)=>processSnapshot(output,wanted,tracked),ports,identities,expected:report.webviewDebugger});report.webviewDebugger||=evidence;(report.debuggerAttempts||=[]).push({stage,evidence});receipt(stage,evidence);save();return evidence}
   catch(e){report.debuggerGap=String(e.message);(report.debuggerAttempts||=[]).push({stage,evidence:e.debuggerEvidence||null,gap:report.debuggerGap});receipt(stage,{gap:report.debuggerGap,evidence:e.debuggerEvidence||null});save();throw e}
@@ -473,6 +545,62 @@ async function execute(o){
   const selected=await installHost(o['--host']),alternate=await installHost(o['--host']==='2026.5.12'?'2026.9.8':'2026.5.12');report.hosts=[{version:selected.version,integrity:selected.integrity},{version:alternate.version,integrity:alternate.integrity}]
   const panel=path.join(home,'.openclaw');fs.mkdirSync(panel,{recursive:true});const configFile=path.join(panel,'openclaw.json'),panelFile=path.join(panel,'clawpanel.json');fs.writeFileSync(configFile,JSON.stringify({gateway:{mode:'local'},channels:{},plugins:{entries:{}}}));const panelConfig={ignoreRisk:true,openclawDir:panel,nodePath:path.dirname(process.execPath),openclawCliPath:selected.cli,openclawSearchPaths:[selected.cli],engineMode:'openclaw',enabledEngines:['openclaw'],engineSetupChoice:'explicit',autoStartGateway:false};fs.writeFileSync(panelFile,JSON.stringify(panelConfig))
   env.NPM_CONFIG_PREFIX=path.dirname(selected.cli);env.PATH=path.dirname(selected.cli)+';'+env.PATH
+  if(o['--diagnostic-attach']){
+   // 诊断保持单独scope，绝不为正式15case制造成功回执。
+   report.nativeQualification=false;report.gaps=REQUIRED_CASES.map(id=>id+': diagnostic未执行正式资格')
+   report.diagnostic={status:'started',actualEnvironmentObserved:false,sessionBudgetMs:60000,application,uiClicks:0,readonlyIPC:null}
+   const binaryFiles={application,driver:edge,runtime:runtime.path},binaryBefore=Object.fromEntries(Object.entries(binaryFiles).map(([k,f])=>[k,hash(f)]))
+   assert.equal(binaryBefore.application,report.build.exeSha256);assert.equal(binaryBefore.driver,report.drivers.edge.sha256)
+   report.diagnostic.binaryBefore=binaryBefore;receipt('diagnostic-binary-before',binaryBefore)
+   const driverPort=await freePort();ports.add(driverPort)
+   const appEnv=nativeAttachAppEnv(env,env.WEBVIEW2_USER_DATA_FOLDER),driverEnv=nativeDriverChildEnv(appEnv)
+   report.diagnostic.appEnvSubmission={scope:'app-child spawn submission only; not actual application environment',actualEnvironmentObserved:false,submitted:{WEBVIEW2_USER_DATA_FOLDER:appEnv.WEBVIEW2_USER_DATA_FOLDER,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:appEnv.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS,WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER:null,WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER:null}}
+   report.driverEnvSubmission = nativeDriverEnvSubmission(driverEnv);receipt('attach-app-env-submission',report.diagnostic.appEnvSubmission);receipt('driver-env-submission',report.driverEnvSubmission)
+   attachOwnership=createAttachOwnership({output,application,driver:edge,runtimePath:runtime.path,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,pending})
+   const keep=(child,bucket,exe,startedAt,returnedAt)=>{attachOwnership.start(child,exe,startedAt,returnedAt);child.once('error',e=>{report.diagnostic.spawnError=String(e)});for(const [stream,key]of [[child.stdout,'stdout'],[child.stderr,'stderr']])stream.on('data',b=>{driverLogBytes[key]+=b.length;if(driverLogBytes[key]>16*1024*1024){driverOverflow=true;child.kill()}else bucket[key].push(b)})}
+   const track=snapshot=>{for(const p of attachOwnership.observe(snapshot))identities.set(debugIdentity(p),p);for(const p of snapshot.listeners)if(identities.has(debugIdentity(p)))ports.add(p.port)}
+   report.sessionLaunch={application,envUserDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,mode:'attach-existing-private-runtime',sessionCreated:false,before:webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER})}
+   const deadline=createAttachDeadline(),startedAt=new Date().toISOString();report.diagnostic.appSpawnStartedAt=startedAt;save()
+   try{
+    const appStart=Date.now(),app=spawn(application,[],{cwd:root,env:appEnv,windowsHide:true,stdio:['ignore','pipe','pipe']});keep(app,attachAppLogs,application,appStart,Date.now());assert.ok(app.pid,'应用没有实际spawn PID')
+    const observed=processSnapshot(output,[...ports],[],Math.min(30000,deadline.remaining()));deadline.remaining();track(observed)
+    const appIdentity=attachOwnership.known().find(p=>p.pid===app.pid);assert.ok(appIdentity,'缺真实同SHA应用spawn窗口/PID/CreationDate')
+    report.diagnostic.appIdentity=appIdentity;receipt('attach-app-identity',observed);save()
+    let evidence
+    for(;;){
+     deadline.remaining();assert.ok(app.exitCode===null&&!app.signalCode&&!report.diagnostic.spawnError&&!driverOverflow,'应用提前退出或日志/spawn失败')
+     const metadata=webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER});deadline.remaining()
+     if(Object.values(metadata.files).some(p=>p.exists)){
+      evidence=captureWebviewDebugger({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,runtimePath:runtime.path,snapshot:(wanted,tracked)=>{const s=processSnapshot(output,wanted,tracked,Math.min(30000,deadline.remaining()));deadline.remaining();track(s);return s},ports,identities})
+      deadline.remaining();assert.ok(Date.parse(evidence.process.creationDate)>=Date.parse(appIdentity.creationDate),'runtime出生早于本轮应用')
+      report.webviewDebugger=evidence;receipt('debugger-before-attach',evidence);break
+     }
+     await wait(Math.min(300,deadline.remaining()))
+    }
+    // 不经过tauri-driver转发；同配套官方driver直接W3C attach，日志仍受原共享输出预算约束。
+    const driverStart=Date.now();driver=spawn(edge,['--port='+driverPort,'--host=127.0.0.1','--verbose'],{cwd:root,env:driverEnv,windowsHide:true,stdio:['ignore','pipe','pipe']});keep(driver,driverLogs,edge,driverStart,Date.now());assert.ok(driver.pid)
+    for(;;){deadline.remaining();assert.ok(!report.diagnostic.spawnError&&!driverOverflow,'driver spawn/日志失败');let ready=false;try{ready=(await fetch(`http://127.0.0.1:${driverPort}/status`,{signal:AbortSignal.timeout(Math.min(1000,deadline.remaining()))})).ok}catch{}if(ready)break;await wait(Math.min(300,deadline.remaining()))}
+    const direct=processSnapshot(output,[...ports],[...identities.values()],Math.min(30000,deadline.remaining()));deadline.remaining();track(direct)
+    const owner=direct.processes.find(p=>p.pid===driver.pid);assert.ok(owner&&attachOwnership.matches(owner),'direct driver缺精确spawn窗口/PID/CreationDate')
+    const listeners=direct.listeners.filter(p=>p.port===driverPort);assert.ok(listeners.length&&listeners.every(p=>p.pid===owner.pid&&p.creationDate===owner.creationDate&&debugPath(p.exe)===debugPath(edge)&&['127.0.0.1','::1'].includes(p.localAddress)),'direct driver监听owner/loopback错误')
+    report.diagnostic.directDriver={process:owner,port:driverPort,listeners};receipt('attach-direct-driver-identity',report.diagnostic.directDriver);receipt('attach-latest-direct',direct)
+    client=new W3C(`http://127.0.0.1:${driverPort}`)
+    try{await client.attachVerified(evidence,deadline,direct)}finally{report.sessionLaunch.requestedCapabilities=client.requestedCapabilities||null;report.sessionLaunch.sessionCreated=!!client.session;report.diagnostic.appSpawnToSessionMs=deadline.elapsedMs();receipt('session-launch',report.sessionLaunch);save()}
+    deadline.remaining();assert.equal(client.sessionInfo.capabilities.browserVersion,runtime.version,'attach返回runtime版本不符');report.diagnostic.session=client.sessionInfo;receipt('attach-session',client.sessionInfo)
+    recordDebugger('debugger-after-attach')
+    await until(()=>client.script('return !!window.__TAURI__?.core?.invoke'))
+    const identity=await client.script('return {url:location.href,label:window.__TAURI__.webviewWindow.getCurrentWebviewWindow().label,ipc:!!window.__TAURI__.core.invoke}')
+    const url=new URL(identity.url);assert.ok(['http://tauri.localhost','https://tauri.localhost','tauri://localhost'].includes(url.origin==='null'?url.protocol+'//'+url.hostname:url.origin));assert.equal(identity.label,'main');assert.equal(identity.ipc,true);receipt('native-identity',identity)
+    await until(()=>client.script('return !!document.querySelector(\'.nav-item[data-route="/channels"]\')'))
+    await client.click('.nav-item[data-route="/channels"]');report.diagnostic.uiClicks++
+    await until(()=>client.script('return location.hash==="#/channels"&&!!document.querySelector(\'.platform-pick[data-pid="weixin"]\')'))
+    const readonly=await client.ipc('get_openclaw_dir');assert.equal(readonly.ok,true);assert.equal(debugPath(readonly.value.path),debugPath(panel));report.diagnostic.readonlyIPC={command:'get_openclaw_dir',result:readonly}
+    receipt('attach-ui-ipc',{identity,clicks:report.diagnostic.uiClicks,readonly:report.diagnostic.readonlyIPC,screenshot:await client.screenshot(path.join(pub,'diagnostic-ui.png'))})
+    report.diagnostic.status='diagnostic-ui-ipc-observed';report.status='diagnostic-ui-ipc-observed'
+   }finally{
+    const after=Object.fromEntries(Object.entries(binaryFiles).map(([k,f])=>[k,hash(f)]));report.diagnostic.binaryAfter=after;receipt('diagnostic-binary-after',after);assert.deepEqual(after,binaryBefore,'attach诊断二进制发生改变');save()
+   }
+  }else{
   const driverPort=await freePort(),nativePort=await freePort();ports.add(driverPort);ports.add(nativePort)
   const driverEnv = nativeDriverChildEnv(env)
   report.driverEnvSubmission = nativeDriverEnvSubmission(driverEnv)
@@ -564,6 +692,7 @@ async function execute(o){
   report.source.after=gitSnapshot(candidate,o['--sha']);for(const [file,value]of Object.entries(report.source.before))assert.equal(hash(path.join(root,file)),value.sha256,'构建源发生变化 '+file)
   report.tooling.after=gitSnapshot(tooling,proof.toolingSha)
    assert.deepEqual(report.cases.filter(x=>x.status==='passed').map(x=>x.id).sort(),[...PHASE_CASES,...(HOSTS[selected.version].accept?['scanner-failure']:[])].sort());report.status='passed-native-ui-origin-partial'
+  }
  }catch(e){report.errors.push(redact(e.stack||String(e)));report.status='failed';process.exitCode=1}
  finally{
   // 每项独立尝试；失败后不改宿主/外部任务来追绿。保留私有HOME，不上传。
@@ -571,15 +700,25 @@ async function execute(o){
   try{if(client){receipt('webdriver-trace',client.events);await client.screenshot(path.join(pub,'final.png'))}}catch(e){report.cleanup.errors.push('native final screenshot: '+redact(String(e)))}
   try{if(client)await client.close()}catch(e){report.cleanup.errors.push('native session close: '+redact(String(e)))}
   try{if(server){server.closeAllConnections();await new Promise(r=>server.close(r))}}catch(e){report.cleanup.errors.push('frame server close: '+String(e))}
+  if(o['--diagnostic-attach']){
+   try{
+    assert.ok(attachOwnership,'diagnostic尚无spawn/owner proof；禁止裸PID fallback')
+    identities.clear();for(const p of attachOwnership.known())identities.set(debugIdentity(p),p)
+    const cleaned=await cleanupAttachProcesses({ownership:attachOwnership,ports,snapshot:(wanted,tracked)=>processSnapshot(output,wanted,tracked),terminate:p=>{const r=spawnSync('taskkill.exe',['/PID',String(p.pid),'/T','/F'],{windowsHide:true,timeout:30000});assert.equal(r.status,0,'owned进程终止失败')},receipt,waitUntil:until})
+    Object.assign(report.cleanup,{...cleaned,errors:[...report.cleanup.errors,...cleaned.errors]})
+   }catch(e){report.cleanup.errors.push('diagnostic owned cleanup: '+redact(String(e)))}
+  }else{
   try{const snap=processSnapshot(output,[...ports]);receipt('processes-before-cleanup',snap);for(const p of snap.processes)identities.set(`${p.pid}:${p.creationDate}`,p);for(const pid of pending){if(![...identities.values()].some(x=>x.pid===pid)){const r=ps(`$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}';if($p){@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath}|ConvertTo-Json}else{'null'}`);const p=JSON.parse(r);if(p)identities.set(`${p.pid}:${p.creationDate}`,p)}}
    assert.ok(identities.size,'清理身份集合为空');for(const p of identities.values()){const current=processSnapshot(output,[],[p]).present.find(x=>x.pid===p.pid&&x.creationDate===p.creationDate);if(current)spawnSync('taskkill.exe',['/PID',String(p.pid),'/T','/F'],{windowsHide:true,timeout:30000})}
    let after;await until(async()=>{after=processSnapshot(output,[...ports],[...identities.values()]);return !after.processes.length&&!after.listeners.length&&!after.present.some(x=>identities.has(`${x.pid}:${x.creationDate}`))},30000)
    Object.assign(report.cleanup,{processes:after.processes,listeners:after.listeners,identities:[...identities.values()],ports:[...ports]});receipt('processes-after-cleanup',after)
   }catch(e){report.cleanup.errors.push('PID/CreationDate/port cleanup: '+redact(String(e)))}
-  try{if(report.sessionLaunch){const observed=report.debuggerAttempts?.findLast(x=>x.evidence?.identities?.length&&x.evidence?.ports?.length)?.evidence;const after=processSnapshot(output,[...ports],[...identities.values()]);receipt('debugger-after-cleanup',after);assertWebviewDebuggerClosed(observed,after);report.cleanup.webviewDebugger={observation:after,ports:[...ports]}}}catch(e){report.cleanup.errors.push('debugger final: '+String(e.message))}
+  }
+  try{if(report.sessionLaunch){const observed=report.debuggerAttempts?.findLast(x=>x.evidence?.identities?.length&&x.evidence?.ports?.length)?.evidence;const after=processSnapshot(output,[...ports],[...identities.values()]);receipt('debugger-after-cleanup',after);if(o['--diagnostic-attach'])assertWebviewDebugger(report.webviewDebugger);assertWebviewDebuggerClosed(observed,after);report.cleanup.webviewDebugger={observation:after,ports:[...ports]}}}catch(e){report.cleanup.errors.push('debugger final: '+String(e.message))}
   try{const after=shared.hostSnapshot(proof),extraAfter=hostExtra(proof.actualProfile);receipt('host-after',after);receipt('host-extra-after',extraAfter);shared.assertHostUnchanged(before,after);assert.deepEqual(extraAfter,extraBefore);report.cleanup.hostUnchanged=true}catch(e){report.cleanup.errors.push('host canary: '+redact(String(e)))}
   try{if(report.tooling){report.tooling.after=gitSnapshot(tooling,proof.toolingSha);assert.deepEqual(report.tooling.after,report.tooling.before)}if(report.source){report.source.after=gitSnapshot(candidate,o['--sha']);assert.deepEqual(report.source.after,report.source.before)}}catch(e){report.cleanup.errors.push('source/tooling post check: '+String(e))}
-  for(const [key,chunks]of Object.entries(driverLogs)){let text=redact(Buffer.concat(chunks).toString('utf8'));if(invokeKey)text=text.replaceAll(invokeKey,'[REDACTED]');fs.writeFileSync(path.join(pub,'driver-'+key+'.log'),text)}
+  for(const [key,chunks]of Object.entries(driverLogs)){let text=redact(Buffer.concat(chunks).toString('utf8'));if(invokeKey)text=text.replaceAll(invokeKey,'[REDACTED]');if(o['--diagnostic-attach'])text=text.replace(/\/devtools\/browser\/[A-Za-z0-9._-]+/g,'/devtools/browser/[REDACTED]');fs.writeFileSync(path.join(pub,'driver-'+key+'.log'),text)}
+  if(o['--diagnostic-attach'])try{for(const [label,logs]of [['app',attachAppLogs],['driver',driverLogs]])for(const [key,chunks]of Object.entries(logs)){const bytes=Buffer.concat(chunks);fs.writeFileSync(path.join(output,'private-attach-'+label+'-'+key+'.log'),bytes,{flag:'wx'});if(label==='app')fs.writeFileSync(path.join(pub,'attach-app-'+key+'.log'),redact(bytes.toString('utf8')).replace(/\/devtools\/browser\/[A-Za-z0-9._-]+/g,'/devtools/browser/[REDACTED]'))}}catch(e){report.cleanup.errors.push('attach私有日志保存失败: '+String(e))}
   if(driverOverflow)report.cleanup.errors.push('driver输出超预算')
   if(report.cleanup.errors.length){report.status='failed';process.exitCode=1}
   if(report.status!=='failed'&&scope==='complete'){try{report.status='pass-native';assertNativeComplete(report)}catch(e){report.status='incomplete-native';report.errors.push(String(e));process.exitCode=1}}
@@ -589,5 +728,5 @@ async function execute(o){
  return report
 }
 if(process.argv[1]&&pathToFileURL(path.resolve(process.argv[1])).href===import.meta.url){
- try{const o=parseArgs(process.argv.slice(2));if(o['--execute'])await execute(o);else console.log(JSON.stringify({status:'not-run',localInstall:false,scope:o['--scope']||'complete',candidateSha:o['--sha']||null,hosts:Object.keys(HOSTS),requiredCases:REQUIRED_CASES,phaseOneCases:PHASE_CASES,expectedArtifacts:Object.fromEntries(Object.keys(HOSTS).map(v=>[v,expectedArtifact(v)])),pendingNativeChecks:REQUIRED_CASES,expectedSurfaceLimit:'main-only surface must be proven by exact source and actual enumeration; never a passed wrong-window negative',legacyScannerLimit:'5.12 has no reviewed operator policy entry; real scanner rejection remains required for complete'}))}catch(e){console.error(redact(e.stack||String(e)));process.exitCode=1}
+ try{const o=parseArgs(process.argv.slice(2));if(o['--execute'])await execute(o);else console.log(JSON.stringify({status:'not-run',localInstall:false,scope:o['--diagnostic-attach']?'diagnostic-attach':o['--scope']||'complete',diagnosticNeverQualifies:!!o['--diagnostic-attach'],candidateSha:o['--sha']||null,hosts:Object.keys(HOSTS),requiredCases:REQUIRED_CASES,phaseOneCases:PHASE_CASES,expectedArtifacts:Object.fromEntries(Object.keys(HOSTS).map(v=>[v,expectedArtifact(v)])),pendingNativeChecks:REQUIRED_CASES,expectedSurfaceLimit:'main-only surface must be proven by exact source and actual enumeration; never a passed wrong-window negative',legacyScannerLimit:'5.12 has no reviewed operator policy entry; real scanner rejection remains required for complete'}))}catch(e){console.error(redact(e.stack||String(e)));process.exitCode=1}
 }

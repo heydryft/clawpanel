@@ -268,9 +268,49 @@ export function validatePrivateCompletion(r, expected) {
   assert.ok(r.requiredStages?.length >= 5 && r.requiredStages.every(name => r.stages?.some(s => s.name === name && s.exitCode === 0)), 'private completion 缺真实安装阶段成功回执')
 }
 
-export function classifyProviderRequest(body) {
+// 固定 f976/d923 agent/title_generator.py：完整prompt与R26实际wire核验；不扩展旧前缀。
+export function matchesPinnedTitleRequest(body, evidence) {
+  const record = (value, keys) => {
+    if (!value || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return false
+    const descriptors = Object.getOwnPropertyDescriptors(value), own = Reflect.ownKeys(descriptors)
+    return own.length === keys.length && keys.every(k => Object.hasOwn(descriptors, k) && descriptors[k].enumerable && Object.hasOwn(descriptors[k], 'value'))
+  }
+  const exact = (value, expected) => {
+    if (expected === null || typeof expected !== 'object') return value === expected
+    const keys = Object.keys(expected)
+    if (Array.isArray(expected)) {
+      if (!Array.isArray(value) || value.length !== expected.length || Reflect.ownKeys(value).length !== keys.length + 1) return false
+    } else if (!record(value, keys)) return false
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    return keys.every(k => Object.hasOwn(descriptors[k] || {}, 'value') && exact(descriptors[k].value, expected[k]))
+  }
+  if (!evidence || evidence.method !== 'POST' || evidence.path !== '/v1/chat/completions' || evidence.authenticated !== true || !['f97608f178d1ffeca59860195ab7da295f7c8e5f', 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'].includes(evidence.pin)) return false
+  const family = evidence.nonceFamily === undefined ? 'web' : evidence.nonceFamily
+  if (!['web', 'native', 'native-web-compat'].includes(family)) return false
+  const noncePattern = family === 'web' ? /^hq-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/ : /^native-acceptance-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
+  if (!record(body, ['messages', 'model', 'reasoning_effort', 'response_format']) || !Array.isArray(evidence.models) || !evidence.models.includes(body.model) || !Array.isArray(evidence.calls)) return false
+  if (!Array.isArray(body.messages) || body.messages.length !== 2 || Reflect.ownKeys(body.messages).length !== 3 || !body.messages.every(m => record(m, ['role', 'content']))) return false
+  const [system, user] = body.messages
+  const nonce = family === 'native-web-compat' ? evidence.nonce : user.content
+  if (system.role !== 'system' || typeof system.content !== 'string' || crypto.createHash('sha256').update(system.content).digest('hex') !== '3f1eef0616ddd2c13d45a3f8cef4ed648dadfdacdba7fbedceebf5a04d549998' || user.role !== 'user' || typeof user.content !== 'string' || typeof nonce !== 'string' || !noncePattern.test(nonce)) return false
+  if (family === 'native-web-compat' && (evidence.pin !== 'f97608f178d1ffeca59860195ab7da295f7c8e5f' || user.content !== `Unicode 中文 🦀 café é ${nonce}`)) return false
+  const format = { type: 'json_schema', json_schema: { name: 'session_title', strict: true, schema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'], additionalProperties: false } } }
+  if (body.reasoning_effort !== 'none' || !exact(body.response_format, format)) return false
+  const prior = evidence.calls.filter(c => c.purpose === 'chat' && c.authenticated === true && c.stream === true && c.nonce === nonce && c.model === body.model)
+  return prior.length === 1 && (family !== 'native-web-compat' || prior[0].openingMessageSha256 === crypto.createHash('sha256').update(user.content).digest('hex')) && !evidence.calls.some(c => c.purpose === 'title' && c.nonce === nonce)
+}
+
+// 仅精确已核strict标题合同返回JSON content；其余路径保持原响应文本。
+export function qualificationProviderReply(body, nonce, evidence = null) {
+  const input = evidence?.nonceFamily === 'native-web-compat' ? `Unicode 中文 🦀 café é ${nonce}` : nonce
+  if (matchesPinnedTitleRequest(body, evidence) && input === body.messages[1].content) return JSON.stringify({ title: `Hermes qualification ${nonce} ${body.model}` })
+  return `Hermes qualification reply ${nonce} ${body.model}.`
+}
+
+export function classifyProviderRequest(body, evidence = null) {
   const system = (body.messages || []).filter(m => m.role === 'system').map(m => String(m.content || '')).join('\n').trim()
   if (/^(?:You are a title generator\.|Create a concise title for an AI coding-assistant session|You generate concise (?:chat|conversation) titles)/.test(system)) return 'title'
+  if (matchesPinnedTitleRequest(body, evidence)) return 'title'
   if (/^(?:You are Hermes(?: Agent)?[, .]|You are (?:an? |a helpful )AI assistant)/.test(system)) return 'chat'
   return 'unattributed'
 }
@@ -994,8 +1034,10 @@ async function execute(o) {
           return res.end(JSON.stringify({ error: 'metadata protocol not provided by this OpenAI fixture' }))
         }
         assert.equal(req.method, 'POST'); assert.equal(req.url, '/v1/chat/completions')
-        const b = JSON.parse(raw), nonce = [...JSON.stringify(b.messages || []).matchAll(/hq-[a-f0-9-]{36}/g)].at(-1)?.[0], reply = `Hermes qualification reply ${nonce} ${b.model}.`
-        const purpose = classifyProviderRequest(b), system = (b.messages || []).filter(m => m.role === 'system').map(m => String(m.content || '')).join('\n')
+        const b = JSON.parse(raw), nonce = [...JSON.stringify(b.messages || []).matchAll(/hq-[a-f0-9-]{36}/g)].at(-1)?.[0]
+        const evidence = { method: req.method, path: req.url, authenticated: authMatches, pin: release.commit, models: providerModels, calls }
+        const purpose = classifyProviderRequest(b, evidence), system = (b.messages || []).filter(m => m.role === 'system').map(m => String(m.content || '')).join('\n')
+        const reply = qualificationProviderReply(b, nonce, evidence)
         record({ kind: purpose === 'unattributed' ? 'unknown' : purpose, body: { model: b.model }, model: b.model, nonce, responseStatus: 200, accepted: authMatches && purpose !== 'unattributed' })
         calls.push({ at: new Date().toISOString(), kind: receipt.kind, method: req.method, path: req.url, bodySha256: digest(raw), purpose, systemPrefix: system.slice(0, 200), systemSha256: digest(system), url: req.url, nonce, model: b.model, stream: b.stream, messages: b.messages, authenticated: req.headers.authorization === 'Bearer qualification-local-no-secret' }); write('provider-requests.json', calls)
         assert.equal(req.url, '/v1/chat/completions'); assert.equal(req.headers.authorization, 'Bearer qualification-local-no-secret')

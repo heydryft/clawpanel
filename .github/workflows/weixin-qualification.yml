@@ -13,6 +13,11 @@ on:
         type: choice
         options: [complete, ui-origin]
         default: complete
+      diagnostic_attach:
+        description: '仅10.4 W3C attach诊断，永不作为15case资格通过'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -24,14 +29,14 @@ concurrency:
 jobs:
   native:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'qingchencloud/clawpanel'
-    name: Windows official ${{ matrix.host }} / ${{ inputs.scope }} (partial is not qualification)
+    name: Windows official ${{ matrix.host }} / ${{ inputs.diagnostic_attach && 'diagnostic-attach (NEVER qualification)' || inputs.scope }} (partial is not qualification)
     runs-on: windows-2025
     timeout-minutes: 110
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        host: ['2026.5.12', '2026.9.8', '2026.10.4']
+        host: ${{ fromJSON(inputs.diagnostic_attach && '["2026.10.4"]' || '["2026.5.12","2026.9.8","2026.10.4"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -45,40 +50,78 @@ jobs:
         shell: pwsh
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          DIAGNOSTIC_ATTACH: ${{ inputs.diagnostic_attach }}
         run: |
-          node tooling/scripts/test-weixin-windows-qualification.mjs --plan --sha "$env:CANDIDATE_SHA"
+          if (@('true','false') -cnotcontains $env:DIAGNOSTIC_ATTACH) { throw 'Invalid diagnostic boolean' }
+          if ($env:DIAGNOSTIC_ATTACH -eq 'true') {
+            node tooling/scripts/test-weixin-windows-qualification.mjs --plan --diagnostic-attach --sha "$env:CANDIDATE_SHA"
+          } else {
+            node tooling/scripts/test-weixin-windows-qualification.mjs --plan --sha "$env:CANDIDATE_SHA"
+          }
           exit $LASTEXITCODE
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           path: candidate
           ref: ${{ inputs.candidate_sha }}
           persist-credentials: false
-      - name: 真实VM资格后私有安装、同SHA no-bundle/W3C UI及来源负向
+      - name: ${{ inputs.diagnostic_attach && '仅10.4 W3C attach诊断（永不资格化）' || '真实VM资格后私有安装、同SHA no-bundle/W3C UI及来源负向' }}
         shell: pwsh
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           OPENCLAW_HOST_VERSION: ${{ matrix.host }}
           QUALIFICATION_SCOPE: ${{ inputs.scope }}
+          DIAGNOSTIC_ATTACH: ${{ inputs.diagnostic_attach }}
         run: |
-          node tooling/scripts/test-weixin-windows-qualification.mjs --execute --root candidate --sha "$env:CANDIDATE_SHA" --host "$env:OPENCLAW_HOST_VERSION" --scope "$env:QUALIFICATION_SCOPE" --output "$env:RUNNER_TEMP/weixin-native-$env:OPENCLAW_HOST_VERSION"
+          node --input-type=module -e @'
+          import assert from 'node:assert/strict'
+          import { spawnSync } from 'node:child_process'
+          const env = process.env, diagnostic = env.DIAGNOSTIC_ATTACH
+          assert.ok(['true', 'false'].includes(diagnostic), 'Invalid diagnostic boolean')
+          if (diagnostic === 'true') assert.equal(env.OPENCLAW_HOST_VERSION, '2026.10.4', '诊断只允许10.4')
+          const args = ['tooling/scripts/test-weixin-windows-qualification.mjs', '--execute', '--root', 'candidate', '--sha', env.CANDIDATE_SHA, '--host', env.OPENCLAW_HOST_VERSION]
+          if (diagnostic === 'true') args.push('--diagnostic-attach')
+          else args.push('--scope', env.QUALIFICATION_SCOPE)
+          args.push('--output', env.RUNNER_TEMP + '/weixin-native-' + env.OPENCLAW_HOST_VERSION)
+          const child = spawnSync(process.execPath, args, { stdio: 'inherit', env })
+          if (child.error) throw child.error
+          process.exit(child.status ?? 1)
+          '@
           exit $LASTEXITCODE
       - name: 摘要保留partial/未执行负向，不按job绿灯宣称完整
         if: always()
         shell: pwsh
         env:
           OPENCLAW_HOST_VERSION: ${{ matrix.host }}
+          DIAGNOSTIC_ATTACH: ${{ inputs.diagnostic_attach }}
         run: |
-          $report = "$env:RUNNER_TEMP/weixin-native-$env:OPENCLAW_HOST_VERSION/public/report.json"
-          if (Test-Path -LiteralPath $report) {
-            $r = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-            "### Weixin $env:OPENCLAW_HOST_VERSION — $($r.status)" >> $env:GITHUB_STEP_SUMMARY
-            "Candidate: $($r.candidateSha); scope: $($r.scope). UI-origin is partial, not pass-native." >> $env:GITHUB_STEP_SUMMARY
-            foreach ($gap in $r.gaps) { "- NOT EXECUTED: $gap" >> $env:GITHUB_STEP_SUMMARY }
-          } else { "No admission/runtime report; NOT qualified." >> $env:GITHUB_STEP_SUMMARY }
+          node --input-type=module -e @'
+          import assert from 'node:assert/strict'
+          import fs from 'node:fs'
+          import path from 'node:path'
+          const env = process.env, diagnostic = env.DIAGNOSTIC_ATTACH
+          assert.ok(['true', 'false'].includes(diagnostic), 'Invalid diagnostic boolean')
+          const append = text => fs.appendFileSync(env.GITHUB_STEP_SUMMARY, text + '\n')
+          if (diagnostic === 'true') append(`### Weixin ${env.OPENCLAW_HOST_VERSION} — DIAGNOSTIC ONLY — NOT QUALIFIED\nscope: diagnostic-attach; 15-case qualification NOT established.`)
+          const file = path.join(env.RUNNER_TEMP, 'weixin-native-' + env.OPENCLAW_HOST_VERSION, 'public/report.json')
+          if (fs.existsSync(file)) {
+            const r = JSON.parse(fs.readFileSync(file, 'utf8'))
+            if (diagnostic === 'true') {
+              assert.equal(r.scope, 'diagnostic-attach'); assert.equal(r.executionMode, 'actual-github-hosted-windows-vm-weixin-attach-diagnostic')
+              assert.notEqual(r.status, 'pass-native'); assert.notEqual(r.nativeQualification, true)
+              if (r.status === 'diagnostic-ui-ipc-observed') assert.equal(r.nativeQualification, false)
+              append(`Observed status: ${r.status}; Candidate: ${r.candidateSha}; scope: diagnostic-attach. NOT QUALIFIED.`)
+            } else {
+              append(`### Weixin ${env.OPENCLAW_HOST_VERSION} — ${r.status}`)
+              append(`Candidate: ${r.candidateSha}; scope: ${r.scope}. UI-origin is partial, not pass-native.`)
+            }
+            for (const gap of r.gaps || []) append('- NOT EXECUTED: ' + gap)
+          } else append('No admission/runtime report; NOT qualified.')
+          '@
+          exit $LASTEXITCODE
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: weixin-native-${{ matrix.host }}-${{ inputs.candidate_sha }}-${{ inputs.scope }}
+          name: weixin-native-${{ matrix.host }}-${{ inputs.candidate_sha }}-${{ inputs.diagnostic_attach && 'diagnostic-attach-never-qualification' || inputs.scope }}
           path: ${{ runner.temp }}/weixin-native-${{ matrix.host }}/public/
           if-no-files-found: warn
           retention-days: 14

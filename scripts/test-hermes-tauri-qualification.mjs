@@ -10,7 +10,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { qualifyHermesProfiles, assertScheduledTasksStable } from './hermes-qualification-profiles.mjs'
 import { qualifyHermesProfileCollision, taskNamePythonSource } from './hermes-qualification-profile-collision.mjs'
-import { validatePrivateCompletion, validateRunnerProof } from './test-hermes-windows-qualification.mjs'
+import { validatePrivateCompletion, validateRunnerProof, classifyProviderRequest, matchesPinnedTitleRequest, qualificationProviderReply } from './test-hermes-windows-qualification.mjs'
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
@@ -352,7 +352,7 @@ export function assertNativeCompatibilityComplete(r) {
   assertNativeUiComplete(r)
 }
 
-export async function createNativeProvider({ report, save = () => {} }) {
+export async function createNativeProvider({ report, save = () => {}, runtimePin: providerPin, nonceFamily }) {
   const { classifyHermesMetadataRequest } = await import('./hermes-qualification-provider.mjs')
   const models = ['native-one', 'native-two']
   report.metadata ||= []
@@ -375,10 +375,18 @@ export async function createNativeProvider({ report, save = () => {} }) {
       assert.equal(req.url, '/v1/chat/completions'); assert.equal(req.headers.authorization, 'Bearer qualification-native-no-secret')
       const nonce = [...JSON.stringify(body.messages).matchAll(/native-acceptance-[a-f0-9-]{36}/g)].at(-1)?.[0]
       assert.ok(nonce, '模型请求缺少本轮 nonce')
+      // 只以真实已分类且同端点POST的历史作证；title:false不等于已核chat。
+      const family = nonceFamily === undefined ? { nonceFamily: 'native' } : { nonceFamily }
+      const evidence = { ...family, nonce, pin: providerPin, method: req.method, path: req.url, authenticated: true, models, calls: report.provider.filter(c => c.method === 'POST' && c.path === '/v1/chat/completions') }
+      const classified = classifyProviderRequest(body, evidence), pinnedTitle = matchesPinnedTitleRequest(body, evidence)
+      // 原Native只认这一种raw前缀（不trim）；共享Web另外两种legacy不得改变原计数。
       const system = (body.messages || []).filter(m => m.role === 'system').map(m => m.content).join('\n')
-      const title = /^You are a title generator\./.test(system)
-      report.provider.push({ nonce, model: body.model, title, stream: body.stream, authenticated: true }); save()
-      const content = `原生完整回复：${nonce}；模型：${body.model}。`
+      const title = /^You are a title generator\./.test(system) || pinnedTitle
+      const purpose = title ? 'title' : classified === 'chat' ? 'chat' : 'unattributed'
+      const content = pinnedTitle ? qualificationProviderReply(body, nonce, evidence) : `原生完整回复：${nonce}；模型：${body.model}。`
+      // Web兼容输入只记实际最后user文本的hash；不能从nonce或title布尔值补造正文证据。
+      const openingMessage = nonceFamily === 'native-web-compat' && Array.isArray(body.messages) ? body.messages.filter(m => m.role === 'user').at(-1)?.content : null
+      report.provider.push({ nonce, model: body.model, title, purpose, stream: body.stream, authenticated: true, method: req.method, path: req.url, ...(nonceFamily === 'native-web-compat' ? { openingMessageSha256: typeof openingMessage === 'string' ? sha256(openingMessage) : null } : {}) }); save()
       if (body.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream' })
         for (const delta of [{ role: 'assistant', content: '' }, { content }, {}]) res.write('data: ' + JSON.stringify({ id: 'native-qualification', object: 'chat.completion.chunk', model: body.model, choices: [{ index: 0, delta, finish_reason: Object.keys(delta).length ? null : 'stop' }] }) + '\n\n')
@@ -776,7 +784,7 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
   }
   try {
     if (compatibility) { runtimeHead(); assert.equal(fs.readFileSync(seedMemory, 'utf8'), o['--seed-sha'], 'seed记忆canary不匹配'); seedMemoryHash = hash(seedMemory) }
-    provider = await createNativeProvider({ report, save })
+    provider = await createNativeProvider({ report, save, runtimePin: compatibility ? OLD_RUNTIME.commit : release.commit })
     await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve)); providerPort = provider.address().port
     driverPort = await freePort(); nativePort = await freePort()
     report.webviewRuntime = readNativeDebuggerRuntime({ webOutput, driver: o['--driver'], nativeDriver: o['--native-driver'], candidateSha: prior.candidateSha }); save()

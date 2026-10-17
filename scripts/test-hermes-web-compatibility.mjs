@@ -26,6 +26,9 @@ function physical(file) {
   return resolved
 }
 export const webCompatibilityPlan = () => ({ scope: SCOPE, localExecution: false, installsKernel: false, copiesVenv: false, nativeQualification: false, actualBrowser: 'seed HOME playwright 1.60.0 / Chromium headless-shell', runtime: OLD, installerCalls: 'blocked before request handler' })
+export async function createWebCompatibilityProvider({ report, save = () => {} }) {
+  return createNativeProvider({ report, save, runtimePin: OLD.commit, nonceFamily: 'native-web-compat' })
+}
 export function webCompatibilityArgs(argv) {
   const values = new Set(['--root', '--sha', '--seed-sha', '--web-output', '--build-output', '--output']), o = {}
   for (let i = 0; i < argv.length; i++) {
@@ -226,7 +229,7 @@ export async function executeWebCompatibility(o) {
     assert.equal(prior.browserTooling.browserManifestSha256, selectedBrowser.reportHashes.browserManifestSha256, '旧种子browser manifest漂移')
     Object.assign(report, selectedBrowser.reportHashes, { playwrightVersion: selectedBrowser.playwrightVersion }); Object.assign(canaries, selectedBrowser.files)
     write('input-canaries.json', canaries)
-    provider = await createNativeProvider({ report, save }); await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve)); providerPort = provider.address().port; ports.add(providerPort)
+    provider = await createWebCompatibilityProvider({ report, save }); await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve)); providerPort = provider.address().port; ports.add(providerPort)
     webPort = await freePort(); ports.add(webPort); gatewayPort = await freePort(); ports.add(gatewayPort); runtimePorts.add(gatewayPort)
     assert.equal(ports.size, 3); const guard = path.join(output, 'installer-guard.mjs'); fs.writeFileSync(guard, installerGuardSource(blockedFile))
     web = spawn(process.execPath, ['--import', pathToFileURL(guard).href, path.join(root, 'scripts/serve.js'), '--host', '127.0.0.1', '--port', String(webPort)], { cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })

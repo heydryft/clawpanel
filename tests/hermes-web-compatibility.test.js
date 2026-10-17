@@ -157,3 +157,79 @@ test('旧package/core、错误cache、cache外路径、缺binary和链接祖先�
   const moved = path.join(f.home, 'moved-cache'); fs.renameSync(f.cache, moved); fs.symlinkSync(moved, f.cache, process.platform === 'win32' ? 'junction' : 'dir')
   try { assert.throws(() => m.resolveWebCompatibilityBrowser(f)) } finally { fs.unlinkSync(f.cache); fs.renameSync(moved, f.cache) }
 })
+
+// source-derived组件输入，不是实际Windows/Native抓包；复用已核固定官方完整title合同。
+const webTitleFixture = JSON.parse(fs.readFileSync(new URL('./fixtures/hermes-title-contracts.json', import.meta.url), 'utf8'))
+const webTitleInput = nonce => `Unicode 中文 🦀 café é ${nonce}`
+const webTitleBody = (nonce, model) => { const b = JSON.parse(webTitleFixture.rawCases[0].rawBody); b.model = model; b.messages[1].content = webTitleInput(nonce); return b }
+const webPriorBody = (nonce, model, text = webTitleInput(nonce), known = true) => ({ model, stream: true, messages: [...(known ? [{ role: 'system', content: 'You are Hermes, an AI assistant.' }] : []), { role: 'user', content: text }] })
+async function actualWebProvider(m, native, report) {
+  if (typeof m.createWebCompatibilityProvider === 'function') return m.createWebCompatibilityProvider({ report, save: () => {} })
+  // 先红时执行原真实调用表达式；没有补pin/虚构family或prior。修复后必须走实际接线wrapper。
+  const text = fs.readFileSync(entry, 'utf8'), call = text.match(/provider = await (createNativeProvider\(\{ report, save[^;]*?\}\));/)
+  assert.ok(call, '原Web provider调用不唯一/不存在')
+  return new Function('createNativeProvider', 'report', 'save', `return ${call[1]}`)(native.createNativeProvider, report, () => {})
+}
+async function titleHTTP(server, body, { method = 'POST', auth = 'qualification-native-no-secret' } = {}) {
+  const raw = JSON.stringify(body), response = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, { method, headers: { authorization: 'Bearer ' + auth, 'content-type': 'application/json' }, body: raw, signal: AbortSignal.timeout(5000) })
+  return { status: response.status, text: await response.text(), bodySha256: crypto.createHash('sha256').update(raw).digest('hex') }
+}
+
+test('Webcompat标题真实HTTP：实际旧pin调用与原Unicode输入，原三chat门禁先红后绿', { timeout: 30000 }, async t => {
+  const m = await load(), native = await import('../scripts/test-hermes-tauri-qualification.mjs'), report = complete(); report.provider = []
+  const out = process.env.HERMES_WEB_COMPAT_TITLE_EVIDENCE_DIR || fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hermes-webcompat-title-'))
+  fs.mkdirSync(out, { recursive: true }); const proof = { scope: 'source-derived real loopback HTTP via actual Web compatibility provider call; report gate uses labelled component fixture; NOT actual VM', runtime: m.webCompatibilityPlan().runtime, observations: [], observedVM: false }
+  const server = await actualWebProvider(m, native, report); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    for (const { nonce, model } of report.prompts) {
+      const chat = await titleHTTP(server, webPriorBody(nonce, model)); assert.equal(chat.status, 200)
+      const content = `原生完整回复：${nonce}；模型：${model}。`, expected = [{ role: 'assistant', content: '' }, { content }, {}].map(delta => 'data: ' + JSON.stringify({ id: 'native-qualification', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta, finish_reason: Object.keys(delta).length ? null : 'stop' }] }) + '\n\n').join('') + 'data: [DONE]\n\n'
+      assert.equal(chat.text, expected, '原Unicode/SSE文本逐字节保留')
+      const title = await titleHTTP(server, webTitleBody(nonce, model)); assert.equal(title.status, 200)
+      const text = JSON.parse(title.text).choices[0].message.content, rows = structuredClone(report.provider.filter(c => c.nonce === nonce)); let jsonTitle, parseError
+      try { jsonTitle = JSON.parse(text) } catch (e) { parseError = String(e) }
+      proof.observations.push({ nonce, model, titleBodySha256: title.bodySha256, content: text, jsonTitle, parseError, rows, nonTitle: rows.filter(c => !c.title).length, titles: rows.filter(c => c.title).length })
+    }
+    try { m.assertWebCompatibilityComplete(report); proof.originalGateAccepted = true } catch (e) { proof.originalGateAccepted = false; proof.originalGateError = String(e) }
+    for (const row of proof.observations) {
+      assert.equal(row.nonTitle, 1, '原三chat恰好一次门禁不得吞掉未归因title'); assert.equal(row.titles, 1); assert.ok(row.titles <= 1)
+      assert.deepEqual(row.rows.map(c => c.purpose), ['chat', 'title']); assert.deepEqual(row.jsonTitle, { title: `Hermes qualification ${row.nonce} ${row.model}` })
+      const inputHash = crypto.createHash('sha256').update(webTitleInput(row.nonce)).digest('hex'); assert.equal(row.rows[0].openingMessageSha256, inputHash, '来自实际已核prior正文，不是!title补chat')
+    }
+    assert.equal(proof.originalGateAccepted, true); proof.passed = true
+  } catch (e) { proof.passed = false; proof.error = String(e); throw e }
+  finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); proof.ownedServerClosed = !server.listening; fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(proof, null, 2) + '\n', { flag: 'wx' }); t.diagnostic('Web compatibility source-derived HTTP: ' + out) }
+})
+
+test('Webcompat标题负向：仅补pin不足、真实unknown或同nonce异文prior及错pin/Unicode/重放不授权', { timeout: 30000 }, async t => {
+  const m = await load(), native = await import('../scripts/test-hermes-tauri-qualification.mjs')
+  const out = process.env.HERMES_WEB_COMPAT_TITLE_EVIDENCE_DIR || fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hermes-webcompat-title-negative-'))
+  fs.mkdirSync(out, { recursive: true }); const proof = { scope: 'controlled source-derived real HTTP negatives only; NOT VM', observations: [], ownedServersClosed: 0 }
+  try {
+    for (const variant of ['pin-only-default-native', 'unknown-prior', 'same-nonce-different-prior', 'wrong-runtime-pin', 'changed-Unicode', 'replay', 'unauthorized']) {
+      const report = { provider: [], metadata: [] }, nonce = 'native-acceptance-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', model = 'native-one'
+      const server = variant === 'pin-only-default-native' ? await native.createNativeProvider({ report, runtimePin: commit }) : variant === 'wrong-runtime-pin' ? await native.createNativeProvider({ report, runtimePin: webTitleFixture.upstream[1].pin, nonceFamily: 'native-web-compat' }) : await actualWebProvider(m, native, report)
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+      try {
+        const prior = await titleHTTP(server, webPriorBody(nonce, model, variant === 'same-nonce-different-prior' ? nonce : webTitleInput(nonce), variant !== 'unknown-prior')); assert.equal(prior.status, 200)
+        assert.equal(report.provider[0].purpose, variant === 'unknown-prior' ? 'unattributed' : 'chat'); assert.equal(report.provider[0].title, false)
+        const body = webTitleBody(nonce, model); if (variant === 'changed-Unicode') body.messages[1].content = body.messages[1].content.replace('é', 'é')
+        if (variant === 'replay') { const first = await titleHTTP(server, body); assert.deepEqual(JSON.parse(JSON.parse(first.text).choices[0].message.content), { title: `Hermes qualification ${nonce} ${model}` }) }
+        const result = await titleHTTP(server, body, variant === 'unauthorized' ? { auth: 'wrong-owned-fixture' } : {}); proof.observations.push({ variant, status: result.status, text: result.text, rows: structuredClone(report.provider) })
+        if (variant === 'unauthorized') { assert.equal(result.status, 500); assert.equal(report.provider.length, 1) }
+        else { assert.equal(result.status, 200); assert.equal(report.provider.at(-1).purpose, 'unattributed'); assert.equal(report.provider.at(-1).title, false); assert.equal(JSON.parse(result.text).choices[0].message.content, `原生完整回复：${nonce}；模型：${model}。`) }
+        assert.ok(report.provider.filter(c => c.title && c.nonce === nonce).length <= 1)
+      } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); assert.equal(server.listening, false); proof.ownedServersClosed++ }
+    }
+    proof.passed = true
+  } catch (e) { proof.passed = false; proof.error = String(e); throw e }
+  finally { fs.writeFileSync(path.join(out, 'negative-report.json'), JSON.stringify(proof, null, 2) + '\n', { flag: 'wx' }); t.diagnostic('Web compatibility negative HTTP: ' + out) }
+})
+
+test('Webcompat实际接线：旧seed完成准入后用显式旧pin/family wrapper，不改原Unicode或门禁', async () => {
+  const m = await load(), source = fs.readFileSync(entry, 'utf8'); assert.equal(typeof m.createWebCompatibilityProvider, 'function')
+  assert.match(source, /createNativeProvider\(\{ report, save, runtimePin: OLD\.commit, nonceFamily: 'native-web-compat' \}\)/)
+  assert.match(source, /provider = await createWebCompatibilityProvider\(\{ report, save \}\)/)
+  assert.ok(source.indexOf('validatePrivateCompletion(seed.completion, { home, ...OLD })') < source.indexOf('provider = await createWebCompatibilityProvider'))
+  assert.ok(source.includes('input = `Unicode 中文 🦀 café é ${nonce}`')); assert.equal(m.webCompatibilityPlan().runtime.commit, commit)
+})

@@ -807,3 +807,152 @@ test('R18：stages必须来自单一真实literal，重复/缺失/未知/表达�
   assert.throws(() => readHermesRelease(old.web.replace("stages: ['uv', 'git'", "stages: ['unsafe', 'git'"), old.rust, old.version))
   assert.throws(() => readHermesRelease(f.web.replace('windows:', 'otherPlatform:'), f.rust, f.version))
 })
+
+// 固定上游标题合同：只重放公开资格fixture，不启动任何内核或宿主探针。
+const titleFixturePath = new URL('./fixtures/hermes-title-contracts.json', import.meta.url)
+const titleFixture = JSON.parse(fs.readFileSync(titleFixturePath, 'utf8'))
+const titleEvidence = (item, calls = [item.priorChat], pin = titleFixture.upstream[1].pin) => ({ method: 'POST', path: '/v1/chat/completions', authenticated: true, pin, models: ['qualification-one', 'qualification-two'], calls })
+
+test('固定上游标题：双pin原Git blob/完整system与三份实际wire hash闭合', async () => {
+  const { gunzipSync } = await import('node:zlib')
+  const pins = ['f97608f178d1ffeca59860195ab7da295f7c8e5f', 'd923a5eb487a17c0a68801bba9ef0f56c81040a8']
+  const blobs = ['9e5073cbb8bec3b0d2e63a0ae86eaf32a228277a', 'fa14b71d4061af3d17eeabd813f333b549c66833']
+  assert.deepEqual(titleFixture.upstream.map(x => x.pin), pins)
+  for (const [i, item] of titleFixture.upstream.entries()) {
+    const bytes = gunzipSync(Buffer.from(item.sourceGzipBase64, 'base64'))
+    assert.equal(createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex'), blobs[i])
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), item.sourceSha256)
+    assert.match(bytes.toString(), /def generate_title\(/)
+    assert.match(bytes.toString(), /task="title_generation"/)
+    assert.match(bytes.toString(), /messages=\[\{"role": "system", "content": prompt\}, \{"role": "user", "content": user_snippet\}\]/)
+  }
+  assert.equal(createHash('sha256').update(titleFixture.system).digest('hex'), '3f1eef0616ddd2c13d45a3f8cef4ed648dadfdacdba7fbedceebf5a04d549998')
+  assert.equal(createHash('sha256').update(JSON.stringify(titleFixture.responseFormat)).digest('hex'), titleFixture.responseFormatSha256)
+  for (const item of titleFixture.rawCases) {
+    assert.equal(createHash('sha256').update(item.rawBody).digest('hex'), item.bodySha256)
+    const body = JSON.parse(item.rawBody)
+    assert.deepEqual(body.messages, [{ role: 'system', content: titleFixture.system }, { role: 'user', content: item.nonce }])
+    assert.deepEqual(Object.keys(body), ['messages', 'model', 'reasoning_effort', 'response_format'])
+    assert.equal(Object.hasOwn(body, 'stream'), false)
+  }
+})
+
+test('固定上游标题：精确合同须双pin、认证及同model/nonce唯一已收chat', async () => {
+  const { classifyProviderRequest } = await load()
+  for (const item of titleFixture.rawCases) for (const source of titleFixture.upstream) {
+    assert.equal(classifyProviderRequest(JSON.parse(item.rawBody), titleEvidence(item, [item.priorChat], source.pin)), 'title')
+  }
+})
+
+test('固定上游标题：prefix/结构/stream/路由/认证/来源/关联/重放负控不免检', async () => {
+  const { classifyProviderRequest } = await load(), item = titleFixture.rawCases[0], original = JSON.parse(item.rawBody), context = titleEvidence(item)
+  const changes = [b => { b.messages[0].content += ' ' }, b => { b.messages[0].content = 'You name chat sessions.' }, b => { b.messages.push({ role: 'assistant', content: 'extra' }) }, b => { b.messages.reverse() }, b => { b.messages[1].role = 'assistant' }, b => { b.messages[1].content += ' extra' }, b => { b.messages[1].extra = true }, b => { b.messages[0].name = 'extra' }, b => { b.messages.pop() }, b => { b.stream = true }, b => { b.stream = false }, b => { b.tools = [] }, b => { b.extra = true }, b => { b.reasoning_effort = 'low' }, b => { b.response_format.json_schema.strict = false }, b => { b.response_format.json_schema.schema.additionalProperties = true }, b => { b.model = 'qualification-two' }, b => { delete b.response_format }]
+  for (const change of changes) { const b = structuredClone(original); change(b); assert.equal(classifyProviderRequest(b, context), 'unattributed', String(change)) }
+  for (const patch of [{ method: 'GET' }, { method: 'post' }, { path: '/v1/chat/completions?x=1' }, { path: '/v1/chat/completions/' }, { authenticated: false }, { authenticated: 'true' }, { pin: '0'.repeat(40) }, { models: [] }, { calls: [] }, { calls: [item.priorChat, item.priorChat] }, { calls: [{ ...item.priorChat, authenticated: false }] }, { calls: [{ ...item.priorChat, stream: false }] }, { calls: [{ ...item.priorChat, model: 'qualification-two' }] }, { calls: [{ ...item.priorChat, nonce: item.nonce + 'x' }] }, { calls: [item.priorChat, { ...item.priorChat, purpose: 'title' }] }]) assert.equal(classifyProviderRequest(original, { ...context, ...patch }), 'unattributed', JSON.stringify(patch))
+  assert.equal(classifyProviderRequest(original), 'unattributed', '无可信调用端关联不单凭prompt放行')
+})
+
+test('固定上游标题：真实HTTP原wire重放三chat三title，unknown原门禁留红到实现', { timeout: 30000 }, async t => {
+  const { classifyProviderRequest } = await load(), calls = [], receipts = [], token = 'qualification-local-no-secret'
+  const out = process.env.HERMES_TITLE_EVIDENCE_DIR || fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hermes-title-http-'))
+  fs.mkdirSync(out, { recursive: true })
+  const report = { scope: 'actual loopback HTTP with exact original R26 title wire SHA; controlled component, not VM/Hermes execution', sourceSha256: createHash('sha256').update(fs.readFileSync(script)).digest('hex'), fixtureSha256: createHash('sha256').update(fs.readFileSync(titleFixturePath)).digest('hex'), calls, receipts }
+  const server = http.createServer(async (req, res) => {
+    try {
+      let raw = ''; for await (const part of req) { raw += part; assert.ok(Buffer.byteLength(raw) <= 65536) }
+      const body = JSON.parse(raw), authenticated = req.headers.authorization === `Bearer ${token}`
+      const purpose = classifyProviderRequest(body, { ...titleEvidence(titleFixture.rawCases[0], calls), method: req.method, path: req.url, authenticated })
+      const nonce = body.messages.find(m => m.role === 'user')?.content
+      calls.push({ purpose, nonce, model: body.model, stream: body.stream, authenticated })
+      receipts.push({ method: req.method, path: req.url, authenticated, rawBody: raw, bodySha256: createHash('sha256').update(raw).digest('hex'), purpose })
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ purpose }))
+    } catch (error) { report.serverError = String(error); res.writeHead(500); res.end('{}') }
+  })
+  try {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const base = `http://127.0.0.1:${server.address().port}`
+    for (const item of titleFixture.rawCases) {
+      const chat = JSON.stringify({ messages: [{ role: 'system', content: 'You are Hermes, an AI assistant.' }, { role: 'user', content: item.nonce }], model: item.model, stream: true })
+      for (const raw of [chat, item.rawBody]) {
+        const r = await fetch(base + '/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: raw, signal: AbortSignal.timeout(5000) }); assert.equal(r.status, 200); await r.json()
+      }
+    }
+    assert.equal(report.serverError, undefined)
+    report.counts = { chats: calls.filter(c => c.purpose === 'chat').length, titles: calls.filter(c => c.purpose === 'title').length, unknown: calls.filter(c => c.purpose === 'unattributed').length }
+    for (const item of titleFixture.rawCases) assert.equal(receipts.filter(r => r.bodySha256 === item.bodySha256).length, 1)
+    assert.equal(report.counts.unknown, 0, '实际固定title仍unknown')
+    assert.equal(report.counts.chats, 3); assert.equal(report.counts.titles, 3)
+    for (const item of titleFixture.rawCases) { assert.equal(calls.filter(c => c.purpose === 'chat' && c.nonce === item.nonce && c.model === item.model).length, 1); assert.ok(calls.filter(c => c.purpose === 'title' && c.nonce === item.nonce).length <= 1) }
+    report.passed = true
+  } catch (error) { report.passed = false; report.error = String(error); throw error }
+  finally { await new Promise(resolve => server.close(resolve)); report.loopbackClosed = !server.listening; fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' }); t.diagnostic('HTTP evidence: ' + out) }
+})
+
+test('strict标题响应：真实接线handler返回JSON title，保留SSE/chat/旧title/unknown', { timeout: 30000 }, async t => {
+  const q = await load(), { compileFunction } = await import('node:vm'), { classifyHermesMetadataRequest } = await import('../scripts/hermes-qualification-provider.mjs')
+  const source = fs.readFileSync(script, 'utf8'), marker = 'provider = http.createServer(async (req, res) => {'
+  const start = source.indexOf(marker), end = source.indexOf('; await new Promise(resolve => provider.listen', start)
+  assert.ok(start > 0 && end > start); assert.equal(source.indexOf(marker, start + 1), -1)
+  // 只截取可信工具真实handler，不进入execute/VM安装；不复制其分类或响应实现。
+  const expression = source.slice(start + 'provider = '.length, end)
+  const out = process.env.HERMES_TITLE_REPLY_EVIDENCE_DIR || fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hermes-title-reply-'))
+  fs.mkdirSync(out, { recursive: true })
+  const calls = [], providerHTTP = [], writes = {}, r = {}, observations = []
+  const report = { scope: 'actual trusted Windows provider handler carve + real loopback HTTP; not full VM/kernel/UI', sourceSha256: createHash('sha256').update(source).digest('hex'), handlerSha256: createHash('sha256').update(expression).digest('hex'), observations, calls, providerHTTP }
+  const bindings = { http, assert, classifyHermesMetadataRequest, classifyProviderRequest: q.classifyProviderRequest, qualificationProviderReply: q.qualificationProviderReply, providerModels: ['qualification-one', 'qualification-two'], release: { commit: titleFixture.upstream[1].pin }, calls, providerHTTP, r, save() {}, write(name, value) { assert.ok(['provider-http.json', 'provider-metadata.json', 'provider-requests.json'].includes(name)); writes[name] = structuredClone(value) }, digest: value => createHash('sha256').update(value).digest('hex') }
+  const server = compileFunction('return (' + expression + ')', Object.keys(bindings), { filename: '<owned-exact-windows-provider-handler>' })(...Object.values(bindings))
+  async function send(raw, authorization = 'Bearer qualification-local-no-secret') {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: raw, signal: AbortSignal.timeout(5000) })
+    const text = await response.text(); const row = { requestSha256: createHash('sha256').update(raw).digest('hex'), status: response.status, contentType: response.headers.get('content-type'), response: text }; observations.push(row); return row
+  }
+  try {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const titleRows = []
+    for (const item of titleFixture.rawCases) {
+      const chat = await send(JSON.stringify({ messages: [{ role: 'system', content: 'You are Hermes, an AI assistant.' }, { role: 'user', content: item.nonce }], model: item.model, stream: true }))
+      const reply = `Hermes qualification reply ${item.nonce} ${item.model}.`
+      const expected = [{ role: 'assistant', content: '' }, { content: reply }, {}].map(delta => 'data: ' + JSON.stringify({ id: 'qualification', object: 'chat.completion.chunk', model: item.model, choices: [{ index: 0, delta, finish_reason: Object.keys(delta).length ? null : 'stop' }] }) + '\n\n').join('') + 'data: [DONE]\n\n'
+      assert.equal(chat.status, 200); assert.match(chat.contentType, /text\/event-stream/); assert.equal(chat.response, expected)
+      const response = await send(item.rawBody); assert.equal(response.status, 200)
+      const envelope = JSON.parse(response.response); assert.equal(envelope.choices[0].finish_reason, 'stop'); assert.deepEqual(envelope.usage, { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 })
+      const content = envelope.choices[0].message.content; assert.equal(typeof content, 'string')
+      const row = { nonce: item.nonce, model: item.model, requestSha256: response.requestSha256, content, parsed: null }
+      try { row.parsed = JSON.parse(content) } catch (error) { row.parseError = String(error) }
+      titleRows.push(row)
+    }
+    report.titleRows = titleRows; report.structuredValid = titleRows.filter(x => x.parsed && Object.keys(x.parsed).length === 1 && x.parsed.title === `Hermes qualification ${x.nonce} ${x.model}`).length
+    assert.equal(report.structuredValid, 3, '已声明strict session_title必须返回合法JSON content，不依赖上游prose fallback')
+    assert.equal(calls.filter(x => x.purpose === 'unattributed').length, 0)
+    for (const item of titleFixture.rawCases) { assert.equal(calls.filter(x => x.purpose === 'chat' && x.nonce === item.nonce && x.model === item.model).length, 1); assert.ok(calls.filter(x => x.purpose === 'title' && x.nonce === item.nonce).length <= 1) }
+    const legacyNonce = 'hq-00000000-0000-0000-0000-000000000099', model = 'qualification-one'
+    for (const [label, system, purpose] of [['legacy-title', 'You are a title generator. You output ONLY a thread title. Nothing else.', 'title'], ['unknown', 'unknown helper task', 'unattributed'], ['chat-nonstream', 'You are Hermes, an AI assistant.', 'chat']]) {
+      const result = await send(JSON.stringify({ messages: [{ role: 'system', content: system }, { role: 'user', content: legacyNonce }], model }))
+      assert.equal(result.status, 200); assert.equal(JSON.parse(result.response).choices[0].message.content, `Hermes qualification reply ${legacyNonce} ${model}.`); assert.equal(calls.at(-1).purpose, purpose); result.negativeLabel = label
+    }
+    const unauthorized = await send(titleFixture.rawCases[0].rawBody, 'Bearer wrong-owned-fixture')
+    assert.equal(unauthorized.status, 500); assert.equal(unauthorized.response, 'qualification provider error'); assert.equal(calls.at(-1).purpose, 'unattributed'); assert.equal(providerHTTP.at(-1).accepted, false)
+    assert.deepEqual(writes['provider-requests.json'], calls)
+    report.passed = true
+  } catch (error) { report.passed = false; report.error = String(error); throw error }
+  finally { await new Promise(resolve => server.close(resolve)); report.loopbackClosed = !server.listening; fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' }); t.diagnostic('Exact handler HTTP evidence: ' + out) }
+})
+
+test('native标题family：显式canonical family、不改写nonce、未知family拒绝', async () => {
+  const q = await load(), item = titleFixture.rawCases[0], body = JSON.parse(item.rawBody)
+  const nonce = 'native-acceptance-12345678-1234-1234-1234-123456789abc'
+  body.model = 'native-one'; body.messages[1].content = nonce
+  const evidence = { ...titleEvidence(item), nonceFamily: 'native', models: ['native-one', 'native-two'], calls: [{ purpose: 'chat', nonce, model: body.model, authenticated: true, stream: true }] }
+  for (const source of titleFixture.upstream) {
+    assert.equal(q.classifyProviderRequest(body, { ...evidence, pin: source.pin }), 'title')
+    assert.deepEqual(JSON.parse(q.qualificationProviderReply(body, nonce, { ...evidence, pin: source.pin })), { title: `Hermes qualification ${nonce} native-one` })
+  }
+  for (const nonceFamily of [undefined, 'web', 'unknown', null, '', true]) assert.equal(q.classifyProviderRequest(body, { ...evidence, nonceFamily }), 'unattributed')
+  for (const bad of [nonce.toUpperCase(), nonce + 'x', nonce.replace('native-acceptance-', 'hq-'), 'prefix ' + nonce]) {
+    const changed = structuredClone(body); changed.messages[1].content = bad; assert.equal(q.classifyProviderRequest(changed, evidence), 'unattributed')
+  }
+  const webBody = JSON.parse(item.rawBody)
+  assert.equal(q.classifyProviderRequest(webBody, titleEvidence(item)), 'title')
+  assert.equal(q.classifyProviderRequest(webBody, { ...titleEvidence(item), nonceFamily: 'web' }), 'title')
+  assert.equal(q.classifyProviderRequest(webBody, { ...titleEvidence(item), nonceFamily: 'native' }), 'unattributed')
+  for (const nonceFamily of ['unknown', null, '']) assert.equal(q.classifyProviderRequest(webBody, { ...titleEvidence(item), nonceFamily }), 'unattributed')
+  assert.equal(body.messages[1].content, nonce)
+})
