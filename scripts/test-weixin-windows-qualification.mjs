@@ -244,7 +244,7 @@ export class W3C{
  async create(application,userDataFolder){
   assert.ok(typeof userDataFolder==='string'&&(path.win32.isAbsolute(userDataFolder)||path.isAbsolute(userDataFolder)),'userDataFolder 必须为私有绝对profile路径');const paths=path.win32.isAbsolute(userDataFolder)?path.win32:path;assert.ok(paths!==path.win32||/^[a-z]:\\/i.test(userDataFolder),'profile拒绝网络路径');assert.equal(paths.resolve(userDataFolder),userDataFolder,'profile路径须正规化')
   // 固定tauri-driver 2.1.0会覆盖顶层ms:edgeOptions；必须经TauriOptions.webviewOptions转发。
-  this.requestedCapabilities={capabilities:{alwaysMatch:{'tauri:options':{application,webviewOptions:{userDataFolder}}}}}
+  this.requestedCapabilities={capabilities:{alwaysMatch:{'tauri:options':{application,webviewOptions:{userDataFolder,additionalBrowserArguments:['remote-debugging-port=0','remote-debugging-address=127.0.0.1']}}}}}
   const v=await this.request('POST','/session',this.requestedCapabilities);assert.ok(v.sessionId);this.session=v.sessionId;this.sessionInfo={sessionId:v.sessionId,capabilities:v.capabilities,application,requestedCapabilities:this.requestedCapabilities};await this.command('POST','/timeouts',{script:120000,pageLoad:60000,implicit:0})
  }
  script(script,args=[]){return this.command('POST','/execute/sync',{script,args})}
@@ -256,9 +256,24 @@ export class W3C{
 async function until(fn,timeout=120000){const end=Date.now()+timeout;do{const v=await fn();if(v)return v;await wait(300)}while(Date.now()<end);throw Error('bounded wait timeout')}
 function physical(p){p=path.resolve(p);for(let q=p;;q=path.dirname(q)){if(fs.existsSync(q)){assert.ok(!fs.lstatSync(q).isSymbolicLink(),'路径链接');const real=fs.realpathSync.native(q);assert.equal(real.toLowerCase(),q.toLowerCase(),'非physical路径');}if(path.dirname(q)===q)break}return p}
 
-// 调试开关仅限driver及其子进程；不继承其它debugger覆盖，不写宿主环境。
+// Browser参数只经W3C capability提交；子环境清除冲突覆盖，不修改父/宿主环境。
 export function nativeDriverChildEnv(env) {
-  return { ...Object.fromEntries(Object.entries(env).filter(([k]) => !/^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k))), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=0 --remote-debugging-address=127.0.0.1' }
+  return Object.fromEntries(Object.entries(env).filter(([k]) => !/^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k)))
+}
+// 只记录交给spawn的白名单值；不是driver、应用或WebView实际收到环境的证明。
+export function nativeDriverEnvSubmission(env) {
+  assert.ok(typeof env.WEBVIEW2_USER_DATA_FOLDER === 'string' && env.WEBVIEW2_USER_DATA_FOLDER.length, '提交收据缺私有UDD')
+  assert.ok(!Object.keys(env).some(k => /^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k)), '提交收据仍有debug环境冲突')
+  return {
+    scope: 'driver-child spawn submission only; not actual driver/app/runtime environment readback',
+    actualEnvironmentObserved: false,
+    submitted: {
+      WEBVIEW2_USER_DATA_FOLDER: env.WEBVIEW2_USER_DATA_FOLDER,
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: null,
+      WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER: null,
+      WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER: null,
+    },
+  }
 }
 const debugPath = value => (path.win32.isAbsolute(value) ? path.win32 : path).normalize(value).toLowerCase()
 const debugIdentity = p => `${p.pid}:${p.creationDate}`
@@ -459,7 +474,10 @@ async function execute(o){
   const panel=path.join(home,'.openclaw');fs.mkdirSync(panel,{recursive:true});const configFile=path.join(panel,'openclaw.json'),panelFile=path.join(panel,'clawpanel.json');fs.writeFileSync(configFile,JSON.stringify({gateway:{mode:'local'},channels:{},plugins:{entries:{}}}));const panelConfig={ignoreRisk:true,openclawDir:panel,nodePath:path.dirname(process.execPath),openclawCliPath:selected.cli,openclawSearchPaths:[selected.cli],engineMode:'openclaw',enabledEngines:['openclaw'],engineSetupChoice:'explicit',autoStartGateway:false};fs.writeFileSync(panelFile,JSON.stringify(panelConfig))
   env.NPM_CONFIG_PREFIX=path.dirname(selected.cli);env.PATH=path.dirname(selected.cli)+';'+env.PATH
   const driverPort=await freePort(),nativePort=await freePort();ports.add(driverPort);ports.add(nativePort)
-  driver=spawn(tauri,['--port',String(driverPort),'--native-port',String(nativePort),'--native-driver',edge],{cwd:root,env: nativeDriverChildEnv(env),windowsHide:true,stdio:['ignore','pipe','pipe']});assert.ok(driver.pid);pending.add(driver.pid)
+  const driverEnv = nativeDriverChildEnv(env)
+  report.driverEnvSubmission = nativeDriverEnvSubmission(driverEnv)
+  receipt('driver-env-submission',report.driverEnvSubmission);save()
+  driver=spawn(tauri,['--port',String(driverPort),'--native-port',String(nativePort),'--native-driver',edge],{cwd:root,env: driverEnv,windowsHide:true,stdio:['ignore','pipe','pipe']});assert.ok(driver.pid);pending.add(driver.pid)
   for(const [stream,key] of [[driver.stdout,'stdout'],[driver.stderr,'stderr']])stream.on('data',b=>{driverLogBytes[key]+=b.length;if(driverLogBytes[key]>16*1024*1024){driverOverflow=true;driver.kill()}else driverLogs[key].push(b)})
   await until(async()=>{try{return (await fetch(`http://127.0.0.1:${driverPort}/status`,{signal:AbortSignal.timeout(1000)})).ok}catch{return false}},30000)
   client=new W3C(`http://127.0.0.1:${driverPort}`);const launch={application,envUserDataFolder:env.WEBVIEW2_USER_DATA_FOLDER,before:webviewProfileMetadata({home,userDataFolder:env.WEBVIEW2_USER_DATA_FOLDER})};report.sessionLaunch=launch;save()

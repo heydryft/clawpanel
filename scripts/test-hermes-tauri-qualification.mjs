@@ -409,7 +409,7 @@ export class NativeWebDriver {
     const paths = path.win32.isAbsolute(userDataFolder) ? path.win32 : path
     assert.ok(paths !== path.win32 || /^[a-z]:\\/i.test(userDataFolder), 'profile拒绝网络路径'); assert.equal(paths.resolve(userDataFolder), userDataFolder, 'profile路径须正规化')
     // 固定tauri-driver 2.1.0从TauriOptions转发webviewOptions；顶层ms:edgeOptions会被覆盖。
-    this.requestedCapabilities = { capabilities: { alwaysMatch: { 'tauri:options': { application, webviewOptions: { userDataFolder } } } } }
+    this.requestedCapabilities = { capabilities: { alwaysMatch: { 'tauri:options': { application, webviewOptions: { userDataFolder, additionalBrowserArguments: ['remote-debugging-port=0', 'remote-debugging-address=127.0.0.1'] } } } } }
     const data = await this.request('POST', '/session', this.requestedCapabilities)
     assert.ok(data?.sessionId, '缺少真实 WebDriver session')
     this.session = data.sessionId
@@ -448,9 +448,24 @@ export class NativeWebDriver {
 }
 
 
-// 调试开关仅限driver及其子进程；不继承其它debugger覆盖，不写宿主环境。
+// Browser参数只经W3C capability提交；子环境清除冲突覆盖，不修改父/宿主环境。
 export function nativeDriverChildEnv(env) {
-  return { ...Object.fromEntries(Object.entries(env).filter(([k]) => !/^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k))), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=0 --remote-debugging-address=127.0.0.1' }
+  return Object.fromEntries(Object.entries(env).filter(([k]) => !/^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k)))
+}
+// 只记录交给spawn的白名单值；不是driver、应用或WebView实际收到环境的证明。
+export function nativeDriverEnvSubmission(env) {
+  assert.ok(typeof env.WEBVIEW2_USER_DATA_FOLDER === 'string' && env.WEBVIEW2_USER_DATA_FOLDER.length, '提交收据缺私有UDD')
+  assert.ok(!Object.keys(env).some(k => /^WEBVIEW2_(?:ADDITIONAL_BROWSER_ARGUMENTS|PIPE_FOR_SCRIPT_DEBUGGER|WAIT_FOR_SCRIPT_DEBUGGER)$/i.test(k)), '提交收据仍有debug环境冲突')
+  return {
+    scope: 'driver-child spawn submission only; not actual driver/app/runtime environment readback',
+    actualEnvironmentObserved: false,
+    submitted: {
+      WEBVIEW2_USER_DATA_FOLDER: env.WEBVIEW2_USER_DATA_FOLDER,
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: null,
+      WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER: null,
+      WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER: null,
+    },
+  }
 }
 const debugPath = value => (path.win32.isAbsolute(value) ? path.win32 : path).normalize(value).toLowerCase()
 const debugIdentity = p => `${p.pid}:${p.creationDate}`
@@ -765,8 +780,11 @@ $listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq '
     await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve)); providerPort = provider.address().port
     driverPort = await freePort(); nativePort = await freePort()
     report.webviewRuntime = readNativeDebuggerRuntime({ webOutput, driver: o['--driver'], nativeDriver: o['--native-driver'], candidateSha: prior.candidateSha }); save()
+    const driverEnv = nativeDriverChildEnv(env)
+    report.driverEnvSubmission = nativeDriverEnvSubmission(driverEnv)
+    fs.writeFileSync(path.join(output, 'driver-env-submission.json'), JSON.stringify(report.driverEnvSubmission, null, 2)); save()
     const log = fs.openSync(path.join(output, 'driver.log'), 'a')
-    driver = spawn(physical(o['--driver']), ['--port', String(driverPort), '--native-port', String(nativePort), '--native-driver', physical(o['--native-driver'])], { env: nativeDriverChildEnv(env), windowsHide: true, stdio: ['ignore', log, log] })
+    driver = spawn(physical(o['--driver']), ['--port', String(driverPort), '--native-port', String(nativePort), '--native-driver', physical(o['--native-driver'])], { env: driverEnv, windowsHide: true, stdio: ['ignore', log, log] })
     fs.closeSync(log)
     let spawnError; driver.once('error', e => { spawnError = e })
     await until(async () => { if (spawnError) throw spawnError; return await reachable(driverPort) }, 30000)
