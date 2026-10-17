@@ -38,15 +38,33 @@ function envelope(payload, pin, sha) {
   return HERMES_WINDOWS_SCRIPT_ENVELOPE.replaceAll('__PIN__', pin).replaceAll('__SHA__', sha).replaceAll('__DATA__', payload)
 }
 
-export function hermesWindowsScript(base, { platform = process.platform, version, pin } = {}) {
+export function hermesWindowsScript(base, { platform = process.platform, version, pin, statusTailDiagnostic = false } = {}) {
+  if (typeof statusTailDiagnostic !== 'boolean') throw Error('Hermes status tail boolean contract mismatch')
+  if (statusTailDiagnostic && (platform !== 'win32' || version !== '0.22.2' || pin !== pins['0.22.2'])) throw Error('Hermes status tail unsupported contract')
   if (platform !== 'win32') return base
   if (pins[version] !== pin || typeof base !== 'string' || base.includes('\0')) throw Error('Hermes Windows script contract mismatch')
   let script = base.replaceAll('\r\n', '\n')
   if (version === '0.22.2') {
     const anchor = "    _hp('main_b')\n", final = '\nfinally:\n'
     if (!script.includes(pin) || script.split(anchor).length !== 2 || script.split(final).length !== 2) throw Error('Hermes Windows PM contract mismatch')
-    const install = HERMES_WINDOWS_CIM_INSTALL
-    script = script.replace(anchor, install + anchor).replace(final, "\nfinally:\n    if callable(globals().get('_cp_cim_restore')):_cp_cim_restore()\n")
+    let install = HERMES_WINDOWS_CIM_INSTALL, tailRestore = ''
+    if (statusTailDiagnostic) {
+      // 默认关闭时不读取新文件、不改变原 capsule；诊断只接受固定原 PM 模板。
+      if (hash(script) !== '655496bcf4631841d394d40f2093b5f0d1517f24ba0f68c9b31905643c824c8a') throw Error('Hermes status tail base contract mismatch')
+      const tailSource = fs.readFileSync(new URL('./hermes-status-tail-observation.py', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
+      if (hash(tailSource) !== '8b4f26cb9850ed3b9c4f373467bdf6529c7acb137d9c9828171bccd0870c3a52') throw Error('Hermes status tail source contract mismatch')
+      // run/status/stop 共用同一正文；仅在既有正常导入/CIM 安装后按精确 words 接线。
+      install += `    _cp_tail_observation = None
+    if os.name=='nt' and words in (['gateway'], ['gateway', 'status']):
+        _cp_tail_source = ${JSON.stringify(tailSource)}.encode('utf-8')
+        require(hashlib.sha256(_cp_tail_source).hexdigest() == '${hash(tailSource)}', 'status tail source contract mismatch')
+        _cp_tail_scope = {'__name__': 'clawpanel_status_tail_observation'}
+        exec(compile(_cp_tail_source, '<clawpanel-status-tail-observation>', 'exec'), _cp_tail_scope)
+        _cp_tail_observation = _cp_tail_scope['install_status_tail_observation'](_cp_g, root, PIN, words)
+`
+      tailRestore = "    if globals().get('_cp_tail_observation') is not None:_cp_tail_observation.restore()\n"
+    }
+    script = script.replace(anchor, install + anchor).replace(final, "\nfinally:\n" + tailRestore + "    if callable(globals().get('_cp_cim_restore')):_cp_cim_restore()\n")
   } else if (!script.includes(pin) || !script.includes('install_windows_cim_probe')) throw Error('Hermes Windows legacy contract mismatch')
   let decoder = ''
   if (version === '0.22.2' && script.includes('install_private_gateway_identity(') && !script.includes('def decode_clawpanel_private_script_bytes')) {
