@@ -134,7 +134,7 @@ def install_status_tail_observation(module, root, pin, words):
     try:
         root = Path(root)
         if (os.name != 'nt' or sys.platform != 'win32' or pin != _PIN or
-                words not in (['gateway'], ['gateway', 'status']) or root.resolve(strict=True) != root):
+                words != ['gateway', 'status'] or root.resolve(strict=True) != root):
             raise ValueError('tail observation contract mismatch')
         file = root / 'hermes_cli' / 'gateway.py'
         with file.open('rb') as stream:

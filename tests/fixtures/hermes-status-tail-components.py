@@ -251,6 +251,40 @@ def _print_standalone_by_config():
             except ValueError: pass
             else: raise AssertionError('foreign executed body accepted')
         restore(); passed = 4
+    elif group == 'bare-gateway':
+        # 只执行面板接线 AST；helper exec 由自有 spy 接收，绝不运行 CLI 或上游函数。
+        failures = []
+        tree = ast.parse(data['body'])
+        gate = next(n for n in ast.walk(tree) if isinstance(n, ast.If) and n.body and
+                    isinstance(n.body[0], ast.Assign) and any(isinstance(t, ast.Name) and t.id == '_cp_tail_source' for t in n.body[0].targets))
+        for words in (['gateway'], ['gateway', 'run'], ['gateway', 'stop'], ['gateway', 'status', '--deep'], ['gateway', 'status']):
+            calls = []
+            def install(*args): calls.append(('install', args[-1])); return object()
+            def helper_exec(code, scope): calls.append(('exec',)); scope['install_status_tail_observation'] = install
+            def require(ok, message): assert ok, message
+            scope = dict(os=types.SimpleNamespace(name='nt'), words=words, hashlib=hashlib, require=require,
+                         _cp_g=module, root=root, PIN=ns['_PIN'], exec=helper_exec)
+            with contextlib.redirect_stderr(err):
+                exec(compile(ast.Module(body=[gate], type_ignores=[]), '<owned-composer-gate>', 'exec'), scope)
+            if calls != ([('exec',), ('install', words)] if words == ['gateway', 'status'] else []):
+                failures.append(('composer must not activate', words, calls))
+            assert err.getvalue() == ''
+        reads = []
+        class OwnPath:
+            def resolve(self, **kw): return self
+            def __truediv__(self, child): return self
+            def open(self, *args): reads.append('source-read'); raise AssertionError('bare gateway must not inspect source')
+        original_path = ns['Path']
+        ns['Path'] = lambda value: OwnPath()
+        try:
+            with contextlib.redirect_stderr(err):
+                obs = ns['install_status_tail_observation'](module, root, ns['_PIN'], ['gateway'])
+            if obs.valid or reads or err.getvalue():
+                failures.append(('installer must not activate/read/emit', reads, obs.valid, err.getvalue()))
+            assert all(getattr(module, name) is fn for name, fn in originals.items())
+        finally: ns['Path'] = original_path
+        assert not failures, failures
+        passed = 8
     elif group == 'argv':
         units = [len(subprocess.list2cmdline(row).encode('utf-16-le')) // 2 + 1 for row in data['rows']]
         assert all(n <= 32767 for n in units), units
@@ -267,6 +301,10 @@ def _print_standalone_by_config():
         cmd = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_cmd_status')
         calls = [n.value.func.id for n in cmd.body[-3:] if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)]
         assert calls == list(names)
+        table = next(n.value for n in tree.body if isinstance(n, ast.Assign) and
+                     any(isinstance(t, ast.Name) and t.id == '_GATEWAY_SUBCOMMANDS' for t in n.targets))
+        dispatch = {key.value: value.id for key, value in zip(table.keys, table.values)}
+        assert dispatch[None] == dispatch['run'] == '_cmd_run' and dispatch['status'] == '_cmd_status'
         compile(source_bytes, '<static-upstream-no-execution>', 'exec')
         passed = 8
     else: raise AssertionError('unknown component group')

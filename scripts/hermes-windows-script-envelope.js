@@ -52,10 +52,10 @@ export function hermesWindowsScript(base, { platform = process.platform, version
       // 默认关闭时不读取新文件、不改变原 capsule；诊断只接受固定原 PM 模板。
       if (hash(script) !== '655496bcf4631841d394d40f2093b5f0d1517f24ba0f68c9b31905643c824c8a') throw Error('Hermes status tail base contract mismatch')
       const tailSource = fs.readFileSync(new URL('./hermes-status-tail-observation.py', import.meta.url), 'utf8').replaceAll('\r\n', '\n')
-      if (hash(tailSource) !== '8b4f26cb9850ed3b9c4f373467bdf6529c7acb137d9c9828171bccd0870c3a52') throw Error('Hermes status tail source contract mismatch')
+      if (hash(tailSource) !== 'fd3a2006ff0f7e5a27e4ed4d7cbecc1614ae94f2e31a617543fb75f1acde5487') throw Error('Hermes status tail source contract mismatch')
       // run/status/stop 共用同一正文；仅在既有正常导入/CIM 安装后按精确 words 接线。
       install += `    _cp_tail_observation = None
-    if os.name=='nt' and words in (['gateway'], ['gateway', 'status']):
+    if os.name=='nt' and words == ['gateway', 'status']:
         _cp_tail_source = ${JSON.stringify(tailSource)}.encode('utf-8')
         require(hashlib.sha256(_cp_tail_source).hexdigest() == '${hash(tailSource)}', 'status tail source contract mismatch')
         _cp_tail_scope = {'__name__': 'clawpanel_status_tail_observation'}
