@@ -8,6 +8,7 @@ import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { evaluateFixtureBoundsGate, qualifyFixtureCleanup, encodeFixtureIdentityEvidence, FIXTURE_IDENTITY_LIMITS } from '../scripts/hermes-cli-owned-identity.mjs'
+import { beginFixtureCleanupRaw, finishFixtureCleanupRaw } from '../scripts/hermes-cli-bounds-observation.mjs'
 
 const root = path.resolve(process.env.HERMES_ASYNC_TEST_ROOT || fileURLToPath(new URL('..', import.meta.url)))
 const evidence = process.env.HERMES_BOUNDS_TEST_EVIDENCE
@@ -210,15 +211,17 @@ test('真实 HTTP 过载：CLI最多2执行/8排队、排队计入15秒、不重
     const sink = { count: 0, probes: [] }
     if (observer) {
       try {
+        observer = observer.forCleanup()
         const native = await observer.snapshot(pids)
         const classified = (await import('../scripts/hermes-cli-bounds-observation.mjs')).classifyFixtureIdentitySample({ starts: report.events.filter(e => e.event === 'start'), processes: native.processes, expectedExecutable })
+        const rawScope = beginFixtureCleanupRaw()
         const startedAtMs = Date.now()
         rawProbeSink = sink
         try { report.cleanup = classified.processes.map(row => { const rawAlive = alive(row.pid); return { ...row, rawAlive, alive: rawAlive, nativeOwnedActive: row.active } }) }
         finally { rawProbeSink = null }
-        report.cleanupRawOrder = { kind: 'captured-after-final-native', nativeCompletedAtMs: native.completedAtMs, startedAtMs, completedAtMs: Date.now() }
+        report.cleanupRawOrder = finishFixtureCleanupRaw(rawScope, native, sink.probes, { startedAtMs, completedAtMs: Date.now() })
       } catch (error) { report.observerErrors.push(String(error)); report.cleanup = pids.map(pid => ({ pid, alive: true, observationFailed: true })) }
-      await observer.close()
+      try { await observer.close() } catch (error) { report.observerErrors.push(String(error)) }
     } else {
       const startedAtMs = Date.now()
       rawProbeSink = sink

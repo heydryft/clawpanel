@@ -13,6 +13,7 @@ import { prepareStartupDiagnosticSpawn, startHermesFilePhaseObservation } from '
 import { observeHermesPythonCache } from './hermes-python-cache-observation.mjs'
 import { classifyHermesMetadataRequest } from './hermes-qualification-provider.mjs'
 import { createHermesExecFileObserver } from './hermes-exec-observation.mjs'
+import { decodeStatusTailObservation } from './hermes-status-tail-receipts.mjs'
 
 export const STAGES = ['source-isolation', 'install-privatecompletion', 'runtime-ui', 'update-stop', 'uninstall-reinstall-preserve']
 
@@ -102,7 +103,7 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 
 export function parseArgs(args) {
-  const flags = new Set(['--plan', '--execute', '--help', '--matrix', '--startup-diagnostic', '--startup-stack-samples'])
+  const flags = new Set(['--plan', '--execute', '--help', '--matrix', '--startup-diagnostic', '--startup-stack-samples', '--status-tail-diagnostic'])
   const values = new Set(['--root', '--sha', '--version', '--variant', '--output', '--verify-linux-evidence', '--publish-evidence'])
   const o = {}
   for (let i = 0; i < args.length; i++) {
@@ -117,10 +118,17 @@ export function parseArgs(args) {
   assert.ok([o['--plan'], o['--execute'], o['--matrix'], o['--verify-linux-evidence'], o['--publish-evidence']].filter(Boolean).length <= 1, '模式互斥')
   if (o['--startup-stack-samples']) assert.equal(o['--startup-diagnostic'], true, 'stack sampling requires startup diagnostic')
   if (o['--startup-diagnostic']) assert.equal(o['--execute'], true, 'startup diagnostic requires execute')
+  if (o['--status-tail-diagnostic']) {
+    assert.ok(o['--execute'] || o['--plan'], 'status tail diagnostic requires execute or plan')
+    assert.ok(!o['--startup-diagnostic'] && !o['--startup-stack-samples'], 'status tail diagnostic is separate from startup sampling')
+    assert.ok(o['--version'] === '0.22.2' && o['--variant'] === 'new', 'status tail diagnostic requires exact new candidate')
+  }
   return o
 }
 
 export function matrixFromInputs(env) {
+  assert.ok(env.STATUS_TAIL_DIAGNOSTIC === undefined || ['true', 'false', ''].includes(env.STATUS_TAIL_DIAGNOSTIC), 'invalid status tail diagnostic boolean')
+  if (env.STATUS_TAIL_DIAGNOSTIC === 'true') assert.ok(env.TARGET === 'candidate' && env.PLATFORM === 'windows' && env.STARTUP_DIAGNOSTIC !== 'true' && env.STARTUP_STACK_SAMPLES !== 'true', 'status tail diagnostic requires separate Windows candidate mode')
   if (env.STARTUP_STACK_SAMPLES === 'true') assert.ok(env.STARTUP_DIAGNOSTIC === 'true' && env.TARGET === 'candidate' && env.PLATFORM === 'windows', 'stack samples require Windows candidate diagnostic')
   if (env.STARTUP_DIAGNOSTIC === 'true') assert.notEqual(env.PLATFORM, 'linux', 'startup diagnostic requires Windows')
   assert.ok(['baseline', 'candidate', 'both'].includes(env.TARGET), 'target 无效')
@@ -356,6 +364,34 @@ export async function collectGatewayStatusReadback({ request, apiReceipts, readE
   } catch { r.status = 'failed'; r.failure = 'STATUS_READBACK_FAILED' }
   r.finishedAt = new Date().toISOString()
   return r
+}
+
+// 只使用原status那一次exec的已落盘stderr；即使原CLI失败仍保留可解析观察，绝不改其结论。
+export function collectStatusTailReadback({ readback, execEvents }) {
+  const r = { status: 'failed', qualificationPass: false, originalCliPassed: false, scope: 'same original status execFile.stderr; diagnostic only' }
+  try { assertGatewayStatusReadback(readback); r.originalCliPassed = true } catch { /* 原失败在独立断言中优先抛出。 */ }
+  try {
+    const start = readback?.exec?.[0]
+    assert.ok(start?.event === 'execFile-start' && Number.isSafeInteger(start.pid) && start.pid > 0 && Number.isSafeInteger(start.callId) && start.callId > 0, 'STATUS_TAIL_EXEC_IDENTITY')
+    assert.ok(Array.isArray(execEvents), 'STATUS_TAIL_EXEC_MISSING')
+    const results = execEvents.filter(e => e.event === 'execFile-result' && e.callId === start.callId && e.pid === start.pid)
+    assert.equal(results.length, 1, 'STATUS_TAIL_RESULT_COUNT')
+    const result = results[0]
+    assert.ok(result.source === 'callback' && typeof result.stderr === 'string' && result.stderrTruncated === false && Buffer.byteLength(result.stderr) <= 1048576, 'STATUS_TAIL_STDERR_MISSING_OR_TRUNCATED')
+    r.stderr = { bytes: Buffer.byteLength(result.stderr), sha256: digest(result.stderr), callId: start.callId, pid: start.pid }
+    r.observation = decodeStatusTailObservation(result.stderr, { rootPid: start.pid })
+    if (r.originalCliPassed) r.status = 'diagnostic-only-not-qualification'
+  } catch (error) {
+    // 只留固定诊断码，不复制原stderr、Error.cmd或任意异常文本。
+    const match = String(error?.message || '').match(/^STATUS_TAIL_[A-Z0-9_]+$/)
+    r.observationError = match ? match[0] : 'STATUS_TAIL_EVIDENCE_INVALID'
+  }
+  return r
+}
+
+export function assertStatusTailReadback(readback, r) {
+  assertGatewayStatusReadback(readback)
+  assert.ok(r?.status === 'diagnostic-only-not-qualification' && r.originalCliPassed === true && r.qualificationPass === false && r.observation?.diagnosticValid === true, 'STATUS_TAIL_DIAGNOSTIC_INCOMPLETE')
 }
 
 export function qualificationStatus(r) {
@@ -845,7 +881,9 @@ async function execute(o) {
   const output = path.resolve(o['--output']); physical(output); assert.ok(!fs.existsSync(output), '输出必须全新'); fs.mkdirSync(output, { recursive: true })
   const r = { schemaVersion: 1, status: 'failed', candidateSha: o['--sha'], expectedVersion: o['--version'], variant: o['--variant'], startedAt: new Date().toISOString(), commands: [], installerStarted: false, stages: STAGES.map(name => ({ name, status: 'missing' })), nativeTauri: { status: 'not-run', qualificationComplete: false }, limitations: ['仅手工一次性托管 Windows 的真实 Web 验收，不证明 native Tauri GUI', 'HOME 隔离不是 Windows HKCU 沙箱；因此本机/self-hosted 均在候选执行前拒绝', '不自动恢复宿主变更，不自动重试，不使用业务凭据或收费模型'] }
   const diagnostic = o['--startup-diagnostic'] === true
+  const statusTailDiagnostic = o['--status-tail-diagnostic'] === true
   if (diagnostic) r.diagnostic = { enabled: true, scope: 'diagnostic-only-not-acceptance', stackSampling: o['--startup-stack-samples'] === true, qualificationPass: false, originalStartupBudgetMs: 20000, cliBudgetMs: 15000, installBudgetMs: 900000 }
+  if (statusTailDiagnostic) r.diagnostic = { enabled: true, kind: 'status-tail', scope: 'diagnostic-only-not-acceptance', qualificationPass: false, originalStartupBudgetMs: 20000, cliBudgetMs: 15000, installBudgetMs: 900000 }
   const save = () => fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(r, null, 2))
   const write = (name, value) => fs.writeFileSync(path.join(output, name), JSON.stringify(value, null, 2))
   let env, home, project, checkout, before, proof, web, provider, base, runtimePort, dashboardPort, browser, context, cli, python, release, lastSession, stopped = true, installCursor = 0
@@ -959,7 +997,7 @@ async function execute(o) {
     r.runnerAdmission = { passed: false, failedConditions: runnerProofFailures(proof) }
     r.runnerAdmission.passed = r.runnerAdmission.failedConditions.length === 0
     write('runner-admission.json', r.runnerAdmission); save(); validateRunnerProof(proof)
-    r.toolingDependencies = Object.fromEntries(['scripts/test-hermes-windows-qualification.mjs', 'scripts/hermes-qualification-provider.mjs', 'scripts/hermes-startup-diagnostic.mjs', 'scripts/hermes-python-cache-observation.mjs', 'scripts/hermes-exec-observation.mjs'].map(file => [file, hash(path.join(tooling, file))]))
+    r.toolingDependencies = Object.fromEntries(['scripts/test-hermes-windows-qualification.mjs', 'scripts/hermes-qualification-provider.mjs', 'scripts/hermes-startup-diagnostic.mjs', 'scripts/hermes-python-cache-observation.mjs', 'scripts/hermes-exec-observation.mjs', 'scripts/hermes-status-tail-receipts.mjs'].map(file => [file, hash(path.join(tooling, file))]))
     write('tooling-dependencies.json', { sha: proof.toolingSha, files: r.toolingDependencies })
     assert.ok(within(physical(process.env.RUNNER_TEMP), output), '输出不在本次 RUNNER_TEMP')
     checkout = resolveQualificationCheckout(o['--root'])
@@ -969,6 +1007,8 @@ async function execute(o) {
     env = isolationEnv({ home, temp: path.join(output, 't'), realProfile: proof.actualProfile })
     // 仅通过真实 VM/SID 资格后启用固定阶段诊断；失败仍按原20秒就绪门禁判红。
     env.CLAWPANEL_HERMES_PHASE_TIMING = '1'
+    // 仅本诊断VM子环境启用；run/status/stop均使用同一个current body，正常模式不设变量。
+    if (statusTailDiagnostic) env.CLAWPANEL_HERMES_STATUS_TAIL_DIAGNOSTIC = '1'
     for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'HERMES_HOME', 'OPENCLAW_CONFIG_DIR', 'UV_PYTHON_INSTALL_DIR', 'UV_CACHE_DIR', 'PLAYWRIGHT_BROWSERS_PATH', 'TEMP']) fs.mkdirSync(physical(env[key]), { recursive: true })
     for (const key of ['GIT_CONFIG_GLOBAL', 'NPM_CONFIG_USERCONFIG', 'NPM_CONFIG_GLOBALCONFIG']) fs.writeFileSync(env[key], '')
     write('isolationenv.json', env)
@@ -1066,6 +1106,13 @@ async function execute(o) {
         r.gatewayStatusFiles.after = captureHermesGatewayStateFiles(home, 'after-status')
         write('gateway-status-files.json', r.gatewayStatusFiles); save()
       }
+      if (statusTailDiagnostic) {
+        r.statusTailReadback = collectStatusTailReadback({ readback: r.gatewayStatusReadback, execEvents: readAudit().slice(statusAuditCursor) })
+        write('status-tail-readback.json', r.statusTailReadback); save()
+        assertStatusTailReadback(r.gatewayStatusReadback, r.statusTailReadback)
+        r.diagnostic.gatewayReadyWithinBudget = true; await capturePids()
+        return { scope: r.diagnostic.scope, gatewayReadyWithinBudget: true, qualificationPass: false }
+      }
       if (diagnostic) { r.diagnostic.gatewayReadyWithinBudget = true; await capturePids(); return { scope: r.diagnostic.scope, gatewayReadyWithinBudget: true } }
       const dash = await api('hermes_dashboard_start'); assert.equal(dash.started, true); assert.equal((await api('hermes_dashboard_probe')).running, true); await capturePids()
       // 官方40747修复Node24.16与旧zip stream的死锁；固定测试工具版本，不降Node或扩安装预算。
@@ -1106,7 +1153,7 @@ async function execute(o) {
       r.browser = { actualChromium: true, screenshots, trace: 'trace.zip', pageErrors, completeReply: true, historyAfterReload: true, prompts }; write('browser-report.json', r.browser)
       return { profiles, dash, providerRequests: calls.length }
     })
-    if (!diagnostic) {
+    if (!diagnostic && !statusTailDiagnostic) {
     const sentinel = path.join(env.HERMES_HOME, 'memories/qualification.txt'); fs.mkdirSync(path.dirname(sentinel), { recursive: true }); fs.writeFileSync(sentinel, o['--sha']); const sentinelHash = hash(sentinel)
     const preserve = async () => { assert.equal(hash(sentinel), sentinelHash); assert.ok(fs.readFileSync(path.join(env.HERMES_HOME, 'config.yaml'), 'utf8').includes(`qualification_marker: ${o['--sha']}`)); assert.ok((await api('hermes_profiles_list')).profiles.some(p => p.name === 'default')); assert.equal((await api('hermes_read_config')).model_raw, 'qualification-two'); return history() }
     await stage('update-stop', async () => { await stopRuntime(); markInstall(); await api('update_hermes', {}, 900000); await completion(); await preserve(); return { productionStop: true, updateVerified: true } })
@@ -1157,7 +1204,7 @@ async function main() {
   if (o['--verify-linux-evidence']) { assert.ok(exactSha(o['--sha'])); console.log(JSON.stringify(verifyLinuxEvidence(o['--verify-linux-evidence'], o['--sha'], o['--version']))); return 0 }
   if (o['--publish-evidence']) { assert.ok(o['--output'], '公开副本必须指定新 output'); console.log(JSON.stringify(await publishEvidence({ roots: { evidence: path.resolve(o['--publish-evidence']) }, output: o['--output'] }))); return 0 }
   if (o['--execute']) return execute(o)
-  console.log(JSON.stringify({ stages: STAGES, installsOnLocalHost: false, nativeTauriRequiredForFullQualification: true, candidateSecrets: false, retries: 0, startupTiming: { qualifiedVmOnly: true, acceptanceExtension: false }, usage: '--execute --root candidate --sha <40hex> --version <0.x.y> --variant old|new --output <fresh RUNNER_TEMP/dir>', nativeTauri: 'separate missing gate, not upgraded by external receipt' }))
+  console.log(JSON.stringify({ stages: STAGES, installsOnLocalHost: false, nativeTauriRequiredForFullQualification: true, candidateSecrets: false, retries: 0, startupTiming: { qualifiedVmOnly: true, acceptanceExtension: false }, ...(o['--status-tail-diagnostic'] ? { statusTailDiagnostic: true, diagnosticNeverQualifies: true, diagnosticScope: 'status-tail-diagnostic-only-not-qualification', executionWiringReady: true } : {}), usage: '--execute --root candidate --sha <40hex> --version <0.x.y> --variant old|new --output <fresh RUNNER_TEMP/dir>', nativeTauri: 'separate missing gate, not upgraded by external receipt' }))
   return 0
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().then(code => { process.exitCode = code }).catch(e => { console.error(e.stack); process.exitCode = 1 })

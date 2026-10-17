@@ -1,4 +1,5 @@
 // 合成CLI验收专用：保留原raw结果，只按前置时间证明排除旧创建身份；不控制产品进程。
+import { createHash } from 'node:crypto'
 export const FIXTURE_IDENTITY_LIMITS = Object.freeze({ materialBytes: 8 * 1024 * 1024, rawSweeps: 2048, rawProbes: 16384, nativeRows: 32768, starts: 128, outputBytes: 24576 })
 const epoch = 116444736000000000n
 const fail = code => { const error = new Error(`Fixture identity evidence: ${code}`); error.code = code; throw error }
@@ -7,6 +8,48 @@ const ticks = hex => { if (!/^[0-9a-f]{16}$/i.test(hex || '')) fail('NATIVE_IDEN
 const lowerTick = ms => epoch + BigInt(ms) * 10000n
 const startKey = s => `${s.pid}/${s.name}/${s.at}/${s.monotonicMs}`
 const pickNative = r => ({ status: r.status, sampledAtMs: r.sampledAtMs, queryStartedAtMs: r.queryStartedAtMs, queryCompletedAtMs: r.queryCompletedAtMs, creationTimeFileTimeHex: r.creationTimeFileTimeHex ?? null, createdAtMs: r.createdAtMs ?? null, exitAtMs: r.exitAtMs ?? null, belongsToFixture: r.belongsToFixture ?? null, waitResult: r.waitResult, nativeError: r.nativeError, imageQueryError: r.imageQueryError ?? null })
+
+// v2仅追加来源和因果证据；原PS UTC、FILETIME及raw字段均不转换或回填。
+const nativeFields = ['pid', 'status', 'executablePath', 'creationTimeFileTimeHex', 'createdAtMs', 'exitAtMs', 'sampledAtMs', 'queryStartedAtMs', 'queryCompletedAtMs', 'nativeError', 'imageQueryError', 'waitResult']
+const rawFields = ['pid', 'alive', 'errorCode', 'startedAtMs', 'completedAtMs', 'startedAtNs', 'completedAtNs']
+const refFields = ['controllerPid', 'clockDomainId', 'transportSessionId', 'observerPid', 'requestId', 'rowsSha256']
+const exactFields = (x, keys) => x && !Array.isArray(x) && typeof x === 'object' && Object.keys(x).length === keys.length && keys.every(k => Object.hasOwn(x, k))
+const nsValue = n => typeof n === 'string' && /^(?:0|[1-9]\d{0,23})$/.test(n)
+const idValue = s => typeof s === 'string' && /^[a-f0-9]{32}$/.test(s)
+const shaValue = s => typeof s === 'string' && /^[a-f0-9]{64}$/.test(s)
+function projectionDigest(rows, keys) {
+  if (!Array.isArray(rows) || !rows.length || rows.length > FIXTURE_IDENTITY_LIMITS.starts) fail('CLEANUP_CAUSAL_ROWS')
+  const projected = rows.map(row => {
+    if (!row || !keys.every(k => Object.hasOwn(row, k))) fail('CLEANUP_CAUSAL_FIELDS')
+    return Object.fromEntries(keys.map(k => [k, row[k]]))
+  })
+  return createHash('sha256').update(JSON.stringify(projected)).digest('hex')
+}
+export const fixtureNativeRowsDigest = rows => projectionDigest(rows, nativeFields)
+export const fixtureRawProbesDigest = rows => projectionDigest(rows, rawFields)
+
+function validateCleanupCausality(order, nativeRows, probes, pids) {
+  const c = order.causal
+  if (Buffer.byteLength(JSON.stringify(order)) > FIXTURE_IDENTITY_LIMITS.outputBytes) fail('CLEANUP_CAUSAL_BUDGET')
+  if (!exactFields(order, ['kind', 'nativeCompletedAtMs', 'startedAtMs', 'completedAtMs', 'finalSnapshotRef', 'causal']) ||
+      !exactFields(c, ['schemaVersion', 'phase', 'clock', ...refFields, 'orderedPids', 'send', 'receive', 'returned', 'rawBegin', 'rawEnd', 'rawSha256']) ||
+      c.schemaVersion !== 2 || c.phase !== 'cleanup-final' || c.clock !== 'controller-process-hrtime-bigint-ns' ||
+      !Number.isSafeInteger(c.controllerPid) || c.controllerPid <= 0 || !Number.isSafeInteger(c.observerPid) || c.observerPid <= 0 ||
+      !Number.isSafeInteger(c.requestId) || c.requestId <= 0 || !idValue(c.clockDomainId) || !idValue(c.transportSessionId) || !shaValue(c.rowsSha256) || !shaValue(c.rawSha256)) fail('CLEANUP_CAUSAL_SCHEMA')
+  if (!exactFields(order.finalSnapshotRef, refFields) || !refFields.every(k => order.finalSnapshotRef[k] === c[k])) fail('CLEANUP_CAUSAL_BINDING')
+  if (!Array.isArray(c.orderedPids) || c.orderedPids.length !== pids.length || !c.orderedPids.every((p, i) => p === pids[i]) ||
+      !nativeRows.every((r, i) => r.pid === pids[i]) || !probes.every((r, i) => r.pid === pids[i]) ||
+      fixtureNativeRowsDigest(nativeRows) !== c.rowsSha256 || fixtureRawProbesDigest(probes) !== c.rawSha256) fail('CLEANUP_CAUSAL_PAYLOAD')
+  let previous = null
+  for (const point of [c.send, c.receive, c.returned, c.rawBegin, c.rawEnd]) {
+    if (!exactFields(point, ['controllerPid', 'clockDomainId', 'sequence', 'ns', 'utcMs']) || point.controllerPid !== c.controllerPid || point.clockDomainId !== c.clockDomainId || !integer(point.sequence) || !point.sequence || !nsValue(point.ns) || !integer(point.utcMs)) fail('CLEANUP_CAUSAL_CLOCK')
+    if (previous && (point.sequence <= previous.sequence || BigInt(point.ns) < BigInt(previous.ns))) fail('CLEANUP_NATIVE_AFTER_RAW_BOUND')
+    previous = point
+  }
+  // 顺序只在此同controller域内比较；任何真正晚于raw的回包仍以原错误码拒绝。
+  for (const p of probes) if (!nsValue(p.startedAtNs) || !nsValue(p.completedAtNs) || BigInt(p.startedAtNs) < BigInt(c.rawBegin.ns) || BigInt(p.completedAtNs) > BigInt(c.rawEnd.ns)) fail('CLEANUP_NATIVE_AFTER_RAW_BOUND')
+  return c
+}
 
 export function qualifyFixtureIdentityHistory(material, { nativeIdentityAvailable = true } = {}) {
   let size
@@ -164,7 +207,13 @@ export function qualifyFixtureCleanup(material, { nativeIdentityAvailable = true
   }
   if (rawProbes.length !== starts.length || cleanupNativeRows.length !== (nativeIdentityAvailable ? starts.length : 0)) fail('CLEANUP_MISSING_MATERIAL')
   const legacy = rawOrder.kind === 'frozen-source-order-lower-bound'
-  if (legacy) {
+  const causal = rawOrder.kind === 'captured-controller-causal-order-v2'
+  let causalReceipt
+  if (causal) {
+    if (!nativeIdentityAvailable) fail('CLEANUP_CAUSAL_NATIVE_REQUIRED')
+    causalReceipt = validateCleanupCausality(rawOrder, cleanupNativeRows, rawProbes, starts.map(s => s.pid))
+    if (![rawOrder.nativeCompletedAtMs, rawOrder.startedAtMs, rawOrder.completedAtMs].every(integer) || rawOrder.nativeCompletedAtMs > rawOrder.startedAtMs || rawOrder.completedAtMs < rawOrder.startedAtMs) fail('CLEANUP_RAW_ORDER')
+  } else if (legacy) {
     // 旧CI未捕获raw时点/错误码：仅接受显式冻结源码的await顺序下界，不补造时间或ESRCH。
     if (!nativeIdentityAvailable || rawOrder.awaitFinalNativeBeforeRaw !== true || !/^[0-9a-f]{40}$/.test(rawOrder.sourceSha || '') || !/^[0-9a-f]{64}$/.test(rawOrder.sourceTestSha256 || '') || !integer(rawOrder.notBeforeMs) ||
       rawOrder.notBeforeMs !== Math.max(...cleanupNativeRows.map(row => row.queryCompletedAtMs)) - 1) fail('CLEANUP_SOURCE_ORDER_MISSING')
@@ -196,7 +245,9 @@ export function qualifyFixtureCleanup(material, { nativeIdentityAvailable = true
     const bound = legacy ? rawOrder.notBeforeMs : rawOrder.nativeCompletedAtMs
     // 原PS -as[long]四舍五入，JS Date.now向下取整；只核验不矛盾的1ms包络。
     // 排除仍用原始raw毫秒下界/更保守的旧源码下界，绝不把+1当成出生证明。
-    if (row.queryCompletedAtMs > bound + 1) fail('CLEANUP_NATIVE_AFTER_RAW_BOUND')
+    if (!causal) {
+      if (row.queryCompletedAtMs > bound + 1) fail('CLEANUP_NATIVE_AFTER_RAW_BOUND')
+    }
   }
   let previousNs = -1n, rawAliveCount = 0
   const rows = rawProbes.map((probe, index) => {
@@ -237,7 +288,8 @@ export function qualifyFixtureCleanup(material, { nativeIdentityAvailable = true
     return { pid, name: start.name, rawAlive: probe.alive, rawErrorCode: probe.errorCode ?? (legacy ? 'not-captured' : null), rawLowerBoundMs,
       oldFixtureIdentityAbsent: proof !== null, proof, ...(legacy ? {} : { rawStartedAtMs: probe.startedAtMs, rawCompletedAtMs: probe.completedAtMs, rawStartedAtNs: probe.startedAtNs, rawCompletedAtNs: probe.completedAtNs }) }
   })
-  return { event: 'hermes-bounds-cleanup-identity', schema: 1, phase: 'cleanup-not-peak', samplingNotAtomic: true,
+  return { event: 'hermes-bounds-cleanup-identity', schema: causal ? 2 : 1, phase: 'cleanup-not-peak', samplingNotAtomic: true,
+    ...(causal ? { causalOrderValidated: true, causalReceipt, legacyPredicate: cleanupNativeRows.every(row => row.queryCompletedAtMs <= rawOrder.nativeCompletedAtMs + 1), clockSources: { workerUtc: 'dotnet-utc-ms-rounded', controllerUtc: 'node-date-now-ms', ordering: 'same-controller-hrtime-bigint-ns' } } : {}),
     rawTiming: legacy ? 'source-order-lower-bound-not-captured-raw-time' : 'captured-original-kill0', rawAliveCount,
     allOldFixtureIdentitiesAbsent: rows.every(row => row.oldFixtureIdentityAbsent), rows }
 }

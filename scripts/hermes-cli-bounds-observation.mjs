@@ -2,7 +2,29 @@
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { fixtureNativeRowsDigest, fixtureRawProbesDigest, FIXTURE_IDENTITY_LIMITS } from './hermes-cli-owned-identity.mjs'
+
+// 域属于此controller实例，不跨Node/worker比较单调时钟；只记录自己已有管道事件。
+const clockDomainId = randomUUID().replaceAll('-', '')
+let clockSequence = 0
+const markController = () => ({ controllerPid: process.pid, clockDomainId, sequence: ++clockSequence, ns: process.hrtime.bigint().toString(), utcMs: Date.now() })
+const authenticSnapshots = new WeakMap(), rawScopes = new WeakSet()
+const finalRef = c => Object.fromEntries(['controllerPid', 'clockDomainId', 'transportSessionId', 'observerPid', 'requestId', 'rowsSha256'].map(k => [k, c[k]]))
+const causalBudget = value => { if (Buffer.byteLength(JSON.stringify(value)) > FIXTURE_IDENTITY_LIMITS.outputBytes) throw new Error('CLEANUP_CAUSAL_BUDGET') }
+
+export function beginFixtureCleanupRaw() {
+  const scope = Object.freeze({ rawBegin: Object.freeze(markController()) }); rawScopes.add(scope); return scope
+}
+
+export function finishFixtureCleanupRaw(scope, snapshot, probes, { startedAtMs, completedAtMs }) {
+  const rawEnd = markController(), stored = authenticSnapshots.get(snapshot)
+  if (!rawScopes.has(scope) || !stored || JSON.stringify(snapshot) !== stored || fixtureNativeRowsDigest(snapshot.processes) !== snapshot.causalReceipt.rowsSha256) throw new Error('CLEANUP_CAUSAL_UNOWNED_RECEIPT')
+  rawScopes.delete(scope); authenticSnapshots.delete(snapshot)
+  const causal = { ...structuredClone(snapshot.causalReceipt), rawBegin: scope.rawBegin, rawEnd, rawSha256: fixtureRawProbesDigest(probes) }
+  const order = { kind: 'captured-controller-causal-order-v2', nativeCompletedAtMs: snapshot.completedAtMs, startedAtMs, completedAtMs, finalSnapshotRef: finalRef(causal), causal }
+  causalBudget(order); return order
+}
 
 const imageKey = value => path.win32.normalize(String(value || '')).toLowerCase()
 
@@ -154,6 +176,13 @@ while ($null -ne ($line = [Console]::ReadLine())) {
   $request = ConvertFrom-Json $line
   $rows = @(); foreach($processId in $request.pids){$rows += Read-FixtureIdentity ([int]$processId)}
   $reply = @{id=$request.id; processes=@($rows)} | ConvertTo-Json -Depth 6 -Compress
+  if($null -ne $request.causal) {
+    # 仅回显本管道的请求绑定；所有原始查询行/UTC不改写，无新系统查询。
+    $c=$request.causal
+    if($c.schemaVersion -ne 2 -or $c.requestId -ne $request.id){throw 'causal request mismatch'}
+    $reply=@{id=$request.id;processes=@($rows);causal=@{schemaVersion=2;controllerPid=$c.controllerPid;clockDomainId=$c.clockDomainId;transportSessionId=$c.transportSessionId;observerPid=$PID;requestId=$request.id;orderedPids=@($request.pids)}} | ConvertTo-Json -Depth 6 -Compress
+    if([Text.Encoding]::UTF8.GetByteCount($reply) -gt 24576){throw 'CLEANUP_CAUSAL_BUDGET'}
+  }
   [Console]::Out.WriteLine($reply)
 }
 `
@@ -204,6 +233,8 @@ function observerDiagnostic(child, launch) {
 
 // 只服务合成测试子进程；所有失败终止本观察器，保留首红，不重放查询。
 export async function startFixtureObserverTransport(child, { onDiagnostic, launch } = {}) {
+  const transportSessionId = randomUUID().replaceAll('-', '')
+  let causalModeUsed = false
   const diagnostic = observerDiagnostic(child, launch)
   const lines = createInterface({ input: child.stdout })
   let nextId = 0, stderr = '', readyResolve, readyReject, closed = false, failure = null
@@ -243,6 +274,7 @@ export async function startFixtureObserverTransport(child, { onDiagnostic, launc
   lines.on('line', line => {
     if (failure) return
     try {
+      if ([...pending.values()].some(item => item.causal) && Buffer.byteLength(line) > FIXTURE_IDENTITY_LIMITS.outputBytes) throw new Error('CLEANUP_CAUSAL_BUDGET')
       const message = JSON.parse(line)
       if (message.event === 'observer-phase') {
         const index = startupPhases.indexOf(message.phase)
@@ -252,6 +284,14 @@ export async function startFixtureObserverTransport(child, { onDiagnostic, launc
       if (message.event === 'ready') { if (message.protocol !== 1) throw new Error('identity observer protocol mismatch'); readyAtMs = Date.now(); diagnostic.record('ready', {}, readyAtMs); readyResolve(); return }
       const item = pending.get(message.id)
       if (!item) throw new Error('unexpected identity observer response ' + message.id)
+      if (item.causal) {
+        if (Buffer.byteLength(line) > FIXTURE_IDENTITY_LIMITS.outputBytes) throw new Error('CLEANUP_CAUSAL_BUDGET')
+        const c = message.causal, expected = item.causal
+        if (Object.keys(message).sort().join(',') !== 'causal,id,processes' || !c || Object.keys(c).sort().join(',') !== 'clockDomainId,controllerPid,observerPid,orderedPids,requestId,schemaVersion,transportSessionId' ||
+            c.schemaVersion !== 2 || c.controllerPid !== process.pid || c.clockDomainId !== clockDomainId || c.transportSessionId !== transportSessionId || c.observerPid !== child.pid || c.requestId !== message.id ||
+            !Array.isArray(c.orderedPids) || JSON.stringify(c.orderedPids) !== JSON.stringify(expected.orderedPids) || !Array.isArray(message.processes) || message.processes.length !== c.orderedPids.length || !message.processes.every((r, i) => r.pid === c.orderedPids[i])) throw new Error('CLEANUP_CAUSAL_RESPONSE_BINDING')
+        item.receipt = { schemaVersion: 2, phase: 'cleanup-final', clock: 'controller-process-hrtime-bigint-ns', controllerPid: process.pid, clockDomainId, transportSessionId, observerPid: child.pid, requestId: message.id, orderedPids: [...c.orderedPids], rowsSha256: fixtureNativeRowsDigest(message.processes), send: item.send, receive: markController() }
+      }
       pending.delete(message.id); clearTimeout(item.timer); item.resolve(message)
     } catch (error) { onFailure(error) }
   })
@@ -261,25 +301,47 @@ export async function startFixtureObserverTransport(child, { onDiagnostic, launc
   return {
     pid: child.pid,
     getDiagnostic,
-    async snapshot(pids) {
+    // 切换既有最终查询的协议，不新增一次查询；原snapshot(pids)调用点保持两处。
+    forCleanup() {
+      const transport = this
+      return { ...transport, snapshot: pids => transport.snapshot(pids, { causal: true }) }
+    },
+    async snapshot(pids, { causal = false } = {}) {
       if (failure) throw failure
       if (closed) throw new Error('fixture identity observer closed')
       if (!pids.every(pid => Number.isSafeInteger(pid) && pid > 0)) throw new Error('invalid fixture PID')
+      if (typeof causal !== 'boolean' || (causal && (!pids.length || pids.length > FIXTURE_IDENTITY_LIMITS.starts || new Set(pids).size !== pids.length))) throw new Error('CLEANUP_CAUSAL_REQUEST')
+      if (causal) causalModeUsed = true
       const id = ++nextId, startedAtMs = Date.now(), monotonicStart = performance.now()
+      let item
       const reply = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => onFailure(new Error('fixture identity observation timeout'), 'request-timeout'), 2000)
-        pending.set(id, { resolve, reject, timer })
-        child.stdin.write(JSON.stringify({ id, pids }) + '\n', error => { if (error) onFailure(error) })
+        item = { resolve, reject, timer }
+        const request = { id, pids }
+        if (causal) {
+          request.causal = { schemaVersion: 2, controllerPid: process.pid, clockDomainId, transportSessionId, requestId: id }
+          item.causal = { orderedPids: [...pids] }; item.send = markController()
+        }
+        pending.set(id, item)
+        try { if (causal) causalBudget(request); child.stdin.write(JSON.stringify(request) + '\n', error => { if (error) onFailure(error) }) } catch (error) { onFailure(error) }
       })
+      if (failure) throw failure
       if (!Array.isArray(reply.processes)) { const error = new Error('identity processes response missing'); onFailure(error); throw error }
-      return { startedAtMs, completedAtMs: Date.now(), durationMs: performance.now() - monotonicStart, processes: reply.processes }
+      const snapshot = { startedAtMs, completedAtMs: Date.now(), durationMs: performance.now() - monotonicStart, processes: reply.processes }
+      if (causal) {
+        snapshot.causalReceipt = { ...item.receipt, returned: markController() }
+        causalBudget(snapshot); authenticSnapshots.set(snapshot, JSON.stringify(snapshot))
+      }
+      return snapshot
     },
     async close() {
-      if (closed) return
+      const verify = () => { if (causalModeUsed && failure && reason !== 'normal-close') throw failure }
+      if (closed) { verify(); return }
       normalClose = true; diagnostic.record('close-request')
       child.stdin.end()
       const timer = setTimeout(() => { if (!closed) child.kill() }, 2000)
       try { await exited } finally { clearTimeout(timer); lines.close() }
+      verify()
     },
   }
 }

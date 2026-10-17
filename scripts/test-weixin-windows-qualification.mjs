@@ -14,6 +14,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const tooling=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..')
+let tokenObservationModule
 const sha=b=>crypto.createHash('sha256').update(b).digest('hex')
 const hash=f=>sha(fs.readFileSync(f))
 const exactSha=v=>typeof v==='string'&&/^[a-f0-9]{40}$/.test(v)
@@ -49,11 +50,11 @@ export const REQUIRED_CASES=Object.freeze(['prepare-ui-unchecked','cancel-ui','a
 const PHASE_CASES=REQUIRED_CASES.filter(k=>!['wrong-window','scanner-failure'].includes(k))
 export function parseArgs(args){
  const o={},values=new Set(['--root','--sha','--host','--output','--scope'])
- for(let i=0;i<args.length;i++){const k=args[i];assert.ok(!Object.hasOwn(o,k),'重复参数');if(['--execute','--plan','--diagnostic-attach'].includes(k))o[k]=true;else{assert.ok(values.has(k)&&args[i+1]&&!args[i+1].startsWith('--'),'未知或缺值参数');o[k]=args[++i]}}
+ for(let i=0;i<args.length;i++){const k=args[i];assert.ok(!Object.hasOwn(o,k),'重复参数');if(['--execute','--plan','--diagnostic-attach','--observe-app-token'].includes(k))o[k]=true;else{assert.ok(values.has(k)&&args[i+1]&&!args[i+1].startsWith('--'),'未知或缺值参数');o[k]=args[++i]}}
  if(o['--sha'])assert.ok(exactSha(o['--sha']),'SHA 必须完整40位')
  if(o['--host'])assert.ok(Object.hasOwn(HOSTS,o['--host']),'仅固定官方5.12/9.8/10.4')
  if(o['--scope'])assert.ok(['complete','ui-origin'].includes(o['--scope']),'scope无效')
- assert.ok(!(o['--execute']&&o['--plan']),'模式互斥');assert.ok(!o['--diagnostic-attach']||!o['--scope'],'attach诊断与正式scope互斥');return o
+ assert.ok(!(o['--execute']&&o['--plan']),'模式互斥');assert.ok(!o['--diagnostic-attach']||!o['--scope'],'attach诊断与正式scope互斥');assert.ok(!o['--observe-app-token']||o['--diagnostic-attach'],'token观察仅显式attach诊断');return o
 }
 export function runnerProofFailures(p={}){
  // 完整复制合取语义，但用本 workflow 精确身份；从不改写 proof 去通过 Hermes 门禁。
@@ -413,6 +414,19 @@ function gitSnapshot(root,commit,exportTo){
  const batch=git(root,['cat-file','--batch'],entries.map(e=>e.id).join('\n')+'\n');let offset=0;const result={}
  for(const e of entries){const end=batch.indexOf(10,offset),head=batch.subarray(offset,end).toString(),m=/^([a-f0-9]{40}) blob (\d+)$/.exec(head);assert.ok(m&&m[1]===e.id);const size=Number(m[2]),b=batch.subarray(end+1,end+1+size);assert.equal(crypto.createHash('sha1').update(`blob ${size}\0`).update(b).digest('hex'),e.id);offset=end+size+2;const f=path.resolve(exportTo||root,e.file);assert.ok(inside(exportTo||root,f));if(exportTo){fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,b);if(process.platform!=='win32')fs.chmodSync(f,e.mode==='100755'?0o755:0o644)}else assert.equal(hash(physical(f)),sha(b),'源码/tooling实际字节不匹配 '+e.file);result[e.file]={gitBlob:e.id,sha256:sha(b)}}return result
 }
+async function loadTokenObservation(o,proof,report){
+ // 共享metadata/plan不解析此依赖；仅真实execute完成原runner及全Git blob绑定后进入。
+ assert.equal(o['--execute'],true);assert.equal(o['--observe-app-token'],true);assert.equal(o['--diagnostic-attach'],true);assert.equal(o['--host'],'2026.10.4')
+ validateRunnerProof(proof);assert.equal(report.tooling?.sha,proof.toolingSha);assert.equal(report.source?.sha,o['--sha']);assert.ok(exactSha(o['--sha'])&&Object.keys(report.source.before||{}).length)
+ const relative='scripts/weixin-native-token-observation.mjs',binding=report.tooling.before?.[relative]
+ assert.ok(binding&&exactSha(binding.gitBlob)&&validHash(binding.sha256),'token helper缺可信Git绑定')
+ const file=physical(path.join(tooling,relative));assert.ok(fs.lstatSync(file).isFile(),'token helper非普通文件')
+ const bytes=fs.readFileSync(file);assert.equal(sha(bytes),binding.sha256,'token helper字节改变')
+ assert.equal(crypto.createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex'),binding.gitBlob,'token helper Git blob不符')
+ const module=await import(pathToFileURL(file).href)
+ assert.equal(hash(file),binding.sha256,'token helper导入时漂移');assert.equal(typeof module.tokenObservationSource,'function');assert.equal(typeof module.publicTokenObservation,'function')
+ return module
+}
 function directoryHashes(root,allowEmpty=false){const out={};let bytes=0;const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){const f=path.join(d,e.name);assert.ok(!e.isSymbolicLink());if(e.isDirectory())walk(f);else{bytes+=fs.statSync(f).size;assert.ok(bytes<200*1024*1024);out[path.relative(root,f).replaceAll('\\','/')]=hash(f)}}};walk(root);assert.ok(allowEmpty||Object.keys(out).length);return out}
 async function freePort(){return await new Promise((resolve,reject)=>{const s=net.createServer();s.on('error',reject);s.listen(0,'127.0.0.1',()=>{const p=s.address().port;s.close(()=>resolve(p))})})}
 async function download(url,max,timeout=300000,{fetchImpl=fetch,headers}={}){const r=await fetchImpl(url,{headers,redirect:'error',signal:AbortSignal.timeout(timeout)});assert.equal(r.status,200,'固定源下载失败: '+url);const chunks=[];let size=0;for await(const b of r.body){size+=b.length;assert.ok(size<=max,'下载预算');chunks.push(b)}return Buffer.concat(chunks)}
@@ -453,8 +467,10 @@ export function processObservationSource(root,ports,tracked=[],controllerPid=pro
  assert.ok(Number.isInteger(controllerPid)&&controllerPid>0&&ports.every(p=>Number.isInteger(p)&&p>0&&p<65536)&&tracked.every(p=>Number.isInteger(p.pid)&&p.pid>0))
  return `$h=${psValue(root)};$ports=@(${ports.join(',')});$ids=@(${tracked.map(x=>x.pid).join(',')});$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$owned=@($all|Where-Object {$_.ProcessId -ne $PID -and $_.ProcessId -ne ${controllerPid} -and (($_.ExecutablePath -and $_.ExecutablePath.StartsWith($h+'\\',[StringComparison]::OrdinalIgnoreCase)) -or ($_.CommandLine -and $_.CommandLine.IndexOf($h+'\\',[StringComparison]::OrdinalIgnoreCase) -ge 0))});function Row($p){if(!$p -or !$p.CreationDate){throw 'Missing CreationDate'};@{pid=[int]$p.ProcessId;creationDate=$p.CreationDate.ToUniversalTime().ToString('o');exe=$p.ExecutablePath;commandLine=$(if($owned.ProcessId -contains $p.ProcessId){$p.CommandLine}else{$null})}};$listeners=@(Get-NetTCPConnection -ErrorAction Stop|Where-Object {$_.State -eq 'Listen' -and ($ports -contains [int]$_.LocalPort -or $owned.ProcessId -contains [int]$_.OwningProcess)}|ForEach-Object {$c=$_;$p=$all|Where-Object {$_.ProcessId -eq $c.OwningProcess}|Select-Object -First 1;$r=Row $p;$r.port=[int]$c.LocalPort;$r.localAddress=$c.LocalAddress;$r});@{processes=@($owned|ForEach-Object {Row $_});present=@($all|Where-Object {$ids -contains [int]$_.ProcessId}|ForEach-Object {Row $_});listeners=$listeners}|ConvertTo-Json -Compress -Depth 6`
 }
-function processSnapshot(root,ports,tracked=[],timeout=30000){
- const out=ps(processObservationSource(root,ports,tracked),timeout)
+function processSnapshot(root,ports,tracked=[],timeout=30000,tokenRequest){
+ const source=processObservationSource(root,ports,tracked)
+ if(tokenRequest)assert.ok(tokenObservationModule,'token helper尚未可信绑定')
+ const out=ps(tokenRequest?tokenObservationModule.tokenObservationSource(source,tokenRequest):source,timeout)
  return JSON.parse(out)
 }
 function hostExtra(profile){
@@ -462,12 +478,12 @@ function hostExtra(profile){
  const home=path.join(profile,'.openclaw');result.actualOpenclawHome=fs.existsSync(home)?directoryHashes(home):'absent';return result
 }
 async function execute(o){
+ for(const key of ['--root','--sha','--host','--output'])assert.ok(typeof o[key]==='string'&&o[key].trim(),'缺少 '+key)
  validateInjectionSyntax()
  // 这两项平台事实在任何目录创建、下载或候选执行之前检查；没有本机执行开关。
  assert.ok(process.platform==='win32'&&process.env.GITHUB_ACTIONS==='true'&&process.env.RUNNER_ENVIRONMENT==='github-hosted','Windows GitHub-hosted VM only; no local install/GUI')
  const shared=await import('./test-hermes-windows-qualification.mjs')
  const proof=shared.actualRunnerProof();validateRunnerProof(proof)
- for(const key of ['--root','--sha','--host','--output'])assert.ok(o[key],'缺少 '+key)
  const candidate=physical(o['--root']),output=physical(o['--output']),tempRoot=physical(process.env.RUNNER_TEMP)
  assert.ok(inside(tempRoot,output)&&!fs.existsSync(output),'输出必须RUNNER_TEMP全新physical目录')
  fs.mkdirSync(output);const pub=path.join(output,'public');fs.mkdirSync(pub)
@@ -519,6 +535,7 @@ async function execute(o){
   for(const f of ['src-tauri/src/commands/weixin_install_consent.rs','src/pages/channels-weixin-consent.js'])assert.ok(Object.hasOwn(report.source.before,f),'候选缺少已集成微信确认实现 '+f)
   assert.match(fs.readFileSync(path.join(root,'src-tauri/Cargo.lock'),'utf8'),/\nname = "tauri"\nversion = "2\.11\.1"\n/,'来源审计固定Tauri2.11.1，不推定其它版本')
   receipt('acl-source-inputs',{defaultCapability:read(path.join(root,'src-tauri/capabilities/default.json')),tauriConfig:read(path.join(root,'src-tauri/tauri.conf.json')),buildRs:fs.readFileSync(path.join(root,'src-tauri/build.rs'),'utf8'),sourcePins:Object.fromEntries(['src-tauri/capabilities/default.json','src-tauri/tauri.conf.json','src-tauri/build.rs','src-tauri/Cargo.lock'].map(f=>[f,report.source.before[f]]))})
+  if(o['--observe-app-token'])tokenObservationModule=await loadTokenObservation(o,proof,report)
   save()
   // 采用 runner 既有 rustup 可执行文件，仅在私有 HOME 下载工具链/驱动和构建缓存。
   const rustup=path.join(proof.actualProfile,'.cargo/bin/rustup.exe');assert.ok(fs.statSync(rustup).isFile());await run(rustup,['toolchain','install','stable-x86_64-pc-windows-msvc','--profile','minimal','--no-self-update'],900000)
@@ -549,6 +566,7 @@ async function execute(o){
    // 诊断保持单独scope，绝不为正式15case制造成功回执。
    report.nativeQualification=false;report.gaps=REQUIRED_CASES.map(id=>id+': diagnostic未执行正式资格')
    report.diagnostic={status:'started',actualEnvironmentObserved:false,sessionBudgetMs:60000,application,uiClicks:0,readonlyIPC:null}
+   if(o['--observe-app-token'])report.diagnostic.tokenObservationRequested=true
    const binaryFiles={application,driver:edge,runtime:runtime.path},binaryBefore=Object.fromEntries(Object.entries(binaryFiles).map(([k,f])=>[k,hash(f)]))
    assert.equal(binaryBefore.application,report.build.exeSha256);assert.equal(binaryBefore.driver,report.drivers.edge.sha256)
    report.diagnostic.binaryBefore=binaryBefore;receipt('diagnostic-binary-before',binaryBefore)
@@ -563,8 +581,13 @@ async function execute(o){
    const deadline=createAttachDeadline(),startedAt=new Date().toISOString();report.diagnostic.appSpawnStartedAt=startedAt;save()
    try{
     const appStart=Date.now(),app=spawn(application,[],{cwd:root,env:appEnv,windowsHide:true,stdio:['ignore','pipe','pipe']});keep(app,attachAppLogs,application,appStart,Date.now());assert.ok(app.pid,'应用没有实际spawn PID')
-    const observed=processSnapshot(output,[...ports],[],Math.min(30000,deadline.remaining()));deadline.remaining();track(observed)
+    // R11另行显式打开；复用首snapshot，不加进程/CIM轮询，不把token证明加入kill集合。
+    const spawnProof=o['--observe-app-token']?attachOwnership.receipt().find(p=>p.pid===app.pid):null
+    const tokenRequest=spawnProof?{app:{pid:app.pid,exe:application,startedAt:spawnProof.startedAt,returnedAt:spawnProof.returnedAt},parent:{pid:process.pid,exe:process.execPath},expectedSid:proof.sid}:undefined
+    assert.ok(!o['--observe-app-token']||tokenRequest,'token观察缺本轮spawn身份')
+    const observed=processSnapshot(output,[...ports],[],Math.min(30000,deadline.remaining()),tokenRequest);deadline.remaining();track(observed)
     const appIdentity=attachOwnership.known().find(p=>p.pid===app.pid);assert.ok(appIdentity,'缺真实同SHA应用spawn窗口/PID/CreationDate')
+    if(tokenRequest){observed.tokenObservation=tokenObservationModule.publicTokenObservation(observed.tokenObservation,tokenRequest);assert.equal(observed.tokenObservation.app.cimCreationUtc,appIdentity.creationDate,'token与本轮CIM出生不符');report.diagnostic.tokenObservation=observed.tokenObservation;receipt('attach-token-observation',observed.tokenObservation)}
     report.diagnostic.appIdentity=appIdentity;receipt('attach-app-identity',observed);save()
     let evidence
     for(;;){
@@ -728,5 +751,5 @@ async function execute(o){
  return report
 }
 if(process.argv[1]&&pathToFileURL(path.resolve(process.argv[1])).href===import.meta.url){
- try{const o=parseArgs(process.argv.slice(2));if(o['--execute'])await execute(o);else console.log(JSON.stringify({status:'not-run',localInstall:false,scope:o['--diagnostic-attach']?'diagnostic-attach':o['--scope']||'complete',diagnosticNeverQualifies:!!o['--diagnostic-attach'],candidateSha:o['--sha']||null,hosts:Object.keys(HOSTS),requiredCases:REQUIRED_CASES,phaseOneCases:PHASE_CASES,expectedArtifacts:Object.fromEntries(Object.keys(HOSTS).map(v=>[v,expectedArtifact(v)])),pendingNativeChecks:REQUIRED_CASES,expectedSurfaceLimit:'main-only surface must be proven by exact source and actual enumeration; never a passed wrong-window negative',legacyScannerLimit:'5.12 has no reviewed operator policy entry; real scanner rejection remains required for complete'}))}catch(e){console.error(redact(e.stack||String(e)));process.exitCode=1}
+ try{const o=parseArgs(process.argv.slice(2));if(o['--execute'])await execute(o);else console.log(JSON.stringify({status:'not-run',localInstall:false,scope:o['--diagnostic-attach']?'diagnostic-attach':o['--scope']||'complete',diagnosticNeverQualifies:!!o['--diagnostic-attach'],...(o['--observe-app-token']?{observeAppToken:true}:{}),candidateSha:o['--sha']||null,hosts:Object.keys(HOSTS),requiredCases:REQUIRED_CASES,phaseOneCases:PHASE_CASES,expectedArtifacts:Object.fromEntries(Object.keys(HOSTS).map(v=>[v,expectedArtifact(v)])),pendingNativeChecks:REQUIRED_CASES,expectedSurfaceLimit:'main-only surface must be proven by exact source and actual enumeration; never a passed wrong-window negative',legacyScannerLimit:'5.12 has no reviewed operator policy entry; real scanner rejection remains required for complete'}))}catch(e){console.error(redact(e.stack||String(e)));process.exitCode=1}
 }

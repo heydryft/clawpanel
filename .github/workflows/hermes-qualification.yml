@@ -23,6 +23,10 @@ on:
         description: '二级采样：仅 candidate/Windows/diagnostic，原20秒判定不变'
         type: boolean
         default: false
+      status_tail_diagnostic:
+        description: '仅新版Windows状态三尾诊断，永不作为发布资格'
+        type: boolean
+        default: false
       baseline_sha:
         description: '旧版0.21.5导出的完整40位SHA；不改安装pin'
         type: string
@@ -63,6 +67,7 @@ jobs:
           PLATFORM: ${{ inputs.platform }}
           STARTUP_DIAGNOSTIC: ${{ inputs.startup_diagnostic }}
           STARTUP_STACK_SAMPLES: ${{ inputs.startup_stack_samples }}
+          STATUS_TAIL_DIAGNOSTIC: ${{ inputs.status_tail_diagnostic }}
           BASELINE_SHA: ${{ inputs.baseline_sha }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
@@ -72,7 +77,7 @@ jobs:
   qualify:
     name: Windows ${{ matrix.variant }} — production Web + actual native Tauri
     needs: prepare
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'qingchencloud/clawpanel' && inputs.platform != 'linux'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'qingchencloud/clawpanel' && inputs.platform != 'linux' && !inputs.status_tail_diagnostic
     runs-on: windows-2025
     # 3 次 Web + 2 次 Rust 安装各仍900秒，另含冷 Rust 构建与14分钟 UI预算；不重试失败。
     timeout-minutes: 120
@@ -372,6 +377,68 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           path: ${{ runner.temp }}/hermes-public-${{ matrix.variant }}/
+
+  status-tail-diagnostic:
+    name: Windows status three-tail diagnostic (NEVER qualification)
+    needs: prepare
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'qingchencloud/clawpanel' && inputs.status_tail_diagnostic
+    runs-on: windows-2025
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: tooling
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: candidate
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.16.0
+      - name: 原准入及原20s/15s/900s后仅观测尾函数，不启动原生资格
+        id: status_tail
+        shell: pwsh
+        env:
+          CANDIDATE_SHA: ${{ matrix.sha }}
+          EXPECTED_VERSION: ${{ matrix.version }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          node tooling/scripts/test-hermes-windows-qualification.mjs --execute --status-tail-diagnostic --root candidate --sha "$env:CANDIDATE_SHA" --version "$env:EXPECTED_VERSION" --variant "$env:VARIANT" --output "$env:RUNNER_TEMP/hermes-status-tail-new"
+          exit $LASTEXITCODE
+      - name: 仅公开脱敏副本，失败或缺材料仍非资格
+        if: always()
+        shell: pwsh
+        run: |
+          $source = "$env:RUNNER_TEMP/hermes-status-tail-new"
+          if (Test-Path -LiteralPath $source) {
+            node tooling/scripts/test-hermes-windows-qualification.mjs --publish-evidence $source --output "$env:RUNNER_TEMP/hermes-status-tail-public"
+            exit $LASTEXITCODE
+          }
+          throw 'No diagnostic report; NOT QUALIFIED'
+      - name: 明确标记诊断及原CLI判定，不充当发布门禁
+        if: always()
+        shell: pwsh
+        run: |
+          '### STATUS TAIL DIAGNOSTIC — NEVER QUALIFICATION' >> $env:GITHUB_STEP_SUMMARY
+          $file = "$env:RUNNER_TEMP/hermes-status-tail-new/report.json"
+          if (!(Test-Path -LiteralPath $file)) { throw 'Missing diagnostic report; NOT QUALIFIED' }
+          $r = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+          if ($r.diagnostic.qualificationPass -ne $false -or $r.diagnostic.kind -ne 'status-tail') { throw 'Invalid diagnostic mode; NOT QUALIFIED' }
+          "Status: $($r.status); original CLI: $($r.gatewayStatusReadback.status); source: $($r.candidateSha). Native/lifecycle qualification NOT EXECUTED." >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hermes-status-tail-${{ matrix.sha }}-never-qualification
+          path: ${{ runner.temp }}/hermes-status-tail-public/
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: false
 
   linux-long-ui:
     name: Linux ${{ matrix.variant }} — fresh11 + two warm Send8/210s UI rounds
