@@ -225,6 +225,8 @@ function createStore() {
     error: null,
     profiles: [],
     activeProfile: safeGet(STORAGE_PROFILE) || 'default',
+    // 异步附件按切换代次隔离，往返同名 profile 也使旧读取失效。
+    profileGeneration: 0,
     loadingProfiles: false,
 
     // Live tool calls for the current run (shown in the streaming indicator).
@@ -411,6 +413,7 @@ function createStore() {
       state.profiles = profiles
       const active = data?.active || profiles.find(p => p.active)?.name || state.activeProfile || 'default'
       if (active !== state.activeProfile) {
+        state.profileGeneration++
         state.activeProfile = active
         safeSet(STORAGE_PROFILE, active)
         state.sessions = []
@@ -427,6 +430,7 @@ function createStore() {
   async function switchProfile(name) {
     if (!name || name === state.activeProfile || state.streaming) return
     await api.hermesProfileUse(name)
+    if (name !== state.activeProfile) state.profileGeneration++
     state.activeProfile = name
     safeSet(STORAGE_PROFILE, name)
     state.sessions = []
