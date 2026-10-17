@@ -11,6 +11,7 @@ let _installed = null
 let _listeners = []
 let _pollTimer = null
 let _probeSequence = 0
+let _bootGeneration = 0
 
 // 仅广播独立、不可变的安装/服务primitive；不传播模型、路径、缓存对象或凭据。
 export function projectHermesHealth(info) {
@@ -71,11 +72,15 @@ export default {
   },
 
   async boot() {
+    const generation = ++_bootGeneration
     await detectHermesStatus()
+    // cleanup或更新boot已取消本次范围时，不重新安装旧轮询。
+    if (generation !== _bootGeneration) return
     startPoll()
   },
 
   cleanup() {
+    _bootGeneration++
     _probeSequence++
     stopPoll()
   },
